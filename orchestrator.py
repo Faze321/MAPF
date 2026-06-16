@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 
 from agents import AgentChatClient, run_all_zone_chains
-from config import AgentConfig, normalize_forecast_model_name
+from config import AgentConfig, normalize_agent_mode, normalize_forecast_model_name
 from data_loader import build_zone_3h_load_quantiles, build_zone_profiles, load_pipeline_data
 from forecasting import ForecastResult, forecast_zone
 from reporting import safe_filename, write_outputs
@@ -34,6 +34,8 @@ def run_pipeline(
     history_days: int = 7,
     validation_days: int = 1,
     zone_ids: str | Iterable[str] | None = None,
+    experiment_zone_count: int = 12,
+    agent_mode: str = "agents",
     forecast_model: str = "timesfm",
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch",
     timesfm_context_hours: int = 168,
@@ -63,6 +65,7 @@ def run_pipeline(
     temperature: float = 0.2,
 ) -> dict[str, Path]:
     forecast_model = normalize_forecast_model_name(forecast_model)
+    agent_mode = normalize_agent_mode(agent_mode)
     output_dir.mkdir(parents=True, exist_ok=True)
     shared_cache_dir = cache_dir or output_dir / "cache"
     run_output_dir = forecast_output_dir(output_dir, forecast_model)
@@ -126,15 +129,25 @@ def run_pipeline(
         lstm_seed=lstm_seed,
     )
 
-    if dry_run:
+    if agent_mode == "rules":
         client = None
+        heuristic_source = "rules"
+    elif dry_run:
+        client = None
+        heuristic_source = "dry-run"
     else:
         config = AgentConfig.from_file(config_path, model=model, required=True)
         if not config.api_key:
             raise RuntimeError("agent.api_key is required in config.yaml, or pass --dry-run")
         client = AgentChatClient(config)
+        heuristic_source = "dry-run"
     reports = asyncio.run(
-        run_all_zone_chains(contexts, client=client, temperature=temperature)
+        run_all_zone_chains(
+            contexts,
+            client=client,
+            temperature=temperature,
+            heuristic_source=heuristic_source,
+        )
     )
     return write_outputs(
         output_dir=run_output_dir,
@@ -152,96 +165,178 @@ def run_experiment_matrix(
     forecast_starts: Iterable[str],
     forecast_models: Iterable[str],
     zone_ids: str | Iterable[str] | None = None,
+    experiment_zone_count: int = 12,
+    experiment_seeds: Iterable[int] | None = None,
+    agent_modes: Iterable[str] | None = None,
+    diurnal_blend_alphas: Iterable[float] | None = None,
     experiment_name: str | None = None,
     **pipeline_kwargs: Any,
 ) -> dict[str, Path]:
     starts = normalize_forecast_starts(forecast_starts)
     models = normalize_forecast_models(forecast_models)
-    selected_zone_ids = normalize_zone_ids(zone_ids) or ["102", "105"]
+    seeds = normalize_experiment_seeds(experiment_seeds)
+    modes = normalize_agent_modes(agent_modes, pipeline_kwargs.get("agent_mode", "agents"))
+    blend_alphas = normalize_blend_alphas(diurnal_blend_alphas)
+    selected_zone_ids = normalize_zone_ids(zone_ids)
     experiment_dir = output_dir / "experiments" / (
         experiment_name or experiment_slug(selected_zone_ids, starts)
     )
     shared_cache_dir = output_dir / "cache"
     experiment_dir.mkdir(parents=True, exist_ok=True)
     shared_cache_dir.mkdir(parents=True, exist_ok=True)
+    base_force_cache = bool(pipeline_kwargs.pop("force_cache", False))
+    if not selected_zone_ids:
+        profiles = build_zone_profiles(
+            data_dir,
+            shared_cache_dir,
+            force_cache=base_force_cache,
+            max_poi_rows=pipeline_kwargs.get("max_poi_rows"),
+        )
+        selected_zone_ids = select_representative_zone_ids(
+            profiles,
+            count=experiment_zone_count,
+        )
 
     runs_path = experiment_dir / "experiment_runs.csv"
     metrics_path = experiment_dir / "experiment_forecast_metrics.csv"
     price_path = experiment_dir / "experiment_price_comparison_summary.csv"
     rationale_path = experiment_dir / "experiment_rationale_trace.csv"
+    explainability_path = experiment_dir / "experiment_explainability_review_packet.csv"
+    forecast_summary_path = experiment_dir / "experiment_forecast_summary.csv"
+    price_summary_path = experiment_dir / "experiment_price_summary.csv"
+    rationale_summary_path = experiment_dir / "experiment_rationale_summary.csv"
+    decision_summary_path = experiment_dir / "experiment_decision_quality_summary.csv"
 
     run_records: list[dict[str, Any]] = []
     metrics_frames: list[pd.DataFrame] = []
     price_frames: list[pd.DataFrame] = []
     rationale_frames: list[pd.DataFrame] = []
-    base_force_cache = bool(pipeline_kwargs.pop("force_cache", False))
+    explainability_frames: list[pd.DataFrame] = []
     cache_attempted = False
+    add_seed_folder = len(seeds) > 1
+    add_mode_folder = len(modes) > 1
+    add_blend_folder = len(blend_alphas) > 1
 
     for forecast_start in starts:
         time_output_dir = experiment_dir / forecast_start_slug(forecast_start)
         for forecast_model in models:
-            run_output_dir = forecast_output_dir(time_output_dir, forecast_model)
-            record: dict[str, Any] = {
-                "forecast_start": forecast_start,
-                "forecast_model": forecast_model,
-                "zone_ids": ",".join(selected_zone_ids),
-                "run_output_dir": str(run_output_dir),
-                "status": "running",
-                "error": "",
-                "completed_at": "",
-            }
-            try:
-                outputs = run_pipeline(
-                    data_dir=data_dir,
-                    output_dir=time_output_dir,
-                    cache_dir=shared_cache_dir,
-                    force_cache=base_force_cache and not cache_attempted,
-                    forecast_start=forecast_start,
-                    forecast_model=forecast_model,
-                    zone_ids=selected_zone_ids,
-                    **pipeline_kwargs,
-                )
-                record["status"] = "success"
-                record["completed_at"] = pd.Timestamp.now().isoformat()
-                append_experiment_frame(
-                    metrics_frames,
-                    outputs.get("forecast_metrics_csv"),
-                    forecast_start,
-                    forecast_model,
-                    run_output_dir,
-                )
-                append_experiment_frame(
-                    price_frames,
-                    outputs.get("price_comparison_summary_csv"),
-                    forecast_start,
-                    forecast_model,
-                    run_output_dir,
-                )
-                append_experiment_frame(
-                    rationale_frames,
-                    outputs.get("rationale_trace_csv"),
-                    forecast_start,
-                    forecast_model,
-                    run_output_dir,
-                )
-            except Exception as exc:
-                record["status"] = "failed"
-                record["error"] = f"{type(exc).__name__}: {exc}"
-                record["completed_at"] = pd.Timestamp.now().isoformat()
-            finally:
-                cache_attempted = True
-                run_records.append(record)
-                pd.DataFrame(run_records).to_csv(runs_path, index=False)
+            for seed in seeds:
+                for agent_mode in modes:
+                    for blend_alpha in blend_alphas:
+                        run_base_dir = experiment_variant_output_dir(
+                            time_output_dir,
+                            seed=seed,
+                            agent_mode=agent_mode,
+                            diurnal_blend_alpha=blend_alpha,
+                            add_seed_folder=add_seed_folder,
+                            add_mode_folder=add_mode_folder,
+                            add_blend_folder=add_blend_folder,
+                        )
+                        run_output_dir = forecast_output_dir(run_base_dir, forecast_model)
+                        run_kwargs = dict(pipeline_kwargs)
+                        run_kwargs["agent_mode"] = agent_mode
+                        if seed is not None:
+                            run_kwargs["lstm_seed"] = seed
+                        if blend_alpha is not None:
+                            apply_uniform_diurnal_blend(run_kwargs, blend_alpha)
+                        record: dict[str, Any] = {
+                            "forecast_start": forecast_start,
+                            "forecast_model": forecast_model,
+                            "experiment_seed": seed,
+                            "agent_mode": agent_mode,
+                            "diurnal_blend_alpha": blend_alpha,
+                            "zone_count": len(selected_zone_ids),
+                            "zone_ids": ",".join(selected_zone_ids),
+                            "run_output_dir": str(run_output_dir),
+                            "status": "running",
+                            "error": "",
+                            "completed_at": "",
+                        }
+                        try:
+                            outputs = run_pipeline(
+                                data_dir=data_dir,
+                                output_dir=run_base_dir,
+                                cache_dir=shared_cache_dir,
+                                force_cache=base_force_cache and not cache_attempted,
+                                forecast_start=forecast_start,
+                                forecast_model=forecast_model,
+                                zone_ids=selected_zone_ids,
+                                **run_kwargs,
+                            )
+                            record["status"] = "success"
+                            record["completed_at"] = pd.Timestamp.now().isoformat()
+                            metadata = {
+                                "forecast_start": forecast_start,
+                                "forecast_model": forecast_model,
+                                "experiment_seed": seed,
+                                "agent_mode": agent_mode,
+                                "diurnal_blend_alpha": blend_alpha,
+                                "run_output_dir": str(run_output_dir),
+                            }
+                            append_experiment_frame(
+                                metrics_frames,
+                                outputs.get("forecast_metrics_csv"),
+                                metadata,
+                            )
+                            append_experiment_frame(
+                                price_frames,
+                                outputs.get("price_comparison_summary_csv"),
+                                metadata,
+                            )
+                            append_experiment_frame(
+                                rationale_frames,
+                                outputs.get("rationale_trace_csv"),
+                                metadata,
+                            )
+                            append_experiment_frame(
+                                explainability_frames,
+                                outputs.get("explainability_review_packet_csv"),
+                                metadata,
+                            )
+                        except Exception as exc:
+                            record["status"] = "failed"
+                            record["error"] = f"{type(exc).__name__}: {exc}"
+                            record["completed_at"] = pd.Timestamp.now().isoformat()
+                        finally:
+                            cache_attempted = True
+                            run_records.append(record)
+                            pd.DataFrame(run_records).to_csv(runs_path, index=False)
 
-    write_experiment_summary(metrics_frames, metrics_path)
-    write_experiment_summary(price_frames, price_path)
-    write_experiment_summary(rationale_frames, rationale_path)
+    metrics = write_experiment_summary(metrics_frames, metrics_path)
+    prices = write_experiment_summary(price_frames, price_path)
+    rationales = write_experiment_summary(rationale_frames, rationale_path)
+    write_experiment_summary(explainability_frames, explainability_path)
+    write_numeric_summary(
+        metrics,
+        forecast_summary_path,
+        metric_columns=["MAE", "RMSE", "MAPE_pct", "RAE", "WAPE_pct", "stress_accuracy", "miss_stress_rate"],
+    )
+    write_numeric_summary(
+        prices,
+        price_summary_path,
+        metric_columns=[
+            "price_accuracy",
+            "avg_adjusted_minus_actual_service_price",
+            "avg_adjusted_vs_actual_pct",
+        ],
+    )
+    write_numeric_summary(
+        rationales,
+        rationale_summary_path,
+        metric_columns=["stress_accuracy", "miss_stress_rate", "suggested_price_shift_pct"],
+    )
+    write_decision_quality_summary(prices, rationales, decision_summary_path)
     return {
         "experiment_dir": experiment_dir,
         "experiment_runs_csv": runs_path,
         "experiment_forecast_metrics_csv": metrics_path,
         "experiment_price_comparison_summary_csv": price_path,
         "experiment_rationale_trace_csv": rationale_path,
+        "experiment_explainability_review_packet_csv": explainability_path,
+        "experiment_forecast_summary_csv": forecast_summary_path,
+        "experiment_price_summary_csv": price_summary_path,
+        "experiment_rationale_summary_csv": rationale_summary_path,
+        "experiment_decision_quality_summary_csv": decision_summary_path,
     }
 
 
@@ -276,6 +371,46 @@ def normalize_forecast_models(forecast_models: Iterable[str]) -> list[str]:
     return models
 
 
+def normalize_experiment_seeds(experiment_seeds: Iterable[int] | None) -> list[int | None]:
+    if experiment_seeds is None:
+        return [None]
+    seeds: list[int | None] = []
+    seen: set[int] = set()
+    for value in experiment_seeds:
+        seed = int(value)
+        if seed not in seen:
+            seeds.append(seed)
+            seen.add(seed)
+    return seeds or [None]
+
+
+def normalize_agent_modes(agent_modes: Iterable[str] | None, default: str) -> list[str]:
+    raw_modes = list(agent_modes) if agent_modes is not None else [default]
+    modes: list[str] = []
+    seen: set[str] = set()
+    for value in raw_modes:
+        mode = normalize_agent_mode(str(value))
+        if mode not in seen:
+            modes.append(mode)
+            seen.add(mode)
+    return modes or [normalize_agent_mode(default)]
+
+
+def normalize_blend_alphas(diurnal_blend_alphas: Iterable[float] | None) -> list[float | None]:
+    if diurnal_blend_alphas is None:
+        return [None]
+    values: list[float | None] = []
+    seen: set[float] = set()
+    for value in diurnal_blend_alphas:
+        alpha = round(float(value), 6)
+        if alpha < 0.0 or alpha > 1.0:
+            raise ValueError(f"Diurnal blend alpha must be between 0 and 1: {value}")
+        if alpha not in seen:
+            values.append(alpha)
+            seen.add(alpha)
+    return values or [None]
+
+
 def experiment_slug(zone_ids: Iterable[str], forecast_starts: Iterable[str]) -> str:
     zone_part = "_".join(safe_filename(zone_id) for zone_id in zone_ids) or "auto"
     start_count = len(list(forecast_starts))
@@ -289,18 +424,11 @@ def forecast_start_slug(forecast_start: str) -> str:
 def append_experiment_frame(
     frames: list[pd.DataFrame],
     path: Path | None,
-    forecast_start: str,
-    forecast_model: str,
-    run_output_dir: Path,
+    metadata: dict[str, Any],
 ) -> None:
     if path is None or not path.exists():
         return
     frame = pd.read_csv(path)
-    metadata = {
-        "forecast_start": forecast_start,
-        "forecast_model": forecast_model,
-        "run_output_dir": str(run_output_dir),
-    }
     insert_at = 0
     for column, value in metadata.items():
         if column in frame.columns:
@@ -311,11 +439,238 @@ def append_experiment_frame(
     frames.append(frame)
 
 
-def write_experiment_summary(frames: list[pd.DataFrame], path: Path) -> None:
+def write_experiment_summary(frames: list[pd.DataFrame], path: Path) -> pd.DataFrame:
     if frames:
-        pd.concat(frames, ignore_index=True).to_csv(path, index=False)
+        frame = pd.concat(frames, ignore_index=True)
     else:
-        pd.DataFrame().to_csv(path, index=False)
+        frame = pd.DataFrame()
+    frame.to_csv(path, index=False)
+    return frame
+
+
+def write_numeric_summary(
+    frame: pd.DataFrame,
+    path: Path,
+    *,
+    metric_columns: list[str],
+    group_columns: list[str] | None = None,
+) -> pd.DataFrame:
+    group_columns = group_columns or ["forecast_model", "agent_mode", "diurnal_blend_alpha"]
+    output_columns = [
+        *group_columns,
+        "metric",
+        "n",
+        "mean",
+        "std",
+        "sem",
+        "min",
+        "max",
+    ]
+    if frame.empty:
+        empty = pd.DataFrame(columns=output_columns)
+        empty.to_csv(path, index=False)
+        return empty
+
+    groups = [column for column in group_columns if column in frame.columns]
+    rows = []
+    grouped = frame.groupby(groups, dropna=False) if groups else [((), frame)]
+    for key, group in grouped:
+        key_values = key if isinstance(key, tuple) else (key,)
+        group_meta = dict(zip(groups, key_values))
+        for metric in metric_columns:
+            if metric not in group.columns:
+                continue
+            values = pd.to_numeric(group[metric], errors="coerce").dropna()
+            if values.empty:
+                continue
+            std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+            rows.append(
+                {
+                    **group_meta,
+                    "metric": metric,
+                    "n": int(len(values)),
+                    "mean": round(float(values.mean()), 6),
+                    "std": round(std, 6),
+                    "sem": round(std / (len(values) ** 0.5), 6) if len(values) > 1 else 0.0,
+                    "min": round(float(values.min()), 6),
+                    "max": round(float(values.max()), 6),
+                }
+            )
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        summary = pd.DataFrame(columns=output_columns)
+    summary.to_csv(path, index=False)
+    return summary
+
+
+def write_decision_quality_summary(
+    prices: pd.DataFrame,
+    rationales: pd.DataFrame,
+    path: Path,
+) -> pd.DataFrame:
+    frames: list[pd.DataFrame] = []
+    if not prices.empty:
+        frames.append(
+            long_metric_frame(
+                prices,
+                metrics=[
+                    "price_accuracy",
+                    "avg_adjusted_minus_actual_service_price",
+                    "avg_adjusted_vs_actual_pct",
+                ],
+                metric_family="price_decision",
+            )
+        )
+    if not rationales.empty:
+        frames.append(
+            long_metric_frame(
+                rationales,
+                metrics=["stress_accuracy", "miss_stress_rate", "suggested_price_shift_pct"],
+                metric_family="stress_and_price_trace",
+            )
+        )
+    combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    columns = [
+        "forecast_model",
+        "agent_mode",
+        "diurnal_blend_alpha",
+        "metric_family",
+        "metric",
+        "n",
+        "mean",
+        "std",
+        "sem",
+        "min",
+        "max",
+    ]
+    if combined.empty:
+        summary = pd.DataFrame(columns=columns)
+        summary.to_csv(path, index=False)
+        return summary
+
+    groups = [
+        column
+        for column in ["forecast_model", "agent_mode", "diurnal_blend_alpha", "metric_family", "metric"]
+        if column in combined.columns
+    ]
+    rows = []
+    for key, group in combined.groupby(groups, dropna=False):
+        key_values = key if isinstance(key, tuple) else (key,)
+        group_meta = dict(zip(groups, key_values))
+        values = pd.to_numeric(group["value"], errors="coerce").dropna()
+        if values.empty:
+            continue
+        std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+        rows.append(
+            {
+                **group_meta,
+                "n": int(len(values)),
+                "mean": round(float(values.mean()), 6),
+                "std": round(std, 6),
+                "sem": round(std / (len(values) ** 0.5), 6) if len(values) > 1 else 0.0,
+                "min": round(float(values.min()), 6),
+                "max": round(float(values.max()), 6),
+            }
+        )
+    summary = pd.DataFrame(rows)
+    if summary.empty:
+        summary = pd.DataFrame(columns=columns)
+    summary.to_csv(path, index=False)
+    return summary
+
+
+def long_metric_frame(frame: pd.DataFrame, *, metrics: list[str], metric_family: str) -> pd.DataFrame:
+    group_cols = [col for col in ["forecast_model", "agent_mode", "diurnal_blend_alpha"] if col in frame.columns]
+    rows = []
+    for metric in metrics:
+        if metric not in frame.columns:
+            continue
+        for _, row in frame.iterrows():
+            value = pd.to_numeric(pd.Series([row.get(metric)]), errors="coerce").iloc[0]
+            if pd.isna(value):
+                continue
+            rows.append(
+                {
+                    **{col: row.get(col) for col in group_cols},
+                    "metric_family": metric_family,
+                    "metric": metric,
+                    "value": float(value),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def experiment_variant_output_dir(
+    time_output_dir: Path,
+    *,
+    seed: int | None,
+    agent_mode: str,
+    diurnal_blend_alpha: float | None,
+    add_seed_folder: bool,
+    add_mode_folder: bool,
+    add_blend_folder: bool,
+) -> Path:
+    path = time_output_dir
+    if add_seed_folder and seed is not None:
+        path = path / f"seed_{seed}"
+    if add_mode_folder:
+        path = path / f"agent_{safe_filename(agent_mode)}"
+    if add_blend_folder and diurnal_blend_alpha is not None:
+        path = path / f"blend_{format_blend_alpha(diurnal_blend_alpha)}"
+    return path
+
+
+def format_blend_alpha(value: float) -> str:
+    return safe_filename(f"{float(value):.3f}".rstrip("0").rstrip("."))
+
+
+def apply_uniform_diurnal_blend(kwargs: dict[str, Any], alpha: float) -> None:
+    value = float(alpha)
+    kwargs["timesfm_diurnal_blend_alpha"] = value
+    kwargs["ar_diurnal_blend_alpha"] = value
+    kwargs["chronos_diurnal_blend_alpha"] = value
+    kwargs["lstm_diurnal_blend_alpha"] = value
+
+
+def select_representative_zone_ids(profiles: pd.DataFrame, *, count: int) -> list[str]:
+    frame = profiles.copy()
+    if frame.empty:
+        raise ValueError("Cannot select representative zones from an empty profile table.")
+    frame["zone_id"] = frame["zone_id"].astype(str)
+    target = max(1, min(int(count), len(frame)))
+    selected: list[str] = []
+    seen: set[str] = set()
+
+    for zone_id in select_zone_categories(frame)["zone_id"].astype(str).tolist():
+        if zone_id not in seen:
+            selected.append(zone_id)
+            seen.add(zone_id)
+        if len(selected) >= target:
+            return selected
+
+    ranked = frame.sort_values(["mean_load_kwh", "load_cv", "peak_capacity_ratio", "zone_id"]).reset_index(drop=True)
+    if target == 1:
+        candidate_indices = [len(ranked) // 2]
+    else:
+        candidate_indices = [
+            round(idx * (len(ranked) - 1) / (target - 1))
+            for idx in range(target)
+        ]
+    for idx in candidate_indices:
+        zone_id = str(ranked.iloc[int(idx)]["zone_id"])
+        if zone_id not in seen:
+            selected.append(zone_id)
+            seen.add(zone_id)
+        if len(selected) >= target:
+            return selected
+
+    for zone_id in ranked["zone_id"].astype(str).tolist():
+        if zone_id not in seen:
+            selected.append(zone_id)
+            seen.add(zone_id)
+        if len(selected) >= target:
+            break
+    return selected
 
 
 def forecast_output_dir(output_dir: Path, forecast_model: str) -> Path:

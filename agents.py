@@ -77,9 +77,10 @@ async def run_zone_chain(
     *,
     client: ChatClient | None,
     temperature: float = 0.2,
+    heuristic_source: str = "dry-run",
 ) -> dict[str, Any]:
     if client is None:
-        return heuristic_zone_chain(context)
+        return heuristic_zone_chain(context, source=heuristic_source)
 
     grid = merge_grid_fallback(
         await client.complete_json(grid_prompt(context), temperature=temperature),
@@ -116,8 +117,17 @@ async def run_all_zone_chains(
     *,
     client: ChatClient | None,
     temperature: float = 0.2,
+    heuristic_source: str = "dry-run",
 ) -> list[dict[str, Any]]:
-    tasks = [run_zone_chain(context, client=client, temperature=temperature) for context in contexts]
+    tasks = [
+        run_zone_chain(
+            context,
+            client=client,
+            temperature=temperature,
+            heuristic_source=heuristic_source,
+        )
+        for context in contexts
+    ]
     return await asyncio.gather(*tasks)
 
 
@@ -174,11 +184,11 @@ def attach_economist_debug(report: dict[str, Any], debug: dict[str, Any]) -> dic
     return tagged
 
 
-def heuristic_zone_chain(context: dict[str, Any]) -> dict[str, Any]:
+def heuristic_zone_chain(context: dict[str, Any], *, source: str = "dry-run") -> dict[str, Any]:
     grid = heuristic_grid(context)
     behavior = heuristic_behavior(context)
     economist = heuristic_economist(context, grid)
-    return combine_reports(context, grid, behavior, economist, source="dry-run")
+    return combine_reports(context, grid, behavior, economist, source=source)
 
 
 def heuristic_grid(context: dict[str, Any]) -> dict[str, Any]:

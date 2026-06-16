@@ -18,9 +18,15 @@ class RunConfig:
     history_days: int = 7
     validation_days: int = 1
     zone_ids: list[str] | None = None
+    experiment_zone_count: int = 12
     forecast_model: str = "timesfm"
     forecast_starts: list[str] | None = None
     forecast_models: list[str] | None = None
+    experiment_seeds: list[int] | None = None
+    agent_mode: str = "agents"
+    agent_modes: list[str] | None = None
+    diurnal_blend_alpha: float | None = None
+    diurnal_blend_alphas: list[float] | None = None
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch"
     timesfm_context_hours: int = 168
     timesfm_step_horizon: int = 24
@@ -54,9 +60,14 @@ class RunConfig:
         zone_ids = settings.get("zone_ids", settings.get("zones"))
         forecast_starts = normalize_string_list(settings.get("forecast_starts"))
         forecast_models = normalize_forecast_model_list(settings.get("forecast_models"))
+        experiment_seeds = normalize_int_list(settings.get("experiment_seeds"))
+        agent_modes = normalize_agent_mode_list(settings.get("agent_modes"))
+        diurnal_blend_alphas = normalize_float_list(settings.get("diurnal_blend_alphas"))
         horizon_days = optional_int(settings.get("horizon_days"))
         history_days = optional_int(settings.get("history_days"))
         validation_days = optional_int(settings.get("validation_days"))
+        experiment_zone_count = optional_int(settings.get("experiment_zone_count"))
+        diurnal_blend_alpha = optional_float(settings.get("diurnal_blend_alpha"))
         timesfm_context_hours = optional_int(settings.get("timesfm_context_hours"))
         timesfm_step_horizon = optional_int(settings.get("timesfm_step_horizon"))
         timesfm_diurnal_blend_alpha = optional_float(
@@ -88,9 +99,15 @@ class RunConfig:
             history_days=history_days if history_days is not None else 7,
             validation_days=validation_days if validation_days is not None else 1,
             zone_ids=normalize_zone_id_list(zone_ids),
+            experiment_zone_count=experiment_zone_count if experiment_zone_count is not None else 12,
             forecast_model=normalize_forecast_model_name(optional_str(settings.get("forecast_model"))),
             forecast_starts=forecast_starts,
             forecast_models=forecast_models,
+            experiment_seeds=experiment_seeds,
+            agent_mode=normalize_agent_mode(optional_str(settings.get("agent_mode"))),
+            agent_modes=agent_modes,
+            diurnal_blend_alpha=diurnal_blend_alpha,
+            diurnal_blend_alphas=diurnal_blend_alphas,
             timesfm_repo=optional_str(settings.get("timesfm_repo"))
             or "google/timesfm-2.5-200m-pytorch",
             timesfm_context_hours=timesfm_context_hours if timesfm_context_hours is not None else 168,
@@ -334,6 +351,15 @@ def normalize_forecast_model_name(value: str | None) -> str:
     return "AR" if normalized == "ar" else normalized
 
 
+def normalize_agent_mode(value: str | None) -> str:
+    normalized = (value or "agents").strip().lower().replace("-", "_")
+    if normalized in {"agent", "agents", "model", "llm"}:
+        return "agents"
+    if normalized in {"rule", "rules", "rule_only", "without_agents", "no_agents"}:
+        return "rules"
+    raise ValueError(f"Unsupported agent_mode: {value}")
+
+
 def optional_int(value: Any) -> int | None:
     if value in (None, ""):
         return None
@@ -376,6 +402,51 @@ def normalize_string_list(value: Any) -> list[str] | None:
                 values.append(value_text)
                 seen.add(value_text)
     return values or None
+
+
+def normalize_int_list(value: Any) -> list[int] | None:
+    values = normalize_string_list(value)
+    if not values:
+        return None
+    normalized: list[int] = []
+    seen: set[int] = set()
+    for item in values:
+        number = int(item)
+        if number not in seen:
+            normalized.append(number)
+            seen.add(number)
+    return normalized or None
+
+
+def normalize_float_list(value: Any) -> list[float] | None:
+    values = normalize_string_list(value)
+    if not values:
+        return None
+    normalized: list[float] = []
+    seen: set[float] = set()
+    for item in values:
+        number = float(item)
+        if number < 0.0 or number > 1.0:
+            raise ValueError(f"Diurnal blend alpha must be between 0 and 1: {item}")
+        rounded = round(number, 6)
+        if rounded not in seen:
+            normalized.append(rounded)
+            seen.add(rounded)
+    return normalized or None
+
+
+def normalize_agent_mode_list(value: Any) -> list[str] | None:
+    values = normalize_string_list(value)
+    if not values:
+        return None
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        mode = normalize_agent_mode(item)
+        if mode not in seen:
+            normalized.append(mode)
+            seen.add(mode)
+    return normalized or None
 
 
 def normalize_forecast_model_list(value: Any) -> list[str] | None:

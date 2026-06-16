@@ -3,7 +3,15 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from config import AppConfig, normalize_forecast_model_list, normalize_string_list
+from config import (
+    AppConfig,
+    normalize_agent_mode,
+    normalize_agent_mode_list,
+    normalize_float_list,
+    normalize_forecast_model_list,
+    normalize_int_list,
+    normalize_string_list,
+)
 from orchestrator import run_experiment_matrix, run_pipeline
 
 
@@ -44,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--horizon-days", type=int, default=None, help="Forecast horizon.")
     parser.add_argument("--history-days", type=int, default=None, help="History window used for the zone snippets.")
+    parser.add_argument("--validation-days", type=int, default=None, help="Validation window used for bias calibration.")
     parser.add_argument(
         "--zones",
         nargs="+",
@@ -57,6 +66,41 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help="Forecast model(s) for an experiment matrix: timesfm, chronos, lstm, or AR.",
+    )
+    parser.add_argument(
+        "--experiment-zone-count",
+        type=int,
+        default=None,
+        help="Representative zone count for experiment matrices when --zones is omitted.",
+    )
+    parser.add_argument(
+        "--experiment-seeds",
+        nargs="+",
+        default=None,
+        help="Seed(s) for repeated experiment runs, mainly affecting LSTM training.",
+    )
+    parser.add_argument(
+        "--agent-mode",
+        default=None,
+        help="Agent mode for a single run: agents or rules.",
+    )
+    parser.add_argument(
+        "--agent-modes",
+        nargs="+",
+        default=None,
+        help="Agent modes for ablation matrices: agents and/or rules.",
+    )
+    parser.add_argument(
+        "--diurnal-blend-alpha",
+        type=float,
+        default=None,
+        help="Uniform diurnal blend weight for all forecasters.",
+    )
+    parser.add_argument(
+        "--diurnal-blend-alphas",
+        nargs="+",
+        default=None,
+        help="Uniform diurnal blend weights to sweep in an experiment matrix.",
     )
     parser.add_argument("--temperature", type=float, default=None, help="LLM sampling temperature.")
     return parser
@@ -84,6 +128,25 @@ def resolve_forecast_models(args, run_config) -> list[str]:
     return [run_config.forecast_model]
 
 
+def resolve_experiment_seeds(args, run_config) -> list[int] | None:
+    cli_seeds = normalize_int_list(args.experiment_seeds)
+    return cli_seeds if cli_seeds else run_config.experiment_seeds
+
+
+def resolve_agent_modes(args, run_config) -> list[str] | None:
+    cli_modes = normalize_agent_mode_list(args.agent_modes)
+    if cli_modes:
+        return cli_modes
+    return run_config.agent_modes
+
+
+def resolve_diurnal_blend_alphas(args, run_config) -> list[float] | None:
+    cli_alphas = normalize_float_list(args.diurnal_blend_alphas)
+    if cli_alphas:
+        return cli_alphas
+    return run_config.diurnal_blend_alphas
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     config_path = Path(args.config)
@@ -91,7 +154,23 @@ def main(argv: list[str] | None = None) -> int:
     run_config = app_config.run
     forecast_starts = resolve_forecast_starts(args, run_config)
     forecast_models = resolve_forecast_models(args, run_config)
-    run_matrix = len(forecast_starts) > 1 or len(forecast_models) > 1
+    experiment_seeds = resolve_experiment_seeds(args, run_config)
+    agent_modes = resolve_agent_modes(args, run_config)
+    diurnal_blend_alphas = resolve_diurnal_blend_alphas(args, run_config)
+    run_matrix = (
+        len(forecast_starts) > 1
+        or len(forecast_models) > 1
+        or bool(experiment_seeds and len(experiment_seeds) > 1)
+        or bool(agent_modes and len(agent_modes) > 1)
+        or bool(diurnal_blend_alphas and len(diurnal_blend_alphas) > 1)
+    )
+
+    agent_mode = normalize_agent_mode(args.agent_mode) if args.agent_mode else run_config.agent_mode
+    diurnal_blend_alpha = (
+        args.diurnal_blend_alpha
+        if args.diurnal_blend_alpha is not None
+        else run_config.diurnal_blend_alpha
+    )
 
     common_kwargs = {
         "data_dir": Path(args.data_dir or run_config.data_dir),
@@ -104,8 +183,14 @@ def main(argv: list[str] | None = None) -> int:
         "max_poi_rows": args.max_poi_rows if args.max_poi_rows is not None else run_config.max_poi_rows,
         "horizon_days": args.horizon_days if args.horizon_days is not None else run_config.horizon_days,
         "history_days": args.history_days if args.history_days is not None else run_config.history_days,
-        "validation_days": run_config.validation_days,
+        "validation_days": args.validation_days if args.validation_days is not None else run_config.validation_days,
         "zone_ids": args.zones if args.zones is not None else run_config.zone_ids,
+        "experiment_zone_count": (
+            args.experiment_zone_count
+            if args.experiment_zone_count is not None
+            else run_config.experiment_zone_count
+        ),
+        "agent_mode": agent_mode,
         "timesfm_repo": run_config.timesfm_repo,
         "timesfm_context_hours": run_config.timesfm_context_hours,
         "timesfm_step_horizon": run_config.timesfm_step_horizon,
@@ -133,6 +218,11 @@ def main(argv: list[str] | None = None) -> int:
         "lstm_seed": run_config.lstm_seed,
         "temperature": args.temperature if args.temperature is not None else run_config.temperature,
     }
+    if diurnal_blend_alpha is not None:
+        common_kwargs["timesfm_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
+        common_kwargs["ar_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
+        common_kwargs["chronos_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
+        common_kwargs["lstm_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
 
     if run_matrix:
         if not forecast_starts:
@@ -140,6 +230,9 @@ def main(argv: list[str] | None = None) -> int:
         outputs = run_experiment_matrix(
             forecast_starts=forecast_starts,
             forecast_models=forecast_models,
+            experiment_seeds=experiment_seeds,
+            agent_modes=agent_modes,
+            diurnal_blend_alphas=diurnal_blend_alphas,
             **common_kwargs,
         )
     else:

@@ -160,6 +160,12 @@ def forecast_zone(
 
     peak_capacity_ratio = forecast_peak / capacity if capacity > 0 else 0.0
     stress_level = str(profile.get("grid_stress_level") or "Low")
+    active_diurnal_blend_alpha = {
+        "timesfm": timesfm_diurnal_blend_alpha,
+        "AR": ar_diurnal_blend_alpha,
+        "chronos": chronos_diurnal_blend_alpha,
+        "lstm": lstm_diurnal_blend_alpha,
+    }.get(normalized_model)
 
     summary = {
         "zone_id": zone_id,
@@ -173,6 +179,9 @@ def forecast_zone(
         "forecast_horizon_days": int(horizon_days),
         "forecast_horizon_hours": int(horizon_hours),
         "forecast_model": normalized_model,
+        "diurnal_blend_alpha": round(float(active_diurnal_blend_alpha), 4)
+        if active_diurnal_blend_alpha is not None
+        else None,
         "timesfm_covariates": (timesfm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS) if normalized_model == "timesfm" else None,
         "timesfm_diurnal_blend_alpha": round(float(timesfm_diurnal_blend_alpha), 4) if normalized_model == "timesfm" else None,
         "timesfm_roll_actuals": bool(timesfm_roll_actuals) if normalized_model == "timesfm" else None,
@@ -194,6 +203,7 @@ def forecast_zone(
         "lstm_diurnal_blend_alpha": round(float(lstm_diurnal_blend_alpha), 4) if normalized_model == "lstm" else None,
         "lstm_device": lstm_device if normalized_model == "lstm" else None,
         "lstm_roll_actuals": bool(lstm_roll_actuals) if normalized_model == "lstm" else None,
+        "lstm_seed": int(lstm_seed) if normalized_model == "lstm" else None,
         "calibration": forecast_attrs.get("calibration"),
         "forecast_total_kwh": round(forecast_total, 2),
         "forecast_peak_kwh": round(forecast_peak, 2),

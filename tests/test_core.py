@@ -41,6 +41,7 @@ from orchestrator import (
     forecast_output_dir,
     normalize_zone_ids,
     run_experiment_matrix,
+    select_representative_zone_ids,
     select_requested_zones,
 )
 from prompts import compact_economist_context, economist_prompt, grid_prompt
@@ -444,9 +445,14 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.run.horizon_days, 2)
         self.assertEqual(config.run.history_days, 7)
         self.assertEqual(config.run.validation_days, 1)
-        self.assertEqual(config.run.zone_ids, ["102", "105"])
+        self.assertIsNone(config.run.zone_ids)
+        self.assertEqual(config.run.experiment_zone_count, 12)
         self.assertEqual(config.run.forecast_model, "timesfm")
         self.assertEqual(config.run.forecast_models, ["timesfm", "chronos", "lstm", "AR"])
+        self.assertEqual(config.run.experiment_seeds, [7, 42, 99])
+        self.assertEqual(config.run.agent_mode, "agents")
+        self.assertEqual(config.run.agent_modes, ["agents", "rules"])
+        self.assertEqual(config.run.diurnal_blend_alphas, [0.0, 0.3, 0.6])
         self.assertEqual(config.run.timesfm_repo, "google/timesfm-2.5-200m-pytorch")
         self.assertEqual(config.run.timesfm_exog_cols[:4], ["T", "U", "nRAIN", "e_price"])
         self.assertEqual(config.run.ar_diurnal_blend_alpha, 0.0)
@@ -799,12 +805,14 @@ class SelectionTests(unittest.TestCase):
                         {
                             "zone_id": "102",
                             "forecast_model": kwargs["forecast_model"],
+                            "diurnal_blend_alpha": kwargs.get("timesfm_diurnal_blend_alpha"),
                             "forecast_start": kwargs["forecast_start"],
                             "MAE": 1.0,
                         },
                         {
                             "zone_id": "105",
                             "forecast_model": kwargs["forecast_model"],
+                            "diurnal_blend_alpha": kwargs.get("timesfm_diurnal_blend_alpha"),
                             "forecast_start": kwargs["forecast_start"],
                             "MAE": 2.0,
                         },
@@ -866,6 +874,124 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(len(rationales), 8)
             self.assertEqual(set(metrics["zone_id"].astype(str)), {"102", "105"})
             self.assertIn("run_output_dir", metrics.columns)
+            forecast_summary = pd.read_csv(outputs["experiment_forecast_summary_csv"])
+            self.assertIn("mean", forecast_summary.columns)
+
+    def test_experiment_matrix_expands_seeds_agent_modes_and_blends(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calls = []
+
+            def fake_run_pipeline(**kwargs):
+                calls.append(kwargs)
+                run_dir = forecast_output_dir(kwargs["output_dir"], kwargs["forecast_model"])
+                run_dir.mkdir(parents=True, exist_ok=True)
+                metrics_path = run_dir / "forecast_metrics.csv"
+                price_path = run_dir / "price_comparison_summary.csv"
+                rationale_path = run_dir / "rationale_trace.csv"
+                explainability_path = run_dir / "explainability_review_packet.csv"
+                pd.DataFrame(
+                    [
+                        {
+                            "zone_id": "102",
+                            "forecast_model": kwargs["forecast_model"],
+                            "MAE": float(kwargs.get("lstm_seed", 0) or 0) + 1.0,
+                            "diurnal_blend_alpha": kwargs.get("lstm_diurnal_blend_alpha"),
+                        }
+                    ]
+                ).to_csv(metrics_path, index=False)
+                pd.DataFrame(
+                    [
+                        {
+                            "zone_id": "102",
+                            "category": "User-selected",
+                            "price_accuracy": 0.5 if kwargs["agent_mode"] == "rules" else 0.75,
+                            "avg_adjusted_minus_actual_service_price": 0.1,
+                            "avg_adjusted_vs_actual_pct": 5.0,
+                        }
+                    ]
+                ).to_csv(price_path, index=False)
+                pd.DataFrame(
+                    [
+                        {
+                            "zone_id": "102",
+                            "source": kwargs["agent_mode"],
+                            "stress_accuracy": 0.8,
+                            "miss_stress_rate": 0.1,
+                            "suggested_price_shift_pct": 3,
+                        }
+                    ]
+                ).to_csv(rationale_path, index=False)
+                pd.DataFrame([{"zone_id": "102", "rationale": "specific rationale"}]).to_csv(
+                    explainability_path,
+                    index=False,
+                )
+                return {
+                    "forecast_metrics_csv": metrics_path,
+                    "price_comparison_summary_csv": price_path,
+                    "rationale_trace_csv": rationale_path,
+                    "explainability_review_packet_csv": explainability_path,
+                }
+
+            with patch("orchestrator.run_pipeline", side_effect=fake_run_pipeline):
+                outputs = run_experiment_matrix(
+                    data_dir=root / "data",
+                    output_dir=root / "output",
+                    config_path=Path("config.yaml"),
+                    dry_run=True,
+                    forecast_starts=["2022-09-09 00:00:00"],
+                    forecast_models=["lstm"],
+                    zone_ids=["102"],
+                    experiment_seeds=[7, 42],
+                    agent_modes=["agents", "rules"],
+                    diurnal_blend_alphas=[0.0, 0.3],
+                )
+
+            self.assertEqual(len(calls), 8)
+            self.assertEqual({call["lstm_seed"] for call in calls}, {7, 42})
+            self.assertEqual({call["agent_mode"] for call in calls}, {"agents", "rules"})
+            self.assertEqual({call["lstm_diurnal_blend_alpha"] for call in calls}, {0.0, 0.3})
+            self.assertTrue(all("seed_" in str(call["output_dir"]) for call in calls))
+            self.assertTrue(all("agent_" in str(call["output_dir"]) for call in calls))
+            self.assertTrue(all("blend_" in str(call["output_dir"]) for call in calls))
+            runs = pd.read_csv(outputs["experiment_runs_csv"])
+            self.assertEqual(len(runs), 8)
+            decision_summary = pd.read_csv(outputs["experiment_decision_quality_summary_csv"])
+            self.assertIn("price_accuracy", set(decision_summary["metric"]))
+
+    def test_selects_representative_zone_ids_beyond_category_five(self):
+        profiles = pd.DataFrame(
+            {
+                "zone_id": [str(i) for i in range(1, 9)],
+                "poi_business_density": np.linspace(1, 8, 8),
+                "morning_ratio": np.linspace(1, 2, 8),
+                "noon_ratio": np.linspace(2, 1, 8),
+                "night_ratio": np.linspace(1, 3, 8),
+                "poi_food_density": np.linspace(3, 1, 8),
+                "poi_lifestyle_density": np.linspace(1, 3, 8),
+                "charge_count": np.arange(10, 18),
+                "burstiness_p99_mean": np.linspace(1, 2, 8),
+                "load_cv": np.linspace(0.1, 0.8, 8),
+                "peak_load_kwh": np.linspace(20, 80, 8),
+                "mean_load_kwh": np.linspace(5, 40, 8),
+                "weekend_ratio": np.linspace(0.8, 1.2, 8),
+                "peak_capacity_ratio": np.linspace(0.1, 0.4, 8),
+                "longitude": 0,
+                "latitude": 0,
+                "station_count": 1,
+                "capacity_kw_proxy": 1,
+                "morning_ratio": np.linspace(1, 2, 8),
+                "evening_ratio": np.linspace(1, 2, 8),
+                "poi_food": 0,
+                "poi_business": 0,
+                "poi_lifestyle": 0,
+                "poi_total": 0,
+                "mean_service_price": 1.0,
+            }
+        )
+        selected = select_representative_zone_ids(profiles, count=7)
+        self.assertEqual(len(selected), 7)
+        self.assertEqual(len(set(selected)), 7)
 
     def test_normalizes_requested_zone_ids(self):
         zone_ids = normalize_zone_ids(["102,104", " 108 ", "104"])

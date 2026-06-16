@@ -10,6 +10,18 @@ import pandas as pd
 PRICE_ERROR_THRESHOLD_RATIO = 0.08
 PRICE_ERROR_THRESHOLD_PCT = PRICE_ERROR_THRESHOLD_RATIO * 100
 ECONOMIST_AGENT_OUTPUT_KEY = "_economist_agent_output"
+EXPLAINABILITY_RUBRIC_TEXT = """# Explainability Evaluation Rubric
+
+Score each criterion from 1 to 5.
+
+1. Forecast grounding: the rationale cites forecast load, stress, price, weather, occupancy, or temporal evidence present in the packet.
+2. Temporal specificity: the rationale names the relevant window or time-of-day pattern instead of only giving a generic statement.
+3. Decision consistency: the recommended price action is consistent with predicted stress, demand level, and service/energy price context.
+4. Actionability: an operator could turn the explanation into a concrete pricing or grid-management decision.
+5. No leakage or hallucination: the rationale avoids actual future load, forecast error, evaluation labels, and unsupported external facts.
+
+Recommended protocol: use at least two independent raters, then add an operator sanity-check note for rationales that are technically inconsistent, unsafe, or operationally implausible.
+"""
 
 
 TRACE_COLUMNS = [
@@ -58,6 +70,8 @@ def write_outputs(
     price_schedule_md = output_dir / "price_schedule_3h.md"
     price_comparison_csv = output_dir / "price_comparison_summary.csv"
     price_comparison_md = output_dir / "price_comparison_summary.md"
+    explainability_rubric_md = output_dir / "explainability_rubric.md"
+    explainability_review_packet_csv = output_dir / "explainability_review_packet.csv"
     details_dir = output_dir / "forecast_details"
 
     selected_zones.to_csv(selected_path, index=False)
@@ -71,6 +85,11 @@ def write_outputs(
     trace_json.write_text(json.dumps(trace_reports, indent=2, ensure_ascii=False), encoding="utf-8")
     trace_md.write_text(markdown_table(trace), encoding="utf-8")
     write_price_schedule_outputs(price_schedule_csv, price_schedule_md, price_comparison_csv, price_comparison_md, trace_reports)
+    write_explainability_review_outputs(
+        explainability_rubric_md,
+        explainability_review_packet_csv,
+        trace_reports,
+    )
     metrics = write_forecast_outputs(details_dir, metrics_csv, metrics_md, forecast_results)
 
     outputs = {
@@ -86,6 +105,8 @@ def write_outputs(
         "price_schedule_3h_md": price_schedule_md,
         "price_comparison_summary_csv": price_comparison_csv,
         "price_comparison_summary_md": price_comparison_md,
+        "explainability_rubric_md": explainability_rubric_md,
+        "explainability_review_packet_csv": explainability_review_packet_csv,
         "forecast_details_dir": details_dir,
     }
     outputs.update(metrics)
@@ -135,6 +156,7 @@ def write_forecast_outputs(
                 "zone_id": zone_id,
                 "category": result.summary.get("category"),
                 "forecast_model": result.summary.get("forecast_model"),
+                "diurnal_blend_alpha": result.summary.get("diurnal_blend_alpha"),
                 "calibration_enabled": (result.summary.get("calibration") or {}).get("enabled"),
                 "bias_mean": (result.summary.get("calibration") or {}).get("bias_mean"),
                 "bias_max_abs": (result.summary.get("calibration") or {}).get("bias_max_abs"),
@@ -165,6 +187,7 @@ def write_forecast_outputs(
                 "grid_stress_q50_kwh": result.summary.get("grid_stress_q50_kwh"),
                 "grid_stress_q80_kwh": result.summary.get("grid_stress_q80_kwh"),
                 "grid_stress_q95_kwh": result.summary.get("grid_stress_q95_kwh"),
+                "lstm_seed": result.summary.get("lstm_seed"),
             }
         )
 
@@ -218,6 +241,58 @@ def write_price_schedule_outputs(
     summary = build_price_comparison_summary(frame)
     summary.to_csv(price_comparison_csv, index=False)
     price_comparison_md.write_text(markdown_table(summary), encoding="utf-8")
+
+
+def write_explainability_review_outputs(
+    rubric_md: Path,
+    review_packet_csv: Path,
+    reports: list[dict[str, Any]],
+) -> None:
+    rubric_md.write_text(EXPLAINABILITY_RUBRIC_TEXT, encoding="utf-8")
+    rows = []
+    for report in reports:
+        rows.append(explainability_review_row(report, None))
+        for window in report.get("price_change_windows_3h") or []:
+            if isinstance(window, dict):
+                rows.append(explainability_review_row(report, window))
+    pd.DataFrame(rows).to_csv(review_packet_csv, index=False)
+
+
+def explainability_review_row(report: dict[str, Any], window: dict[str, Any] | None) -> dict[str, Any]:
+    is_window = window is not None
+    item = window or {}
+    return {
+        "record_type": "price_window_3h" if is_window else "zone_summary",
+        "zone_id": report.get("zone_id"),
+        "category": report.get("category"),
+        "source": report.get("source"),
+        "window_start": item.get("window_start"),
+        "window_end": item.get("window_end"),
+        "predicted_load_kwh": item.get("sum_predicted_kwh") if is_window else report.get("predicted_load_kwh"),
+        "actual_load_kwh": item.get("sum_actual_kwh") if is_window else report.get("actual_load_kwh"),
+        "predicted_stress_level": item.get("load_stress_level") or report.get("grid_stress_level"),
+        "actual_stress_level": item.get("actual_load_stress_level") or report.get("actual_grid_stress_level"),
+        "suggested_price_shift_pct": item.get("suggested_price_shift_pct")
+        if is_window
+        else report.get("suggested_price_shift_pct"),
+        "action_label": item.get("action_label") if is_window else report.get("action_label"),
+        "rationale": item.get("price_rationale") if is_window else report.get("price_rationale"),
+        "behavior_reasoning": report.get("agent_reasoning"),
+        "rater_1_forecast_grounding_1_5": "",
+        "rater_1_temporal_specificity_1_5": "",
+        "rater_1_decision_consistency_1_5": "",
+        "rater_1_actionability_1_5": "",
+        "rater_1_no_leakage_1_5": "",
+        "rater_1_total": "",
+        "rater_2_forecast_grounding_1_5": "",
+        "rater_2_temporal_specificity_1_5": "",
+        "rater_2_decision_consistency_1_5": "",
+        "rater_2_actionability_1_5": "",
+        "rater_2_no_leakage_1_5": "",
+        "rater_2_total": "",
+        "operator_sanity_check": "",
+        "operator_notes": "",
+    }
 
 
 def price_comparison_fields(actual_price: Any, shift_pct: Any) -> dict[str, Any]:
@@ -390,7 +465,6 @@ def write_zone_plot(path: Path, summary: dict[str, Any], hourly: pd.DataFrame) -
         axis.tick_params(axis="x", labelbottom=True)
         axis.tick_params(axis="x", rotation=30)
 
-    fig.tight_layout()
     fig.savefig(path, bbox_inches="tight")
     plt.close(fig)
 

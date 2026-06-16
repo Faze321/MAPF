@@ -50,13 +50,19 @@ python main.py --dry-run --forecast-model chronos
 python main.py --dry-run --forecast-model lstm
 python main.py --dry-run --forecast-model AR
 python main.py --zones 102 105 --forecast-starts "2022-09-09 00:00:00" "2022-10-14 00:00:00" "2022-12-16 00:00:00" "2023-02-24 00:00:00" --forecast-models timesfm chronos lstm AR
+python main.py --forecast-starts "2022-09-09 00:00:00" "2022-10-14 00:00:00" --forecast-models chronos lstm --experiment-zone-count 12 --experiment-seeds 7 42 99
+python main.py --forecast-starts "2022-09-09 00:00:00" --forecast-models chronos lstm --agent-modes agents rules --diurnal-blend-alphas 0.0 0.3 0.6
 python main.py --config config.yaml --model anthropic/claude-sonnet-4.5 --forecast-start "2023-02-25 00:00:00"
 python main.py --force-cache
 ```
 
 Runtime defaults can be stored under `run:` in `config.yaml`, so common settings do not need to be typed each time. Command-line options override YAML values only for that run. When `run.zones` / `--zones` is omitted, the pipeline keeps the original five-category automatic zone selection. When zones are provided, the pipeline skips category selection and validates only the specified zone ids.
 
-For broader experimental validation, set `run.forecast_starts` and `run.forecast_models`, or pass `--forecast-starts` and `--forecast-models`. Multi-value runs execute the full forecast-start by forecaster matrix while keeping each combination in a separate folder under `output/experiments/`, for example `output/experiments/zones_102_105_4starts/2022-09-09_000000/timesfm/`. The experiment root also writes `experiment_runs.csv`, `experiment_forecast_metrics.csv`, `experiment_price_comparison_summary.csv`, and `experiment_rationale_trace.csv`.
+For broader experimental validation, set `run.forecast_starts` and `run.forecast_models`, or pass `--forecast-starts` and `--forecast-models`. If `run.zones` / `--zones` is omitted in an experiment matrix, the runner selects a representative zone set from the cached zone profiles. `run.experiment_zone_count` / `--experiment-zone-count` controls the size of that set; the example config uses 12 zones instead of the earlier two-zone quick check.
+
+Experiment matrices can also sweep `run.experiment_seeds`, `run.agent_modes`, and `run.diurnal_blend_alphas`. Seeds are recorded for every model and passed into LSTM training. `agent_modes: ["agents", "rules"]` runs the LLM-backed agent chain against the deterministic rule-only pricing baseline, so `price_accuracy`, price bias, `stress_accuracy`, and `miss_stress_rate` can be compared directly. `diurnal_blend_alphas` applies the same daily-shape blend weight to TimesFM, Chronos, LSTM, and AR for fair blend ablations.
+
+Multi-value runs execute the full forecast-start by forecaster by seed by agent-mode by blend matrix while keeping each combination in a separate folder under `output/experiments/`, for example `output/experiments/zones_auto_4starts/2022-09-09_000000/seed_42/agent_rules/blend_0_3/lstm/`. The experiment root writes raw concatenated tables plus aggregate summaries with `n`, `mean`, `std`, and `sem`: `experiment_forecast_summary.csv`, `experiment_price_summary.csv`, `experiment_rationale_summary.csv`, and `experiment_decision_quality_summary.csv`.
 
 Set `run.forecast_model: "timesfm"` to use `google/timesfm-2.5-200m-pytorch` for load forecasting. Set `run.forecast_model: "lstm"` to train a small local PyTorch LSTM per zone. Set `run.forecast_model: "AR"` for a fast autoregressive baseline run without TimesFM.
 Set `run.forecast_model: "chronos"` to use Chronos. The default Chronos config uses `amazon/chronos-2`, rolls actual observations into the context during retrospective multi-day evaluation, and exports the same `predicted_kwh`, `q10_kwh`, `q50_kwh`, and `q90_kwh` columns as TimesFM.
@@ -80,11 +86,15 @@ The LSTM path uses the existing `torch` installation and trains only on the sele
 
 Generated result files are written under a forecast-model subfolder, for example `output/timesfm/`, `output/chronos/`, `output/lstm/`, or `output/AR/`:
 
-- `selected_zones.csv`: the five selected zones and the proxy features used for selection.
+- `selected_zones.csv`: the selected zones and the proxy features used for selection.
 - `context_snippets.json`: token-efficient context passed to each agent.
 - `rationale_trace.csv`: machine-readable explainability table.
 - `rationale_trace.md`: markdown table for a report or paper appendix.
 - `rationale_trace.json`: full structured agent outputs.
+- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, adjusted service price, actual service price, stress labels, and price rationales.
+- `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when the adjusted service price is within 8% of the actual service price.
+- `explainability_rubric.md`: five-criterion human evaluation rubric for rationale quality.
+- `explainability_review_packet.csv`: review template for two independent raters plus an operator sanity-check column.
 - `forecast_metrics.csv` / `forecast_metrics.md`: per-zone forecast metrics including MAE, RMSE, MAPE, RAE, and WAPE.
 - `forecast_details/zone_<id>_forecast_vs_actual.csv`: hourly actual vs predicted values, residuals, TimesFM raw/bias-corrected values, and P10/P50/P90 columns when TimesFM returns quantiles.
 - `forecast_details/zone_<id>_forecast_plot.png`: per-zone actual/predicted plot, P10-P90 band when available, residual bars, and metric summary.

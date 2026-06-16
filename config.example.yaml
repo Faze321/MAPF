@@ -20,15 +20,27 @@ run:
   horizon_days: 2
   history_days: 7
   validation_days: 1
-  zones:
-    - "102"
-    - "105"
+  zones: null
+  experiment_zone_count: 12
   forecast_model: "timesfm"
   forecast_models:
     - "timesfm"
     - "chronos"
     - "lstm"
     - "AR"
+  experiment_seeds:
+    - 7
+    - 42
+    - 99
+  agent_mode: "agents"
+  agent_modes:
+    - "agents"
+    - "rules"
+  diurnal_blend_alpha: null
+  diurnal_blend_alphas:
+    - 0.0
+    - 0.3
+    - 0.6
   timesfm_repo: "google/timesfm-2.5-200m-pytorch"
   timesfm_context_hours: 168
   timesfm_step_horizon: 24

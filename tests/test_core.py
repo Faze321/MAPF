@@ -12,6 +12,7 @@ import torch
 from agents import (
     ECONOMIST_AGENT_OUTPUT_KEY,
     AgentChatClient,
+    AgentStageError,
     extract_json_object,
     heuristic_behavior,
     heuristic_economist,
@@ -958,6 +959,41 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(len(runs), 8)
             decision_summary = pd.read_csv(outputs["experiment_decision_quality_summary_csv"])
             self.assertIn("price_accuracy", set(decision_summary["metric"]))
+
+    def test_experiment_matrix_writes_detailed_error_records(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            def fake_run_pipeline(**kwargs):
+                raise AgentStageError(
+                    stage="agent.grid",
+                    zone_id="102",
+                    agent="Grid Analyst",
+                    original=TypeError("'NoneType' object is not subscriptable"),
+                )
+
+            with patch("orchestrator.run_pipeline", side_effect=fake_run_pipeline):
+                outputs = run_experiment_matrix(
+                    data_dir=root / "data",
+                    output_dir=root / "output",
+                    config_path=Path("config.yaml"),
+                    forecast_starts=["2022-09-09 00:00:00"],
+                    forecast_models=["timesfm"],
+                    zone_ids=["102"],
+                    agent_modes=["agents"],
+                    diurnal_blend_alphas=[0.3],
+                )
+
+            runs = pd.read_csv(outputs["experiment_runs_csv"])
+            self.assertEqual(runs.loc[0, "status"], "failed")
+            self.assertEqual(runs.loc[0, "error_code"], "MAPF-E210")
+            self.assertEqual(runs.loc[0, "error_stage"], "agent.grid")
+            self.assertEqual(str(runs.loc[0, "error_zone_id"]), "102")
+            self.assertEqual(runs.loc[0, "error_agent"], "Grid Analyst")
+            self.assertEqual(runs.loc[0, "error_type"], "TypeError")
+            traceback_file = Path(runs.loc[0, "traceback_file"])
+            self.assertTrue(traceback_file.exists())
+            self.assertIn("TRACEBACK", traceback_file.read_text(encoding="utf-8"))
 
     def test_selects_representative_zone_ids_beyond_category_five(self):
         profiles = pd.DataFrame(

@@ -147,7 +147,7 @@ def resolve_diurnal_blend_alphas(args, run_config) -> list[float] | None:
     return run_config.diurnal_blend_alphas
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
     config_path = Path(args.config)
     app_config = AppConfig.from_file(config_path, required=False)
@@ -244,7 +244,6 @@ def main(argv: list[str] | None = None) -> int:
     print("Generated outputs:")
     for name, path in outputs.items():
         print(f"- {name}: {path}")
-    return 0
 
 
 if __name__ == "__main__":

@@ -25,6 +25,19 @@ GRID_STRESS_LEVEL_BY_KEY.update(
 )
 
 
+class AgentStageError(RuntimeError):
+    def __init__(self, *, stage: str, zone_id: Any, agent: str, original: Exception) -> None:
+        self.stage = stage
+        self.zone_id = zone_id
+        self.agent = agent
+        self.original = original
+        message = (
+            f"{agent} failed for zone {zone_id} at {stage}: "
+            f"{type(original).__name__}: {original}"
+        )
+        super().__init__(message)
+
+
 class ChatClient(Protocol):
     async def complete_json(self, prompt: str, *, temperature: float) -> dict[str, Any]:
         ...
@@ -83,11 +96,25 @@ async def run_zone_chain(
         return heuristic_zone_chain(context, source=heuristic_source)
 
     grid = merge_grid_fallback(
-        await client.complete_json(grid_prompt(context), temperature=temperature),
+        await complete_agent_json(
+            client,
+            grid_prompt(context),
+            context=context,
+            temperature=temperature,
+            stage="agent.grid",
+            agent="Grid Analyst",
+        ),
         context,
     )
     behavior = merge_behavior_fallback(
-        await client.complete_json(behavior_prompt(context, grid), temperature=temperature),
+        await complete_agent_json(
+            client,
+            behavior_prompt(context, grid),
+            context=context,
+            temperature=temperature,
+            stage="agent.behavior",
+            agent="Behavioural Agent",
+        ),
         context,
     )
     economist_report = await complete_validated_economist_report(
@@ -131,6 +158,28 @@ async def run_all_zone_chains(
     return await asyncio.gather(*tasks)
 
 
+async def complete_agent_json(
+    client: ChatClient,
+    prompt: str,
+    *,
+    context: dict[str, Any],
+    temperature: float,
+    stage: str,
+    agent: str,
+) -> dict[str, Any]:
+    try:
+        return await client.complete_json(prompt, temperature=temperature)
+    except AgentStageError:
+        raise
+    except Exception as exc:
+        raise AgentStageError(
+            stage=stage,
+            zone_id=context.get("zone_id"),
+            agent=agent,
+            original=exc,
+        ) from exc
+
+
 async def complete_validated_economist_report(
     client: ChatClient,
     context: dict[str, Any],
@@ -140,7 +189,14 @@ async def complete_validated_economist_report(
     temperature: float,
 ) -> dict[str, Any]:
     expected_windows = context.get("pricing_windows_3h", [])
-    report = await client.complete_json(economist_prompt(context, grid, behavior), temperature=temperature)
+    report = await complete_agent_json(
+        client,
+        economist_prompt(context, grid, behavior),
+        context=context,
+        temperature=temperature,
+        stage="agent.economist",
+        agent="Market Economist",
+    )
     errors = validate_economist_report(report, expected_windows)
     debug: dict[str, Any] = {
         "zone_id": context.get("zone_id"),
@@ -159,9 +215,13 @@ async def complete_validated_economist_report(
     if not errors:
         return attach_economist_debug(report, debug)
 
-    repaired = await client.complete_json(
+    repaired = await complete_agent_json(
+        client,
         repair_economist_prompt(context, grid, behavior, report, errors),
+        context=context,
         temperature=min(temperature, 0.1),
+        stage="agent.economist_repair",
+        agent="Market Economist Repair",
     )
     repair_errors = validate_economist_report(repaired, expected_windows)
     debug.update(

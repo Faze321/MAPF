@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
-from agents import AgentChatClient, run_all_zone_chains
+from agents import AgentChatClient, AgentStageError, run_all_zone_chains
 from config import AgentConfig, normalize_agent_mode, normalize_forecast_model_name
 from data_loader import build_zone_3h_load_quantiles, build_zone_profiles, load_pipeline_data
 from forecasting import ForecastResult, forecast_zone
@@ -16,6 +17,39 @@ from zone_selection import select_zone_categories
 
 
 STRESS_LEVEL_ORDER = {"Low": 0, "Medium": 1, "High": 2, "Extreme High": 3}
+ERROR_CODE_BY_STAGE = {
+    "zone_selection": "MAPF-E010",
+    "load_data": "MAPF-E020",
+    "forecast": "MAPF-E100",
+    "build_contexts": "MAPF-E110",
+    "agent_chain": "MAPF-E200",
+    "agent.grid": "MAPF-E210",
+    "agent.behavior": "MAPF-E220",
+    "agent.economist": "MAPF-E230",
+    "agent.economist_repair": "MAPF-E231",
+    "write_outputs": "MAPF-E300",
+    "unexpected": "MAPF-E900",
+}
+
+
+class PipelineStageError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        stage: str,
+        original: Exception,
+        zone_id: Any = None,
+        agent: str | None = None,
+    ) -> None:
+        self.stage = stage
+        self.zone_id = zone_id
+        self.agent = agent
+        self.original = original
+        location = f" zone={zone_id}" if zone_id is not None else ""
+        agent_text = f" agent={agent}" if agent else ""
+        super().__init__(
+            f"{stage}{location}{agent_text}: {type(original).__name__}: {original}"
+        )
 
 
 def run_pipeline(
@@ -81,53 +115,64 @@ def run_pipeline(
         force_cache=force_cache,
     )
     requested_zone_ids = normalize_zone_ids(zone_ids)
-    selected_zones = (
-        select_requested_zones(profiles, requested_zone_ids)
-        if requested_zone_ids
-        else select_zone_categories(profiles)
-    )
+    try:
+        selected_zones = (
+            select_requested_zones(profiles, requested_zone_ids)
+            if requested_zone_ids
+            else select_zone_categories(profiles)
+        )
+    except Exception as exc:
+        raise PipelineStageError(stage="zone_selection", original=exc) from exc
     selected_zone_ids = selected_zones["zone_id"].astype(str).tolist()
-    pipeline_data = load_pipeline_data(
-        data_dir,
-        profiles,
-        selected_zone_ids,
-        weather_file=weather_file,
-    )
-    contexts, forecast_results = build_contexts(
-        pipeline_data=pipeline_data,
-        selected_zones=selected_zones,
-        forecast_start=forecast_start,
-        horizon_days=horizon_days,
-        history_days=history_days,
-        validation_days=validation_days,
-        forecast_model=forecast_model,
-        zone_load_quantiles=zone_load_quantiles,
-        timesfm_repo=timesfm_repo,
-        timesfm_context_hours=timesfm_context_hours,
-        timesfm_step_horizon=timesfm_step_horizon,
-        timesfm_exog_cols=timesfm_exog_cols,
-        timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-        timesfm_roll_actuals=timesfm_roll_actuals,
-        ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
-        chronos_repo=chronos_repo,
-        chronos_context_hours=chronos_context_hours,
-        chronos_step_horizon=chronos_step_horizon,
-        chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
-        chronos_device=chronos_device,
-        chronos_roll_actuals=chronos_roll_actuals,
-        lstm_context_hours=lstm_context_hours,
-        lstm_step_horizon=lstm_step_horizon,
-        lstm_exog_cols=lstm_exog_cols,
-        lstm_hidden_size=lstm_hidden_size,
-        lstm_num_layers=lstm_num_layers,
-        lstm_epochs=lstm_epochs,
-        lstm_learning_rate=lstm_learning_rate,
-        lstm_batch_size=lstm_batch_size,
-        lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
-        lstm_device=lstm_device,
-        lstm_roll_actuals=lstm_roll_actuals,
-        lstm_seed=lstm_seed,
-    )
+    try:
+        pipeline_data = load_pipeline_data(
+            data_dir,
+            profiles,
+            selected_zone_ids,
+            weather_file=weather_file,
+        )
+    except Exception as exc:
+        raise PipelineStageError(stage="load_data", original=exc) from exc
+    try:
+        contexts, forecast_results = build_contexts(
+            pipeline_data=pipeline_data,
+            selected_zones=selected_zones,
+            forecast_start=forecast_start,
+            horizon_days=horizon_days,
+            history_days=history_days,
+            validation_days=validation_days,
+            forecast_model=forecast_model,
+            zone_load_quantiles=zone_load_quantiles,
+            timesfm_repo=timesfm_repo,
+            timesfm_context_hours=timesfm_context_hours,
+            timesfm_step_horizon=timesfm_step_horizon,
+            timesfm_exog_cols=timesfm_exog_cols,
+            timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
+            timesfm_roll_actuals=timesfm_roll_actuals,
+            ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
+            chronos_repo=chronos_repo,
+            chronos_context_hours=chronos_context_hours,
+            chronos_step_horizon=chronos_step_horizon,
+            chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
+            chronos_device=chronos_device,
+            chronos_roll_actuals=chronos_roll_actuals,
+            lstm_context_hours=lstm_context_hours,
+            lstm_step_horizon=lstm_step_horizon,
+            lstm_exog_cols=lstm_exog_cols,
+            lstm_hidden_size=lstm_hidden_size,
+            lstm_num_layers=lstm_num_layers,
+            lstm_epochs=lstm_epochs,
+            lstm_learning_rate=lstm_learning_rate,
+            lstm_batch_size=lstm_batch_size,
+            lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
+            lstm_device=lstm_device,
+            lstm_roll_actuals=lstm_roll_actuals,
+            lstm_seed=lstm_seed,
+        )
+    except PipelineStageError:
+        raise
+    except Exception as exc:
+        raise PipelineStageError(stage="build_contexts", original=exc) from exc
 
     if agent_mode == "rules":
         client = None
@@ -141,21 +186,29 @@ def run_pipeline(
             raise RuntimeError("agent.api_key is required in config.yaml, or pass --dry-run")
         client = AgentChatClient(config)
         heuristic_source = "dry-run"
-    reports = asyncio.run(
-        run_all_zone_chains(
-            contexts,
-            client=client,
-            temperature=temperature,
-            heuristic_source=heuristic_source,
+    try:
+        reports = asyncio.run(
+            run_all_zone_chains(
+                contexts,
+                client=client,
+                temperature=temperature,
+                heuristic_source=heuristic_source,
+            )
         )
-    )
-    return write_outputs(
-        output_dir=run_output_dir,
-        selected_zones=selected_zones,
-        contexts=contexts,
-        reports=reports,
-        forecast_results=forecast_results,
-    )
+    except AgentStageError:
+        raise
+    except Exception as exc:
+        raise PipelineStageError(stage="agent_chain", original=exc) from exc
+    try:
+        return write_outputs(
+            output_dir=run_output_dir,
+            selected_zones=selected_zones,
+            contexts=contexts,
+            reports=reports,
+            forecast_results=forecast_results,
+        )
+    except Exception as exc:
+        raise PipelineStageError(stage="write_outputs", original=exc) from exc
 
 
 def run_experiment_matrix(
@@ -250,6 +303,13 @@ def run_experiment_matrix(
                             "run_output_dir": str(run_output_dir),
                             "status": "running",
                             "error": "",
+                            "error_code": "",
+                            "error_stage": "",
+                            "error_zone_id": "",
+                            "error_agent": "",
+                            "error_type": "",
+                            "error_message": "",
+                            "traceback_file": "",
                             "completed_at": "",
                         }
                         try:
@@ -295,7 +355,14 @@ def run_experiment_matrix(
                             )
                         except Exception as exc:
                             record["status"] = "failed"
-                            record["error"] = f"{type(exc).__name__}: {exc}"
+                            record.update(
+                                experiment_error_record(
+                                    exc,
+                                    experiment_dir=experiment_dir,
+                                    record=record,
+                                    run_index=len(run_records) + 1,
+                                )
+                            )
                             record["completed_at"] = pd.Timestamp.now().isoformat()
                         finally:
                             cache_attempted = True
@@ -446,6 +513,96 @@ def write_experiment_summary(frames: list[pd.DataFrame], path: Path) -> pd.DataF
         frame = pd.DataFrame()
     frame.to_csv(path, index=False)
     return frame
+
+
+def experiment_error_record(
+    exc: Exception,
+    *,
+    experiment_dir: Path,
+    record: dict[str, Any],
+    run_index: int,
+) -> dict[str, Any]:
+    details = classify_experiment_error(exc)
+    traceback_path = write_error_traceback(
+        exc,
+        experiment_dir=experiment_dir,
+        record=record,
+        run_index=run_index,
+        error_code=details["error_code"],
+    )
+    error = (
+        f"{details['error_code']} {details['error_stage']}: "
+        f"{details['error_type']}: {details['error_message']}"
+    )
+    return {
+        "error": error,
+        "error_code": details["error_code"],
+        "error_stage": details["error_stage"],
+        "error_zone_id": details["error_zone_id"],
+        "error_agent": details["error_agent"],
+        "error_type": details["error_type"],
+        "error_message": details["error_message"],
+        "traceback_file": str(traceback_path),
+    }
+
+
+def classify_experiment_error(exc: Exception) -> dict[str, str]:
+    source = exc
+    stage = "unexpected"
+    zone_id = ""
+    agent = ""
+
+    if isinstance(exc, AgentStageError):
+        source = exc.original
+        stage = exc.stage
+        zone_id = "" if exc.zone_id is None else str(exc.zone_id)
+        agent = exc.agent
+    elif isinstance(exc, PipelineStageError):
+        source = exc.original
+        stage = exc.stage
+        zone_id = "" if exc.zone_id is None else str(exc.zone_id)
+        agent = exc.agent or ""
+        if isinstance(source, AgentStageError):
+            stage = source.stage
+            zone_id = "" if source.zone_id is None else str(source.zone_id)
+            agent = source.agent
+            source = source.original
+
+    return {
+        "error_code": ERROR_CODE_BY_STAGE.get(stage, ERROR_CODE_BY_STAGE["unexpected"]),
+        "error_stage": stage,
+        "error_zone_id": zone_id,
+        "error_agent": agent,
+        "error_type": type(source).__name__,
+        "error_message": str(source),
+    }
+
+
+def write_error_traceback(
+    exc: Exception,
+    *,
+    experiment_dir: Path,
+    record: dict[str, Any],
+    run_index: int,
+    error_code: str,
+) -> Path:
+    errors_dir = experiment_dir / "errors"
+    errors_dir.mkdir(parents=True, exist_ok=True)
+    blend_value = record.get("diurnal_blend_alpha")
+    blend_text = "blend" if blend_value in (None, "") else str(blend_value)
+    name_parts = [
+        f"{run_index:04d}",
+        error_code,
+        forecast_start_slug(str(record.get("forecast_start") or "unknown")),
+        safe_filename(record.get("forecast_model") or "model"),
+        safe_filename(record.get("agent_mode") or "mode"),
+        safe_filename(blend_text),
+    ]
+    path = errors_dir / ("_".join(name_parts) + ".txt")
+    metadata = "\n".join(f"{key}: {value}" for key, value in record.items())
+    trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    path.write_text(f"{metadata}\n\nTRACEBACK:\n{trace}", encoding="utf-8")
+    return path
 
 
 def write_numeric_summary(
@@ -723,46 +880,53 @@ def build_contexts(
         zone_id = str(row["zone_id"])
         profile = profiles_by_zone.loc[zone_id].to_dict()
         zone_stress_thresholds = load_stress_thresholds(stress_thresholds_by_zone, zone_id)
-        raw_result = forecast_zone(
-            zone_id=zone_id,
-            category=row["category"],
-            load=pipeline_data.load,
-            service_price=pipeline_data.service_price,
-            energy_price=pipeline_data.energy_price,
-            occupancy=pipeline_data.occupancy,
-            weather=pipeline_data.weather,
-            profile=profile,
-            forecast_start=start,
-            horizon_days=horizon_days,
-            history_days=history_days,
-            validation_days=validation_days,
-            forecast_model=forecast_model,
-            timesfm_repo=timesfm_repo,
-            timesfm_context_hours=timesfm_context_hours,
-            timesfm_step_horizon=timesfm_step_horizon,
-            timesfm_exog_cols=timesfm_exog_cols,
-            timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-            timesfm_roll_actuals=timesfm_roll_actuals,
-            ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
-            chronos_repo=chronos_repo,
-            chronos_context_hours=chronos_context_hours,
-            chronos_step_horizon=chronos_step_horizon,
-            chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
-            chronos_device=chronos_device,
-            chronos_roll_actuals=chronos_roll_actuals,
-            lstm_context_hours=lstm_context_hours,
-            lstm_step_horizon=lstm_step_horizon,
-            lstm_exog_cols=lstm_exog_cols,
-            lstm_hidden_size=lstm_hidden_size,
-            lstm_num_layers=lstm_num_layers,
-            lstm_epochs=lstm_epochs,
-            lstm_learning_rate=lstm_learning_rate,
-            lstm_batch_size=lstm_batch_size,
-            lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
-            lstm_device=lstm_device,
-            lstm_roll_actuals=lstm_roll_actuals,
-            lstm_seed=lstm_seed,
-        )
+        try:
+            raw_result = forecast_zone(
+                zone_id=zone_id,
+                category=row["category"],
+                load=pipeline_data.load,
+                service_price=pipeline_data.service_price,
+                energy_price=pipeline_data.energy_price,
+                occupancy=pipeline_data.occupancy,
+                weather=pipeline_data.weather,
+                profile=profile,
+                forecast_start=start,
+                horizon_days=horizon_days,
+                history_days=history_days,
+                validation_days=validation_days,
+                forecast_model=forecast_model,
+                timesfm_repo=timesfm_repo,
+                timesfm_context_hours=timesfm_context_hours,
+                timesfm_step_horizon=timesfm_step_horizon,
+                timesfm_exog_cols=timesfm_exog_cols,
+                timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
+                timesfm_roll_actuals=timesfm_roll_actuals,
+                ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
+                chronos_repo=chronos_repo,
+                chronos_context_hours=chronos_context_hours,
+                chronos_step_horizon=chronos_step_horizon,
+                chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
+                chronos_device=chronos_device,
+                chronos_roll_actuals=chronos_roll_actuals,
+                lstm_context_hours=lstm_context_hours,
+                lstm_step_horizon=lstm_step_horizon,
+                lstm_exog_cols=lstm_exog_cols,
+                lstm_hidden_size=lstm_hidden_size,
+                lstm_num_layers=lstm_num_layers,
+                lstm_epochs=lstm_epochs,
+                lstm_learning_rate=lstm_learning_rate,
+                lstm_batch_size=lstm_batch_size,
+                lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
+                lstm_device=lstm_device,
+                lstm_roll_actuals=lstm_roll_actuals,
+                lstm_seed=lstm_seed,
+            )
+        except Exception as exc:
+            raise PipelineStageError(
+                stage="forecast",
+                zone_id=zone_id,
+                original=exc,
+            ) from exc
         pricing_windows_3h = build_pricing_windows_3h(raw_result.hourly, stress_thresholds=zone_stress_thresholds)
         summary = apply_load_quantile_stress(raw_result.summary, zone_stress_thresholds, pricing_windows_3h)
         result = ForecastResult(hourly=raw_result.hourly, summary=summary)

@@ -3,8 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+import re
+import os
+import yaml
 
-
+_ENV_REF_RE = re.compile(r"""
+                         \$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\} 
+                         |\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*) 
+                         |%(?P<windows>[A-Za-z_][A-Za-z0-9_]*)%
+                         """, re.VERBOSE)
 @dataclass(frozen=True)
 class RunConfig:
     data_dir: str = "data"
@@ -218,125 +225,30 @@ class AppConfig:
             run=RunConfig.from_mapping(run_settings),
         )
 
+def _expand_env_vars(obj: Any) -> Any:
+    if isinstance(obj, str):
+        missing_env = []
+        for match in _ENV_REF_RE.finditer(obj):
+            name = match.group("braced") or match.group("plain") or match.group("windows")
+            if name not in os.environ:
+                missing_env.append(name)
+        if missing_env:
+            raise ValueError(f"Missing environment variable(s): {', '.join(missing_env)}")
+        return os.path.expandvars(obj)
+    elif isinstance(obj, list):
+        return [_expand_env_vars(x) for x in obj]
+    elif isinstance(obj, dict):
+        return {k: _expand_env_vars(v) for k, v in obj.items()}
+    else:
+        return obj
 
 def read_config_mapping(path: Path) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
-    value = read_yaml_mapping(text)
+    value = yaml.safe_load(text)
+    value = _expand_env_vars(value)
     if not isinstance(value, dict):
         raise ValueError(f"Config file must contain a mapping: {path}")
     return value
-
-
-def read_yaml_mapping(text: str) -> dict[str, Any]:
-    try:
-        import yaml  # type: ignore
-    except ModuleNotFoundError:
-        return parse_simple_yaml(text)
-
-    value = yaml.safe_load(text) or {}
-    if not isinstance(value, dict):
-        raise ValueError("YAML config must contain a mapping")
-    return value
-
-
-def parse_simple_yaml(text: str) -> dict[str, Any]:
-    root: dict[str, Any] = {}
-    current: dict[str, Any] = root
-    current_list_key: str | None = None
-
-    for raw_line in text.splitlines():
-        line = strip_yaml_comment(raw_line).rstrip()
-        if not line.strip():
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        stripped = line.strip()
-
-        if indent == 0:
-            key, value = split_yaml_key_value(stripped)
-            current_list_key = None
-            if value is None:
-                root[key] = {}
-                current = root[key]
-            else:
-                root[key] = parse_yaml_scalar(value)
-                current = root
-            continue
-
-        if indent == 2 and stripped.startswith("- "):
-            if current_list_key is None:
-                raise ValueError(f"List item without a key: {raw_line}")
-            current[current_list_key].append(parse_yaml_scalar(stripped[2:].strip()))
-            continue
-
-        if indent == 2:
-            key, value = split_yaml_key_value(stripped)
-            if value is None:
-                current[key] = []
-                current_list_key = key
-            else:
-                current[key] = parse_yaml_scalar(value)
-                current_list_key = None
-            continue
-
-        if indent == 4 and stripped.startswith("- "):
-            if current_list_key is None:
-                raise ValueError(f"List item without a key: {raw_line}")
-            current[current_list_key].append(parse_yaml_scalar(stripped[2:].strip()))
-            continue
-
-        raise ValueError(f"Unsupported YAML line: {raw_line}")
-
-    return root
-
-
-def split_yaml_key_value(line: str) -> tuple[str, str | None]:
-    if ":" not in line:
-        raise ValueError(f"Expected key/value line: {line}")
-    key, value = line.split(":", 1)
-    key = key.strip()
-    value = value.strip()
-    return key, value if value else None
-
-
-def parse_yaml_scalar(value: str) -> Any:
-    if value.startswith("[") and value.endswith("]"):
-        inner = value[1:-1].strip()
-        if not inner:
-            return []
-        return [parse_yaml_scalar(part.strip()) for part in inner.split(",")]
-
-    lowered = value.lower()
-    if lowered in {"null", "none", "~"}:
-        return None
-    if lowered == "true":
-        return True
-    if lowered == "false":
-        return False
-
-    if (
-        (value.startswith('"') and value.endswith('"'))
-        or (value.startswith("'") and value.endswith("'"))
-    ):
-        return value[1:-1]
-
-    try:
-        return int(value)
-    except ValueError:
-        pass
-    try:
-        return float(value)
-    except ValueError:
-        return value
-
-
-def strip_yaml_comment(line: str) -> str:
-    quote: str | None = None
-    for idx, char in enumerate(line):
-        if char in {"'", '"'}:
-            quote = None if quote == char else char if quote is None else quote
-        elif char == "#" and quote is None:
-            return line[:idx]
-    return line
 
 
 def optional_str(value: Any) -> str | None:

@@ -20,6 +20,7 @@ from agents import (
     merge_grid_fallback,
     normalize_price_windows,
     run_zone_chain,
+    solve_nash_equilibrium_window,
     validate_economist_report,
 )
 from config import AgentConfig, AppConfig, RunConfig
@@ -197,6 +198,37 @@ class AgentParsingTests(unittest.TestCase):
         )
         self.assertIn("price_change_windows_3h[0] missing window_end", errors)
         self.assertIn("price_change_windows_3h[0] missing action_label", errors)
+
+    def test_nash_equilibrium_marks_unresolved_grid_constraint(self):
+        window = solve_nash_equilibrium_window(
+            {
+                "category": "Residential",
+                "capacity_kw_proxy": 200.0,
+            },
+            {},
+            {
+                "window_start": "2022-09-09 18:00:00",
+                "window_end": "2022-09-09 20:00:00",
+                "hours": 3,
+                "sum_predicted_kwh": 120.0,
+                "mean_service_price": 1.0,
+                "mean_energy_price": 0.8,
+                "mean_occupancy": 0.9,
+                "total_rain": 1.0,
+                "load_3h_q95_kwh": 90.0,
+                "suggested_price_shift_pct": 5,
+                "action_label": "Raise price",
+                "price_rationale": "High predicted demand.",
+            },
+        )
+
+        self.assertFalse(window["nash_equilibrium_reached"])
+        self.assertEqual(window["capacity_limit_source"], "historical_load_quantile")
+        self.assertAlmostEqual(window["target_peak_reduction_pct"], 25.0)
+        self.assertLessEqual(window["suggested_price_shift_pct"], window["max_discomfort_score"] * 15.0)
+        self.assertFalse(window["grid_safe"])
+        self.assertTrue(window["user_tolerant"])
+        self.assertTrue(window["price_stable"])
 
     def test_run_zone_chain_repairs_invalid_economist_response(self):
         class FakeClient:

@@ -13,6 +13,12 @@ from prompts import SYSTEM_MESSAGE, behavior_prompt, economist_prompt, grid_prom
 GRID_STRESS_LEVELS = ("Low", "Medium", "High", "Extreme High")
 MODEL_RESPONSE_FAILED = "MODEL_RESPONSE_FAILED"
 ECONOMIST_AGENT_OUTPUT_KEY = "_economist_agent_output"
+NASH_MAX_ITERATIONS = 6
+NASH_PRICE_STABILITY_EPSILON_PCT = 0.5
+NASH_MAX_DISCOMFORT_SCORE = 1.0
+NASH_MAX_ABS_PRICE_SHIFT_PCT = 25.0
+NASH_MIN_ELASTICITY = 0.05
+NASH_MAX_ELASTICITY = 0.7
 GRID_STRESS_LEVEL_BY_KEY = {level.lower(): level for level in GRID_STRESS_LEVELS}
 GRID_STRESS_LEVEL_BY_KEY.update(
     {
@@ -309,6 +315,8 @@ def heuristic_behavior(context: dict[str, Any]) -> dict[str, Any]:
             f"local POI mix of {poi_total} assigned POIs."
         ),
         "demand_drivers": drivers,
+        "elasticity_factor": estimate_elasticity_factor(context, {}, peak_window or {}),
+        "tolerance_threshold_pct": estimate_price_tolerance_pct(context, peak_window or {}),
         "confidence": "medium",
     }
 
@@ -339,6 +347,13 @@ def combine_reports(
     source: str,
     economist_debug: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    price_windows = normalize_price_windows(
+        economist.get("price_change_windows_3h"),
+        context.get("pricing_windows_3h", []),
+    )
+    price_windows = apply_nash_equilibrium_to_windows(context, behavior, price_windows)
+    nash_summary = summarize_nash_equilibrium(price_windows)
+    final_shift = average_price_shift(price_windows, as_float(economist.get("suggested_price_shift_pct"), 0))
     report = {
         "category": context["category"],
         "zone_id": context["zone_id"],
@@ -361,13 +376,15 @@ def combine_reports(
         "stress_eval_windows": context.get("stress_eval_windows"),
         "stress_miss_count": context.get("stress_miss_count"),
         "agent_reasoning": str(behavior.get("agent_reasoning") or ""),
-        "suggested_price_shift_pct": as_float(economist.get("suggested_price_shift_pct"), 0),
+        "suggested_price_shift_pct": final_shift,
         "action_label": str(economist.get("action_label") or ""),
         "price_rationale": str(economist.get("price_rationale") or ""),
-        "price_change_windows_3h": normalize_price_windows(
-            economist.get("price_change_windows_3h"),
-            context.get("pricing_windows_3h", []),
-        ),
+        "price_change_windows_3h": price_windows,
+        "nash_equilibrium_reached": nash_summary["nash_equilibrium_reached"],
+        "nash_equilibrium_windows": nash_summary["nash_equilibrium_windows"],
+        "nash_equilibrium_reached_windows": nash_summary["nash_equilibrium_reached_windows"],
+        "nash_equilibrium_rounds": nash_summary["nash_equilibrium_rounds"],
+        "nash_equilibrium_summary": nash_summary["nash_equilibrium_summary"],
         "source": source,
     }
     if economist_debug is not None:
@@ -569,17 +586,25 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
             {
                 "window_start": item.get("window_start") or fallback.get("window_start"),
                 "window_end": item.get("window_end") or fallback.get("window_end"),
+                "hours": fallback.get("hours"),
                 "sum_predicted_kwh": fallback.get("sum_predicted_kwh"),
                 "mean_predicted_kwh": fallback.get("mean_predicted_kwh"),
+                "peak_predicted_kwh": fallback.get("peak_predicted_kwh"),
                 "sum_actual_kwh": fallback.get("sum_actual_kwh"),
                 "mean_service_price": fallback.get("mean_service_price"),
                 "mean_energy_price": fallback.get("mean_energy_price"),
+                "mean_occupancy": fallback.get("mean_occupancy"),
+                "mean_temp_c": fallback.get("mean_temp_c"),
+                "mean_humidity": fallback.get("mean_humidity"),
+                "total_rain": fallback.get("total_rain"),
                 "load_stress_level": fallback.get("load_stress_level") or fallback.get("grid_stress_level"),
                 "stress_load_3h_kwh": fallback.get("stress_load_3h_kwh"),
                 "actual_load_stress_level": fallback.get("actual_load_stress_level") or fallback.get("actual_grid_stress_level"),
                 "actual_stress_load_3h_kwh": fallback.get("actual_stress_load_3h_kwh"),
                 "stress_correct": fallback.get("stress_correct"),
                 "stress_missed": fallback.get("stress_missed"),
+                "stress_source_file": fallback.get("stress_source_file"),
+                "stress_window_hours": fallback.get("stress_window_hours"),
                 "load_3h_q50_kwh": fallback.get("load_3h_q50_kwh"),
                 "load_3h_q80_kwh": fallback.get("load_3h_q80_kwh"),
                 "load_3h_q95_kwh": fallback.get("load_3h_q95_kwh"),
@@ -589,6 +614,259 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
             }
         )
     return normalized
+
+
+def apply_nash_equilibrium_to_windows(
+    context: dict[str, Any],
+    behavior: dict[str, Any],
+    windows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [solve_nash_equilibrium_window(context, behavior, window) for window in windows]
+
+
+def solve_nash_equilibrium_window(
+    context: dict[str, Any],
+    behavior: dict[str, Any],
+    window: dict[str, Any],
+) -> dict[str, Any]:
+    baseline_load = window_predicted_load(window)
+    capacity_limit, capacity_source = capacity_limit_kwh(context, window)
+    elasticity = estimate_elasticity_factor(context, behavior, window)
+    tolerance_pct = estimate_price_tolerance_pct(context, window)
+    previous_shift = 0.0
+    raw_shift = as_float(window.get("suggested_price_shift_pct"), 0)
+    profit_shift = economic_minimum_shift_pct(window)
+    required_reduction_pct = target_peak_reduction_pct(baseline_load, capacity_limit)
+    needed_shift = required_reduction_pct / elasticity if required_reduction_pct > 0 else 0.0
+    target_shift = max(raw_shift, needed_shift, profit_shift)
+    if required_reduction_pct <= 0 and raw_shift < 0 and profit_shift <= 0:
+        target_shift = max(raw_shift, -tolerance_pct)
+    target_shift = max(-NASH_MAX_ABS_PRICE_SHIFT_PCT, min(NASH_MAX_ABS_PRICE_SHIFT_PCT, target_shift))
+    target_shift = max(-tolerance_pct, min(tolerance_pct, target_shift))
+    trace: list[dict[str, Any]] = []
+    final_state: dict[str, Any] = {}
+
+    for iteration in range(1, NASH_MAX_ITERATIONS + 1):
+        price_shift = round(target_shift, 4)
+        expected_load = expected_load_after_price(baseline_load, price_shift, elasticity)
+        discomfort_score = user_discomfort_score(price_shift, tolerance_pct)
+        adjusted_service_price = adjusted_price(window.get("mean_service_price"), price_shift)
+        energy_price = optional_float(window.get("mean_energy_price"))
+        grid_safe = expected_load <= capacity_limit + 1e-9
+        user_tolerant = discomfort_score <= NASH_MAX_DISCOMFORT_SCORE + 1e-9
+        price_stable = abs(price_shift - previous_shift) < NASH_PRICE_STABILITY_EPSILON_PCT
+        economic_feasible = (
+            True
+            if adjusted_service_price is None or energy_price is None
+            else adjusted_service_price + 1e-9 >= energy_price
+        )
+        final_state = {
+            "iteration": iteration,
+            "price_shift_pct": round(price_shift, 4),
+            "expected_load_kwh": round(expected_load, 4),
+            "grid_safe": grid_safe,
+            "user_tolerant": user_tolerant,
+            "price_stable": price_stable,
+            "economic_feasible": economic_feasible,
+            "discomfort_score": round(discomfort_score, 4),
+        }
+        trace.append(final_state)
+        if grid_safe and user_tolerant and price_stable and economic_feasible:
+            break
+        previous_shift = price_shift
+
+    reached = bool(
+        final_state.get("grid_safe")
+        and final_state.get("user_tolerant")
+        and final_state.get("price_stable")
+        and final_state.get("economic_feasible")
+    )
+    enriched = dict(window)
+    enriched.update(
+        {
+            "pre_nash_suggested_price_shift_pct": raw_shift,
+            "suggested_price_shift_pct": round(float(final_state.get("price_shift_pct", target_shift)), 2),
+            "nash_equilibrium_reached": reached,
+            "nash_status": "reached" if reached else "not_reached",
+            "nash_iterations": int(final_state.get("iteration", 0) or 0),
+            "nash_iteration_trace": trace,
+            "target_peak_reduction_pct": round(required_reduction_pct, 4),
+            "elasticity_factor": round(elasticity, 4),
+            "capacity_limit_kwh": round(capacity_limit, 4),
+            "capacity_limit_source": capacity_source,
+            "expected_load_kwh": round(float(final_state.get("expected_load_kwh", baseline_load)), 4),
+            "grid_safe": bool(final_state.get("grid_safe", False)),
+            "user_tolerant": bool(final_state.get("user_tolerant", False)),
+            "price_stable": bool(final_state.get("price_stable", False)),
+            "economic_feasible": bool(final_state.get("economic_feasible", True)),
+            "discomfort_score": round(float(final_state.get("discomfort_score", 0)), 4),
+            "max_discomfort_score": NASH_MAX_DISCOMFORT_SCORE,
+            "price_stability_epsilon_pct": NASH_PRICE_STABILITY_EPSILON_PCT,
+        }
+    )
+    return enriched
+
+
+def summarize_nash_equilibrium(windows: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(windows)
+    reached = sum(1 for window in windows if window.get("nash_equilibrium_reached") is True)
+    rounds = max((int(window.get("nash_iterations") or 0) for window in windows), default=0)
+    all_reached = total > 0 and reached == total
+    return {
+        "nash_equilibrium_reached": all_reached,
+        "nash_equilibrium_windows": total,
+        "nash_equilibrium_reached_windows": reached,
+        "nash_equilibrium_rounds": rounds,
+        "nash_equilibrium_summary": (
+            f"Nash equilibrium reached for {reached}/{total} pricing windows"
+            if total
+            else "No pricing windows available for Nash equilibrium evaluation"
+        ),
+    }
+
+
+def average_price_shift(windows: list[dict[str, Any]], fallback: float) -> float:
+    if not windows:
+        return fallback
+    values = [as_float(window.get("suggested_price_shift_pct"), fallback) for window in windows]
+    return round(sum(values) / len(values), 2)
+
+
+def window_predicted_load(window: dict[str, Any]) -> float:
+    load = optional_float(window.get("sum_predicted_kwh"))
+    if load is not None:
+        return max(0.0, load)
+    mean_load = optional_float(window.get("mean_predicted_kwh")) or 0.0
+    hours = optional_float(window.get("hours")) or 1.0
+    return max(0.0, mean_load * hours)
+
+
+def capacity_limit_kwh(context: dict[str, Any], window: dict[str, Any]) -> tuple[float, str]:
+    historical = first_positive_float(
+        window.get("load_3h_q95_kwh"),
+        context.get("grid_stress_q95_kwh"),
+        window.get("load_3h_q80_kwh"),
+        context.get("grid_stress_q80_kwh"),
+    )
+    capacity_kw = optional_float(context.get("capacity_kw_proxy"))
+    hours = optional_float(window.get("hours")) or optional_float(window.get("stress_window_hours")) or 3.0
+    physical = capacity_kw * hours if capacity_kw is not None and capacity_kw > 0 else None
+    candidates = [(value, source) for value, source in ((historical, "historical_load_quantile"), (physical, "capacity_kw_proxy")) if value is not None and value > 0]
+    if candidates:
+        return min(candidates, key=lambda item: item[0])
+    return max(window_predicted_load(window), 0.0), "baseline_predicted_load"
+
+
+def target_peak_reduction_pct(load: float, capacity_limit: float) -> float:
+    if load <= 0:
+        return 0.0
+    return max(0.0, ((load - capacity_limit) / load) * 100)
+
+
+def estimate_elasticity_factor(
+    context: dict[str, Any],
+    behavior: dict[str, Any],
+    window: dict[str, Any],
+) -> float:
+    reported = optional_float(behavior.get("elasticity_factor"))
+    if reported is not None:
+        return clamp(abs(reported), NASH_MIN_ELASTICITY, NASH_MAX_ELASTICITY)
+
+    category = str(context.get("category") or "").lower()
+    if "residential" in category:
+        base = 0.45
+    elif "commercial" in category or "mall" in category:
+        base = 0.32
+    elif "cbd" in category or "office" in category:
+        base = 0.24
+    elif "transport" in category or "hub" in category:
+        base = 0.2
+    elif "industrial" in category:
+        base = 0.18
+    else:
+        base = 0.28
+
+    occupancy = normalized_rate(window.get("mean_occupancy"))
+    rain = optional_float(window.get("total_rain"))
+    if rain is None:
+        weather = context.get("weather") if isinstance(context.get("weather"), dict) else {}
+        rain = optional_float(weather.get("rain_hours")) or 0.0
+    occupancy_factor = 1.0 - 0.25 * occupancy
+    rain_factor = 0.85 if rain > 0 else 1.0
+    return clamp(base * occupancy_factor * rain_factor, NASH_MIN_ELASTICITY, NASH_MAX_ELASTICITY)
+
+
+def estimate_price_tolerance_pct(context: dict[str, Any], window: dict[str, Any]) -> float:
+    category = str(context.get("category") or "").lower()
+    if "residential" in category:
+        base = 15.0
+    elif "commercial" in category or "mall" in category:
+        base = 12.0
+    elif "industrial" in category:
+        base = 9.0
+    else:
+        base = 10.0
+    occupancy = normalized_rate(window.get("mean_occupancy"))
+    rain = optional_float(window.get("total_rain")) or 0.0
+    tolerance = base * (1.0 - 0.25 * occupancy)
+    if rain > 0:
+        tolerance *= 0.85
+    return clamp(tolerance, 5.0, NASH_MAX_ABS_PRICE_SHIFT_PCT)
+
+
+def expected_load_after_price(baseline_load: float, price_shift_pct: float, elasticity: float) -> float:
+    response = elasticity * (price_shift_pct / 100.0)
+    return max(0.0, baseline_load * (1.0 - response))
+
+
+def user_discomfort_score(price_shift_pct: float, tolerance_pct: float) -> float:
+    if tolerance_pct <= 0:
+        return float("inf")
+    return abs(price_shift_pct) / tolerance_pct
+
+
+def economic_minimum_shift_pct(window: dict[str, Any]) -> float:
+    service_price = optional_float(window.get("mean_service_price"))
+    energy_price = optional_float(window.get("mean_energy_price"))
+    if service_price is None or energy_price is None or service_price <= 0:
+        return 0.0
+    return max(0.0, ((energy_price / service_price) - 1.0) * 100)
+
+
+def adjusted_price(price: Any, shift_pct: float) -> float | None:
+    value = optional_float(price)
+    if value is None:
+        return None
+    return value * (1.0 + shift_pct / 100.0)
+
+
+def normalized_rate(value: Any) -> float:
+    number = optional_float(value)
+    if number is None:
+        return 0.0
+    if number > 1.0:
+        number /= 100.0
+    return clamp(number, 0.0, 1.0)
+
+
+def first_positive_float(*values: Any) -> float | None:
+    for value in values:
+        number = optional_float(value)
+        if number is not None and number > 0:
+            return number
+    return None
+
+
+def optional_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if number != number else number
+
+
+def clamp(value: float, lower: float, upper: float) -> float:
+    return max(lower, min(upper, value))
 
 
 def required_model_text(item: dict[str, Any], field: str, item_missing: bool) -> str:

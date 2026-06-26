@@ -6,10 +6,11 @@ This project implements the conference-work requirement in `Conference work.docx
 2. Build compact context snippets from `volume.csv`, a configurable weather file, `poi.csv`, `inf.csv`, `occupancy.csv`, and `s_price.csv`.
 3. Run a sequential multi-agent chain per zone:
    - Grid Analyst: forecast 1-4 days of load and assign a grid stress level.
-   - Behavioural Agent: explain the demand drivers from POI mix, weather, and time markers.
-   - Market Economist: prescribe a service-fee shift from stress and elasticity proxies.
+   - Behavioural Agent: explain the demand drivers from POI mix, weather, time markers, and estimate a price-response elasticity factor.
+   - Market Economist: prescribe a service-fee shift from stress, elasticity, and price context.
+   - Nash Equilibrium Check: simulate the load response to price and test grid safety, user tolerance, and price stability for each 3-hour window.
 4. Execute all five zone chains concurrently with `asyncio`.
-5. Export an explainability table with predicted vs. actual load, rationale, and price shift.
+5. Export an explainability table with predicted vs. actual load, rationale, price shift, and Nash equilibrium status.
 
 The model call path uses the OpenAI Python SDK with an OpenAI-compatible `base_url`.
 
@@ -88,10 +89,10 @@ Generated result files are written under a forecast-model subfolder, for example
 
 - `selected_zones.csv`: the selected zones and the proxy features used for selection.
 - `context_snippets.json`: token-efficient context passed to each agent.
-- `rationale_trace.csv`: machine-readable explainability table.
+- `rationale_trace.csv`: machine-readable explainability table, including zone-level Nash equilibrium status.
 - `rationale_trace.md`: markdown table for a report or paper appendix.
 - `rationale_trace.json`: full structured agent outputs.
-- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, adjusted service price, actual service price, stress labels, and price rationales.
+- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, adjusted service price, actual service price, stress labels, price rationales, and Nash equilibrium diagnostics (`expected_load_kwh`, `capacity_limit_kwh`, `elasticity_factor`, `grid_safe`, `user_tolerant`, and `price_stable`).
 - `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when the adjusted service price is within 8% of the actual service price.
 - `explainability_rubric.md`: five-criterion human evaluation rubric for rationale quality.
 - `explainability_review_packet.csv`: review template for two independent raters plus an operator sanity-check column.

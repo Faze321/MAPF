@@ -37,9 +37,9 @@ def behavior_prompt(context: dict[str, Any], grid_report: dict[str, Any]) -> str
     return (
         f"""Phase B / Behavioural Agent.
 
-        Task: explain why demand looks this way over the next {horizon} using POI mix, weather, temporal markers, hourly forecast data, 3-hour pricing windows, and the load shape. Keep it specific and short.
+        Task: explain why demand looks this way over the next {horizon} using POI mix, weather, temporal markers, hourly forecast data, 3-hour pricing windows, and the load shape. Also estimate a positive elasticity_factor for price response: higher means users are more willing to shift charging after a price increase. Rain and high occupancy should lower elasticity. Keep it specific and short.
 
-        Return JSON with keys: agent_reasoning, demand_drivers, confidence.
+        Return JSON with keys: agent_reasoning, demand_drivers, elasticity_factor, confidence.
 
         Context:{json.dumps(context, ensure_ascii=False)}
         Grid report:{json.dumps(grid_report, ensure_ascii=False)}"""
@@ -56,7 +56,9 @@ def economist_prompt(
     return (
         f"""Phase C / Market Economist.
         
-        Task: prescribe service-fee shifts for the next {horizon} using only forecast-derived information, prior agent conclusions, category, service price, energy price, and each 3-hour window's predicted load_stress_level. Residential users are more price-sensitive; CBD and hub users are less price-sensitive. Avoid extreme changes.
+        Task: prescribe service-fee shifts for the next {horizon} using only forecast-derived information, prior agent conclusions, category, service price, energy price, each 3-hour window's predicted load_stress_level, and the behavioural elasticity estimate. Residential users are more price-sensitive; CBD and hub users are less price-sensitive. Avoid extreme changes.
+
+        Nash-equilibrium intent: each window should move toward a strategy where the expected load after price response is grid safe, users remain within tolerance, and the price recommendation is stable. The code will run the final mathematical equilibrium check after your JSON response.
 
         Do not use actual future load, actual future stress, forecast error, stress correctness, or any evaluation/ground-truth fields. Those fields are intentionally not provided to you.
 
@@ -110,6 +112,10 @@ def compact_economist_context(context: dict[str, Any]) -> dict[str, Any]:
         "forecast_peak_kwh",
         "predicted_change_pct",
         "grid_stress_level",
+        "capacity_kw_proxy",
+        "grid_stress_q50_kwh",
+        "grid_stress_q80_kwh",
+        "grid_stress_q95_kwh",
     ]
     compact = {key: context.get(key) for key in scalar_keys if key in context}
     if "hourly_averages" in context:

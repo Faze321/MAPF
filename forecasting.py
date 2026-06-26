@@ -10,7 +10,7 @@ from config import normalize_forecast_model_name
 
 _TIMESFM_MODEL_CACHE: dict[tuple[str, int, int], Any] = {}
 _CHRONOS_MODEL_CACHE: dict[tuple[str, str], Any] = {}
-DEFAULT_TIMESFM_EXOG_COLS = ["T", "U", "nRAIN", "e_price", "is_weekend", "temp_price_idx"]
+DEFAULT_TIMESFM_EXOG_COLS = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
 
 
 @dataclass(frozen=True)

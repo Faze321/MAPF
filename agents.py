@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -13,6 +14,7 @@ from prompts import SYSTEM_MESSAGE, behavior_prompt, economist_prompt, grid_prom
 GRID_STRESS_LEVELS = ("Low", "Medium", "High", "Extreme High")
 MODEL_RESPONSE_FAILED = "MODEL_RESPONSE_FAILED"
 ECONOMIST_AGENT_OUTPUT_KEY = "_economist_agent_output"
+AGENT_COMPLETION_USAGE_KEY = "_agent_completion_usage"
 NASH_MAX_ITERATIONS = 6
 NASH_PRICE_STABILITY_EPSILON_PCT = 0.5
 NASH_MAX_DISCOMFORT_SCORE = 1.0
@@ -49,6 +51,12 @@ class ChatClient(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class AgentCallResult:
+    content: dict[str, Any]
+    usage: dict[str, Any]
+
+
 @dataclass
 class AgentChatClient:
     config: AgentConfig
@@ -82,7 +90,9 @@ class AgentChatClient:
             temperature=temperature,
         )
         content = response.choices[0].message.content or "{}"
-        return extract_json_object(content)
+        payload = extract_json_object(content)
+        payload[AGENT_COMPLETION_USAGE_KEY] = response_token_usage(response)
+        return payload
 
 
 @dataclass
@@ -101,29 +111,31 @@ async def run_zone_chain(
     if client is None:
         return heuristic_zone_chain(context, source=heuristic_source)
 
+    grid_result = await complete_agent_json(
+        client,
+        grid_prompt(context),
+        context=context,
+        temperature=temperature,
+        stage="agent.grid",
+        agent="Grid Analyst",
+    )
     grid = merge_grid_fallback(
-        await complete_agent_json(
-            client,
-            grid_prompt(context),
-            context=context,
-            temperature=temperature,
-            stage="agent.grid",
-            agent="Grid Analyst",
-        ),
+        grid_result.content,
         context,
+    )
+    behavior_result = await complete_agent_json(
+        client,
+        behavior_prompt(context, grid),
+        context=context,
+        temperature=temperature,
+        stage="agent.behavior",
+        agent="Behavioural Agent",
     )
     behavior = merge_behavior_fallback(
-        await complete_agent_json(
-            client,
-            behavior_prompt(context, grid),
-            context=context,
-            temperature=temperature,
-            stage="agent.behavior",
-            agent="Behavioural Agent",
-        ),
+        behavior_result.content,
         context,
     )
-    economist_report = await complete_validated_economist_report(
+    economist_report, economist_call_usage = await complete_validated_economist_report(
         client,
         context,
         grid,
@@ -135,6 +147,7 @@ async def run_zone_chain(
         economist_report,
         context,
     )
+    agent_call_usage = [grid_result.usage, behavior_result.usage, *economist_call_usage]
     return combine_reports(
         context,
         grid,
@@ -142,6 +155,7 @@ async def run_zone_chain(
         economist,
         source="model",
         economist_debug=economist_debug,
+        agent_call_usage=agent_call_usage,
     )
 
 
@@ -172,9 +186,10 @@ async def complete_agent_json(
     temperature: float,
     stage: str,
     agent: str,
-) -> dict[str, Any]:
+) -> AgentCallResult:
+    started = time.perf_counter()
     try:
-        return await client.complete_json(prompt, temperature=temperature)
+        response = await client.complete_json(prompt, temperature=temperature)
     except AgentStageError:
         raise
     except Exception as exc:
@@ -184,6 +199,18 @@ async def complete_agent_json(
             agent=agent,
             original=exc,
         ) from exc
+    elapsed = round(time.perf_counter() - started, 4)
+    token_usage = response.pop(AGENT_COMPLETION_USAGE_KEY, {})
+    return AgentCallResult(
+        content=response,
+        usage=agent_call_usage_record(
+            stage=stage,
+            agent=agent,
+            zone_id=context.get("zone_id"),
+            elapsed_seconds=elapsed,
+            token_usage=token_usage,
+        ),
+    )
 
 
 async def complete_validated_economist_report(
@@ -193,9 +220,9 @@ async def complete_validated_economist_report(
     behavior: dict[str, Any],
     *,
     temperature: float,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     expected_windows = context.get("pricing_windows_3h", [])
-    report = await complete_agent_json(
+    initial_result = await complete_agent_json(
         client,
         economist_prompt(context, grid, behavior),
         context=context,
@@ -203,6 +230,8 @@ async def complete_validated_economist_report(
         stage="agent.economist",
         agent="Market Economist",
     )
+    report = initial_result.content
+    call_usage = [initial_result.usage]
     errors = validate_economist_report(report, expected_windows)
     debug: dict[str, Any] = {
         "zone_id": context.get("zone_id"),
@@ -219,9 +248,11 @@ async def complete_validated_economist_report(
         "selected_validation_errors": errors,
     }
     if not errors:
-        return attach_economist_debug(report, debug)
+        debug["agent_call_usage"] = call_usage
+        debug["agent_usage_summary"] = summarize_agent_call_usage(call_usage)
+        return attach_economist_debug(report, debug), call_usage
 
-    repaired = await complete_agent_json(
+    repair_result = await complete_agent_json(
         client,
         repair_economist_prompt(context, grid, behavior, report, errors),
         context=context,
@@ -229,6 +260,8 @@ async def complete_validated_economist_report(
         stage="agent.economist_repair",
         agent="Market Economist Repair",
     )
+    repaired = repair_result.content
+    call_usage.append(repair_result.usage)
     repair_errors = validate_economist_report(repaired, expected_windows)
     debug.update(
         {
@@ -240,14 +273,102 @@ async def complete_validated_economist_report(
     if not repair_errors or len(repair_errors) < len(errors):
         debug["selected_response_source"] = "repair"
         debug["selected_validation_errors"] = repair_errors
-        return attach_economist_debug(repaired, debug)
-    return attach_economist_debug(report, debug)
+        debug["agent_call_usage"] = call_usage
+        debug["agent_usage_summary"] = summarize_agent_call_usage(call_usage)
+        return attach_economist_debug(repaired, debug), call_usage
+    debug["agent_call_usage"] = call_usage
+    debug["agent_usage_summary"] = summarize_agent_call_usage(call_usage)
+    return attach_economist_debug(report, debug), call_usage
 
 
 def attach_economist_debug(report: dict[str, Any], debug: dict[str, Any]) -> dict[str, Any]:
     tagged = dict(report)
     tagged[ECONOMIST_AGENT_OUTPUT_KEY] = debug
     return tagged
+
+
+def response_token_usage(response: Any) -> dict[str, int | None]:
+    usage = getattr(response, "usage", None)
+    prompt_tokens = usage_value(usage, "prompt_tokens", "input_tokens")
+    completion_tokens = usage_value(usage, "completion_tokens", "output_tokens")
+    total_tokens = usage_value(usage, "total_tokens")
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def usage_value(usage: Any, *keys: str) -> int | None:
+    if usage is None:
+        return None
+    for key in keys:
+        value = None
+        if isinstance(usage, dict):
+            value = usage.get(key)
+        else:
+            value = getattr(usage, key, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def agent_call_usage_record(
+    *,
+    stage: str,
+    agent: str,
+    zone_id: Any,
+    elapsed_seconds: float,
+    token_usage: dict[str, Any] | None,
+) -> dict[str, Any]:
+    usage = token_usage if isinstance(token_usage, dict) else {}
+    return {
+        "stage": stage,
+        "agent": agent,
+        "zone_id": zone_id,
+        "elapsed_seconds": elapsed_seconds,
+        "prompt_tokens": optional_int_usage(usage.get("prompt_tokens")),
+        "completion_tokens": optional_int_usage(usage.get("completion_tokens")),
+        "total_tokens": optional_int_usage(usage.get("total_tokens")),
+    }
+
+
+def summarize_agent_call_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "elapsed_seconds": round(sum(optional_float_usage(record.get("elapsed_seconds")) for record in records), 4),
+        "prompt_tokens": sum_token_usage(records, "prompt_tokens"),
+        "completion_tokens": sum_token_usage(records, "completion_tokens"),
+        "total_tokens": sum_token_usage(records, "total_tokens"),
+    }
+
+
+def sum_token_usage(records: list[dict[str, Any]], field: str) -> int:
+    total = 0
+    for record in records:
+        value = optional_int_usage(record.get(field))
+        if value is not None:
+            total += value
+    return total
+
+
+def optional_int_usage(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def optional_float_usage(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def heuristic_zone_chain(context: dict[str, Any], *, source: str = "dry-run") -> dict[str, Any]:
@@ -346,6 +467,7 @@ def combine_reports(
     *,
     source: str,
     economist_debug: dict[str, Any] | None = None,
+    agent_call_usage: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     price_windows = normalize_price_windows(
         economist.get("price_change_windows_3h"),
@@ -354,6 +476,7 @@ def combine_reports(
     price_windows = apply_nash_equilibrium_to_windows(context, behavior, price_windows)
     nash_summary = summarize_nash_equilibrium(price_windows)
     final_shift = average_price_shift(price_windows, as_float(economist.get("suggested_price_shift_pct"), 0))
+    usage_summary = summarize_agent_call_usage(agent_call_usage or [])
     report = {
         "category": context["category"],
         "zone_id": context["zone_id"],
@@ -385,11 +508,37 @@ def combine_reports(
         "nash_equilibrium_reached_windows": nash_summary["nash_equilibrium_reached_windows"],
         "nash_equilibrium_rounds": nash_summary["nash_equilibrium_rounds"],
         "nash_equilibrium_summary": nash_summary["nash_equilibrium_summary"],
+        "agent_time_cost_seconds": usage_summary["elapsed_seconds"],
+        "agent_prompt_tokens": usage_summary["prompt_tokens"],
+        "agent_completion_tokens": usage_summary["completion_tokens"],
+        "agent_total_tokens": usage_summary["total_tokens"],
+        "agent_call_usage": agent_call_usage or [],
         "source": source,
     }
     if economist_debug is not None:
         report[ECONOMIST_AGENT_OUTPUT_KEY] = economist_debug
     return report
+
+
+def recompute_report_nash(context: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    price_windows = apply_nash_equilibrium_to_windows(
+        context,
+        {},
+        report.get("price_change_windows_3h") or [],
+    )
+    nash_summary = summarize_nash_equilibrium(price_windows)
+    updated = dict(report)
+    updated["price_change_windows_3h"] = price_windows
+    updated["suggested_price_shift_pct"] = average_price_shift(
+        price_windows,
+        as_float(report.get("suggested_price_shift_pct"), 0),
+    )
+    updated["nash_equilibrium_reached"] = nash_summary["nash_equilibrium_reached"]
+    updated["nash_equilibrium_windows"] = nash_summary["nash_equilibrium_windows"]
+    updated["nash_equilibrium_reached_windows"] = nash_summary["nash_equilibrium_reached_windows"]
+    updated["nash_equilibrium_rounds"] = nash_summary["nash_equilibrium_rounds"]
+    updated["nash_equilibrium_summary"] = nash_summary["nash_equilibrium_summary"]
+    return updated
 
 
 def merge_grid_fallback(report: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
@@ -587,6 +736,30 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
                 "window_start": item.get("window_start") or fallback.get("window_start"),
                 "window_end": item.get("window_end") or fallback.get("window_end"),
                 "hours": fallback.get("hours"),
+                "price_conditioned_baseline_load_kwh": first_present(
+                    item.get("price_conditioned_baseline_load_kwh"),
+                    fallback.get("price_conditioned_baseline_load_kwh"),
+                ),
+                "price_conditioned_baseline_source": first_present(
+                    item.get("price_conditioned_baseline_source"),
+                    fallback.get("price_conditioned_baseline_source"),
+                ),
+                "price_conditioned_mean_predicted_kwh": first_present(
+                    item.get("price_conditioned_mean_predicted_kwh"),
+                    fallback.get("price_conditioned_mean_predicted_kwh"),
+                ),
+                "price_conditioned_peak_predicted_kwh": first_present(
+                    item.get("price_conditioned_peak_predicted_kwh"),
+                    fallback.get("price_conditioned_peak_predicted_kwh"),
+                ),
+                "price_conditioned_load_stress_level": first_present(
+                    item.get("price_conditioned_load_stress_level"),
+                    fallback.get("price_conditioned_load_stress_level"),
+                ),
+                "price_conditioned_service_price": first_present(
+                    item.get("price_conditioned_service_price"),
+                    fallback.get("price_conditioned_service_price"),
+                ),
                 "sum_predicted_kwh": fallback.get("sum_predicted_kwh"),
                 "mean_predicted_kwh": fallback.get("mean_predicted_kwh"),
                 "peak_predicted_kwh": fallback.get("peak_predicted_kwh"),
@@ -635,11 +808,10 @@ def solve_nash_equilibrium_window(
     tolerance_pct = estimate_price_tolerance_pct(context, window)
     previous_shift = 0.0
     raw_shift = as_float(window.get("suggested_price_shift_pct"), 0)
-    profit_shift = economic_minimum_shift_pct(window)
     required_reduction_pct = target_peak_reduction_pct(baseline_load, capacity_limit)
     needed_shift = required_reduction_pct / elasticity if required_reduction_pct > 0 else 0.0
-    target_shift = max(raw_shift, needed_shift, profit_shift)
-    if required_reduction_pct <= 0 and raw_shift < 0 and profit_shift <= 0:
+    target_shift = max(raw_shift, needed_shift)
+    if required_reduction_pct <= 0 and raw_shift < 0:
         target_shift = max(raw_shift, -tolerance_pct)
     target_shift = max(-NASH_MAX_ABS_PRICE_SHIFT_PCT, min(NASH_MAX_ABS_PRICE_SHIFT_PCT, target_shift))
     target_shift = max(-tolerance_pct, min(tolerance_pct, target_shift))
@@ -650,16 +822,9 @@ def solve_nash_equilibrium_window(
         price_shift = round(target_shift, 4)
         expected_load = expected_load_after_price(baseline_load, price_shift, elasticity)
         discomfort_score = user_discomfort_score(price_shift, tolerance_pct)
-        adjusted_service_price = adjusted_price(window.get("mean_service_price"), price_shift)
-        energy_price = optional_float(window.get("mean_energy_price"))
         grid_safe = expected_load <= capacity_limit + 1e-9
         user_tolerant = discomfort_score <= NASH_MAX_DISCOMFORT_SCORE + 1e-9
         price_stable = abs(price_shift - previous_shift) < NASH_PRICE_STABILITY_EPSILON_PCT
-        economic_feasible = (
-            True
-            if adjusted_service_price is None or energy_price is None
-            else adjusted_service_price + 1e-9 >= energy_price
-        )
         final_state = {
             "iteration": iteration,
             "price_shift_pct": round(price_shift, 4),
@@ -667,11 +832,10 @@ def solve_nash_equilibrium_window(
             "grid_safe": grid_safe,
             "user_tolerant": user_tolerant,
             "price_stable": price_stable,
-            "economic_feasible": economic_feasible,
             "discomfort_score": round(discomfort_score, 4),
         }
         trace.append(final_state)
-        if grid_safe and user_tolerant and price_stable and economic_feasible:
+        if grid_safe and user_tolerant and price_stable:
             break
         previous_shift = price_shift
 
@@ -679,7 +843,6 @@ def solve_nash_equilibrium_window(
         final_state.get("grid_safe")
         and final_state.get("user_tolerant")
         and final_state.get("price_stable")
-        and final_state.get("economic_feasible")
     )
     enriched = dict(window)
     enriched.update(
@@ -690,6 +853,8 @@ def solve_nash_equilibrium_window(
             "nash_status": "reached" if reached else "not_reached",
             "nash_iterations": int(final_state.get("iteration", 0) or 0),
             "nash_iteration_trace": trace,
+            "baseline_load_kwh": round(baseline_load, 4),
+            "baseline_load_source": window_predicted_load_source(window),
             "target_peak_reduction_pct": round(required_reduction_pct, 4),
             "elasticity_factor": round(elasticity, 4),
             "capacity_limit_kwh": round(capacity_limit, 4),
@@ -698,7 +863,6 @@ def solve_nash_equilibrium_window(
             "grid_safe": bool(final_state.get("grid_safe", False)),
             "user_tolerant": bool(final_state.get("user_tolerant", False)),
             "price_stable": bool(final_state.get("price_stable", False)),
-            "economic_feasible": bool(final_state.get("economic_feasible", True)),
             "discomfort_score": round(float(final_state.get("discomfort_score", 0)), 4),
             "max_discomfort_score": NASH_MAX_DISCOMFORT_SCORE,
             "price_stability_epsilon_pct": NASH_PRICE_STABILITY_EPSILON_PCT,
@@ -733,27 +897,33 @@ def average_price_shift(windows: list[dict[str, Any]], fallback: float) -> float
 
 
 def window_predicted_load(window: dict[str, Any]) -> float:
-    load = optional_float(window.get("sum_predicted_kwh"))
-    if load is not None:
-        return max(0.0, load)
+    for key in ("price_conditioned_baseline_load_kwh", "nash_baseline_load_kwh", "sum_predicted_kwh"):
+        load = optional_float(window.get(key))
+        if load is not None:
+            return max(0.0, load)
     mean_load = optional_float(window.get("mean_predicted_kwh")) or 0.0
     hours = optional_float(window.get("hours")) or 1.0
     return max(0.0, mean_load * hours)
 
 
+def window_predicted_load_source(window: dict[str, Any]) -> str:
+    for key, source in (
+        ("price_conditioned_baseline_load_kwh", "price_conditioned_forecast_sum_predicted_kwh"),
+        ("nash_baseline_load_kwh", "nash_baseline_load_kwh"),
+        ("sum_predicted_kwh", "forecast_sum_predicted_kwh"),
+    ):
+        if optional_float(window.get(key)) is not None:
+            return source
+    return "forecast_mean_predicted_kwh_times_hours"
+
+
 def capacity_limit_kwh(context: dict[str, Any], window: dict[str, Any]) -> tuple[float, str]:
-    historical = first_positive_float(
+    q95 = first_positive_float(
         window.get("load_3h_q95_kwh"),
         context.get("grid_stress_q95_kwh"),
-        window.get("load_3h_q80_kwh"),
-        context.get("grid_stress_q80_kwh"),
     )
-    capacity_kw = optional_float(context.get("capacity_kw_proxy"))
-    hours = optional_float(window.get("hours")) or optional_float(window.get("stress_window_hours")) or 3.0
-    physical = capacity_kw * hours if capacity_kw is not None and capacity_kw > 0 else None
-    candidates = [(value, source) for value, source in ((historical, "historical_load_quantile"), (physical, "capacity_kw_proxy")) if value is not None and value > 0]
-    if candidates:
-        return min(candidates, key=lambda item: item[0])
+    if q95 is not None and q95 > 0:
+        return q95, "load_3h_q95_kwh"
     return max(window_predicted_load(window), 0.0), "baseline_predicted_load"
 
 
@@ -768,6 +938,10 @@ def estimate_elasticity_factor(
     behavior: dict[str, Any],
     window: dict[str, Any],
 ) -> float:
+    window_value = optional_float(window.get("elasticity_factor"))
+    if window_value is not None:
+        return clamp(abs(window_value), NASH_MIN_ELASTICITY, NASH_MAX_ELASTICITY)
+
     reported = optional_float(behavior.get("elasticity_factor"))
     if reported is not None:
         return clamp(abs(reported), NASH_MIN_ELASTICITY, NASH_MAX_ELASTICITY)
@@ -825,21 +999,6 @@ def user_discomfort_score(price_shift_pct: float, tolerance_pct: float) -> float
     return abs(price_shift_pct) / tolerance_pct
 
 
-def economic_minimum_shift_pct(window: dict[str, Any]) -> float:
-    service_price = optional_float(window.get("mean_service_price"))
-    energy_price = optional_float(window.get("mean_energy_price"))
-    if service_price is None or energy_price is None or service_price <= 0:
-        return 0.0
-    return max(0.0, ((energy_price / service_price) - 1.0) * 100)
-
-
-def adjusted_price(price: Any, shift_pct: float) -> float | None:
-    value = optional_float(price)
-    if value is None:
-        return None
-    return value * (1.0 + shift_pct / 100.0)
-
-
 def normalized_rate(value: Any) -> float:
     number = optional_float(value)
     if number is None:
@@ -874,6 +1033,13 @@ def required_model_text(item: dict[str, Any], field: str, item_missing: bool) ->
         return model_response_failed("missing price_change_windows_3h item")
     value = item.get(field)
     return str(value).strip() if has_text(value) else model_response_failed(f"missing {field}")
+
+
+def first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def has_text(value: Any) -> bool:

@@ -8,7 +8,8 @@ This project implements the conference-work requirement in `Conference work.docx
    - Grid Analyst: forecast 1-4 days of load and assign a grid stress level.
    - Behavioural Agent: explain the demand drivers from POI mix, weather, time markers, and estimate a price-response elasticity factor.
    - Market Economist: prescribe a service-fee shift from stress, elasticity, and price context.
-   - Nash Equilibrium Check: simulate the load response to price and test grid safety, user tolerance, and price stability for each 3-hour window.
+   - Price-conditioned Forecaster: rerun the forecaster with predicted service prices plus observed weather, occupancy, and energy-price conditions to estimate the current load baseline.
+   - Nash Equilibrium Check: test the price-conditioned baseline against Q95 grid capacity, user tolerance, and price stability for each 3-hour window.
 4. Execute all five zone chains concurrently with `asyncio`.
 5. Export an explainability table with predicted vs. actual load, rationale, price shift, and Nash equilibrium status.
 
@@ -73,7 +74,7 @@ The TimesFM path now follows the `zone102_timefm1.ipynb` workflow:
 - `run.weather_file` chooses the weather source. Use `weather_central.csv` to match `zone102_timefm1.ipynb`; the default project path uses `weather_airport.csv`.
 - `run.history_days: 7` builds the context window.
 - `run.validation_days: 1` reserves the day before `forecast_start` for bias calibration.
-- `run.timesfm_exog_cols` controls dynamic numerical covariates. The notebook-style default is `T`, `U`, `nRAIN`, `e_price`, `is_weekend`, and `temp_price_idx`.
+- `run.timesfm_exog_cols` controls dynamic numerical covariates. The notebook-style default is `T`, `U`, `nRAIN`, `e_price`, `s_price`, `is_weekend`, and `temp_price_idx`. The post-price baseline forecast forces `s_price` into the covariates so the predicted service price can affect the load baseline.
 - `run.timesfm_diurnal_blend_alpha` blends the TimesFM point forecast with the recent hourly load profile. `1.0` matches the notebook setting; `0.0` disables the blend.
 - `run.timesfm_roll_actuals: true` rolls known actual values into the context during multi-day validation/forecast steps.
 
@@ -89,10 +90,10 @@ Generated result files are written under a forecast-model subfolder, for example
 
 - `selected_zones.csv`: the selected zones and the proxy features used for selection.
 - `context_snippets.json`: token-efficient context passed to each agent.
-- `rationale_trace.csv`: machine-readable explainability table, including zone-level Nash equilibrium status.
+- `rationale_trace.csv`: machine-readable explainability table, including zone-level Nash equilibrium status plus `agent_time_cost_seconds`, `agent_prompt_tokens`, `agent_completion_tokens`, and `agent_total_tokens`.
 - `rationale_trace.md`: markdown table for a report or paper appendix.
-- `rationale_trace.json`: full structured agent outputs.
-- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, adjusted service price, actual service price, stress labels, price rationales, and Nash equilibrium diagnostics (`expected_load_kwh`, `capacity_limit_kwh`, `elasticity_factor`, `grid_safe`, `user_tolerant`, and `price_stable`).
+- `rationale_trace.json`: full structured agent outputs, including per-agent call usage details under `agent_call_usage`.
+- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, adjusted service price, actual service price, stress labels, price rationales, price-conditioned baseline diagnostics (`price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, `baseline_load_source`), and Nash equilibrium diagnostics (`expected_load_kwh`, `capacity_limit_kwh`, `elasticity_factor`, `grid_safe`, `user_tolerant`, and `price_stable`). The Nash capacity limit is the zone's historical 3-hour Q95 load threshold.
 - `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when the adjusted service price is within 8% of the actual service price.
 - `explainability_rubric.md`: five-criterion human evaluation rubric for rationale quality.
 - `explainability_review_packet.csv`: review template for two independent raters plus an operator sanity-check column.

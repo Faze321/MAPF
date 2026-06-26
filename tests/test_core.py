@@ -10,9 +10,11 @@ import pandas as pd
 import torch
 
 from agents import (
+    AGENT_COMPLETION_USAGE_KEY,
     ECONOMIST_AGENT_OUTPUT_KEY,
     AgentChatClient,
     AgentStageError,
+    capacity_limit_kwh,
     extract_json_object,
     heuristic_behavior,
     heuristic_economist,
@@ -22,6 +24,7 @@ from agents import (
     run_zone_chain,
     solve_nash_equilibrium_window,
     validate_economist_report,
+    window_predicted_load,
 )
 from config import AgentConfig, AppConfig, RunConfig
 from data_loader import available_zone_ids, build_zone_3h_load_quantiles, load_pipeline_data
@@ -40,11 +43,14 @@ from orchestrator import (
     build_hourly_averages,
     build_pricing_windows_3h,
     classify_load_stress,
+    attach_price_conditioned_baselines,
+    ensure_service_price_exog_cols,
     forecast_output_dir,
     normalize_zone_ids,
     run_experiment_matrix,
     select_representative_zone_ids,
     select_requested_zones,
+    service_price_with_predicted_windows,
 )
 from prompts import compact_economist_context, economist_prompt, grid_prompt
 from reporting import (
@@ -74,6 +80,13 @@ class AgentParsingTests(unittest.TestCase):
                 class Response:
                     choices = [Choice()]
 
+                    class Usage:
+                        prompt_tokens = 7
+                        completion_tokens = 3
+                        total_tokens = 10
+
+                    usage = Usage()
+
                 return Response()
 
         class FakeChat:
@@ -91,7 +104,11 @@ class AgentParsingTests(unittest.TestCase):
 
         result = asyncio.run(client.complete_json("Return JSON.", temperature=0.2))
 
-        self.assertEqual(result, {"ok": True})
+        self.assertEqual(result["ok"], True)
+        self.assertEqual(
+            result[AGENT_COMPLETION_USAGE_KEY],
+            {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
+        )
         self.assertEqual(fake_client.chat.completions.kwargs["response_format"], {"type": "json_object"})
 
     def test_extracts_json_from_markdown_fence(self):
@@ -223,12 +240,49 @@ class AgentParsingTests(unittest.TestCase):
         )
 
         self.assertFalse(window["nash_equilibrium_reached"])
-        self.assertEqual(window["capacity_limit_source"], "historical_load_quantile")
+        self.assertEqual(window["capacity_limit_source"], "load_3h_q95_kwh")
         self.assertAlmostEqual(window["target_peak_reduction_pct"], 25.0)
         self.assertLessEqual(window["suggested_price_shift_pct"], window["max_discomfort_score"] * 15.0)
         self.assertFalse(window["grid_safe"])
         self.assertTrue(window["user_tolerant"])
         self.assertTrue(window["price_stable"])
+
+    def test_nash_uses_price_conditioned_baseline_and_q95_capacity(self):
+        window = {
+            "price_conditioned_baseline_load_kwh": 80.0,
+            "sum_predicted_kwh": 120.0,
+            "load_3h_q95_kwh": 90.0,
+            "load_3h_q80_kwh": 40.0,
+        }
+
+        self.assertEqual(window_predicted_load(window), 80.0)
+        self.assertEqual(
+            capacity_limit_kwh({"capacity_kw_proxy": 10.0}, window),
+            (90.0, "load_3h_q95_kwh"),
+        )
+
+    def test_nash_does_not_require_service_price_to_cover_energy_price(self):
+        window = solve_nash_equilibrium_window(
+            {"category": "Commercial"},
+            {},
+            {
+                "window_start": "2022-09-09 00:00:00",
+                "window_end": "2022-09-09 02:00:00",
+                "hours": 3,
+                "sum_predicted_kwh": 60.0,
+                "load_3h_q95_kwh": 100.0,
+                "mean_service_price": 1.0,
+                "mean_energy_price": 2.0,
+                "suggested_price_shift_pct": -10.0,
+                "action_label": "Utilization incentive",
+                "price_rationale": "Low stress window.",
+            },
+        )
+
+        self.assertTrue(window["nash_equilibrium_reached"])
+        self.assertEqual(window["suggested_price_shift_pct"], -10.0)
+        self.assertNotIn("economic_feasible", window)
+        self.assertNotIn("economic_feasible", window["nash_iteration_trace"][-1])
 
     def test_run_zone_chain_repairs_invalid_economist_response(self):
         class FakeClient:
@@ -269,7 +323,13 @@ class AgentParsingTests(unittest.TestCase):
 
             async def complete_json(self, prompt, *, temperature):
                 self.prompts.append(prompt)
-                return self.responses.pop(0)
+                response = self.responses.pop(0)
+                response[AGENT_COMPLETION_USAGE_KEY] = {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                }
+                return response
 
         client = FakeClient()
         context = {
@@ -309,6 +369,12 @@ class AgentParsingTests(unittest.TestCase):
         self.assertTrue(debug["repair_attempted"])
         self.assertEqual(debug["selected_response_source"], "repair")
         self.assertIn("missing action_label", debug["initial_validation_errors"])
+        self.assertEqual(report["agent_prompt_tokens"], 40)
+        self.assertEqual(report["agent_completion_tokens"], 20)
+        self.assertEqual(report["agent_total_tokens"], 60)
+        self.assertEqual(len(report["agent_call_usage"]), 4)
+        self.assertGreaterEqual(report["agent_time_cost_seconds"], 0)
+        self.assertEqual(debug["agent_usage_summary"]["total_tokens"], 30)
 
     def test_splits_economist_agent_output_from_trace_reports(self):
         trace_reports, economist_outputs = split_economist_agent_outputs(
@@ -762,6 +828,59 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(summary["stress_miss_count"], 1)
         self.assertAlmostEqual(summary["stress_accuracy"], 0.5)
         self.assertAlmostEqual(summary["miss_stress_rate"], 0.5)
+
+    def test_price_conditioned_service_price_uses_pre_nash_shift(self):
+        times = pd.date_range("2022-09-09", periods=4, freq="h")
+        service_price = pd.DataFrame({"time": times, "102": [1.0, 1.0, 1.0, 1.0]})
+
+        adjusted = service_price_with_predicted_windows(
+            service_price,
+            "102",
+            [
+                {
+                    "window_start": "2022-09-09 00:00:00",
+                    "window_end": "2022-09-09 02:00:00",
+                    "mean_service_price": 1.0,
+                    "pre_nash_suggested_price_shift_pct": 10.0,
+                    "suggested_price_shift_pct": 20.0,
+                }
+            ],
+        )
+
+        self.assertEqual(adjusted["102"].tolist(), [1.1, 1.1, 1.1, 1.0])
+        self.assertEqual(ensure_service_price_exog_cols(["T", "e_price", "U"]), ["T", "e_price", "s_price", "U"])
+
+    def test_attaches_price_conditioned_baseline_to_report_windows(self):
+        report = {
+            "price_change_windows_3h": [
+                {
+                    "window_start": "2022-09-09 00:00:00",
+                    "window_end": "2022-09-09 02:00:00",
+                    "sum_predicted_kwh": 60.0,
+                }
+            ]
+        }
+        updated = attach_price_conditioned_baselines(
+            report,
+            [
+                {
+                    "window_start": "2022-09-09 00:00:00",
+                    "window_end": "2022-09-09 02:00:00",
+                    "sum_predicted_kwh": 54.0,
+                    "mean_predicted_kwh": 18.0,
+                    "peak_predicted_kwh": 20.0,
+                    "load_stress_level": "Medium",
+                    "mean_service_price": 1.1,
+                }
+            ],
+            forecast_model="timesfm",
+        )
+
+        window = updated["price_change_windows_3h"][0]
+        self.assertEqual(window["price_conditioned_baseline_load_kwh"], 54.0)
+        self.assertEqual(window["price_conditioned_mean_predicted_kwh"], 18.0)
+        self.assertEqual(window["price_conditioned_load_stress_level"], "Medium")
+        self.assertIn("predicted_service_price", window["price_conditioned_baseline_source"])
 
     def test_caches_zone_three_hour_load_quantiles_from_volume_csv(self):
         with tempfile.TemporaryDirectory() as temp_dir:

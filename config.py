@@ -154,6 +154,7 @@ class AgentConfig:
     api_key: str | None
     base_url: str
     model: str
+    single_model_model: str | None = None
     http_referer: str | None = None
     title: str | None = None
     timeout_seconds: float = 90.0
@@ -177,11 +178,18 @@ class AgentConfig:
         settings = raw.get("agent")
         if not isinstance(settings, dict):
             raise ValueError('Config key "agent" must contain a mapping')
+        single_model_settings = settings.get("single_model")
+        if single_model_settings is None:
+            single_model_settings = {}
+        if not isinstance(single_model_settings, dict):
+            raise ValueError('Config key "agent.single_model" must contain a mapping when provided')
 
         return cls(
             api_key=optional_str(settings.get("api_key")),
             base_url=optional_str(settings.get("base_url")) or "https://openrouter.ai/api/v1",
             model=model or optional_str(settings.get("model")) or "meta-llama/llama-3.1-8b-instruct",
+            single_model_model=optional_str(settings.get("single_model_model"))
+            or optional_str(single_model_settings.get("model")),
             http_referer=optional_str(settings.get("http_referer")),
             title=optional_str(settings.get("title")) or "MAPF UrbanEV",
             timeout_seconds=float(settings.get("timeout_seconds", 90)),
@@ -267,6 +275,10 @@ def normalize_agent_mode(value: str | None) -> str:
     normalized = (value or "agents").strip().lower().replace("-", "_")
     if normalized in {"agent", "agents", "model", "llm"}:
         return "agents"
+    if normalized in {"agent_no_nash", "agents_no_nash", "no_nash", "without_nash", "no_equilibrium"}:
+        return "agents_no_nash"
+    if normalized in {"single", "single_model", "single_agent", "single_llm", "one_model", "monolithic"}:
+        return "single_model"
     if normalized in {"rule", "rules", "rule_only", "without_agents", "no_agents"}:
         return "rules"
     raise ValueError(f"Unsupported agent_mode: {value}")

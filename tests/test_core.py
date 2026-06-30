@@ -26,9 +26,10 @@ from agents import (
     validate_economist_report,
     window_predicted_load,
 )
-from config import AgentConfig, AppConfig, RunConfig
+from config import AgentConfig, AppConfig, RunConfig, normalize_agent_mode
 from data_loader import available_zone_ids, build_zone_3h_load_quantiles, load_pipeline_data
 from forecasting import (
+    ForecastResult,
     ar_forecast,
     build_zone_model_frame,
     chronos_forecast,
@@ -39,6 +40,7 @@ from forecasting import (
 )
 from orchestrator import (
     apply_load_quantile_stress,
+    apply_price_conditioned_baseline_forecasts,
     build_agent_hourly_data,
     build_hourly_averages,
     build_pricing_windows_3h,
@@ -48,6 +50,7 @@ from orchestrator import (
     forecast_output_dir,
     normalize_zone_ids,
     run_experiment_matrix,
+    select_agent_config_for_mode,
     select_representative_zone_ids,
     select_requested_zones,
     service_price_with_predicted_windows,
@@ -376,6 +379,134 @@ class AgentParsingTests(unittest.TestCase):
         self.assertGreaterEqual(report["agent_time_cost_seconds"], 0)
         self.assertEqual(debug["agent_usage_summary"]["total_tokens"], 30)
 
+    def test_run_zone_chain_can_skip_nash_equilibrium(self):
+        context = {
+            "category": "Commercial",
+            "zone_id": "102",
+            "forecast_total_kwh": 100.0,
+            "forecast_peak_kwh": 20.0,
+            "predicted_change_pct": 5.0,
+            "actual_total_kwh": 90.0,
+            "mae_kwh": None,
+            "rmse_kwh": None,
+            "mape_pct": None,
+            "rae": None,
+            "wape_pct": None,
+            "grid_stress_level": "High",
+            "weather": {"rain_hours": 0},
+            "hourly_shape": {"night_20_6": 1.0, "morning_7_10": 0.8, "evening_17_22": 0.7},
+            "profile": {"poi_total": 10},
+            "hourly_averages": {"mean_predicted_kwh": 10.0, "mean_energy_price": 1.0},
+            "pricing_windows_3h": [
+                {
+                    "window_start": "2022-09-09 00:00:00",
+                    "window_end": "2022-09-09 02:00:00",
+                    "sum_predicted_kwh": 60.0,
+                    "mean_predicted_kwh": 20.0,
+                    "load_stress_level": "High",
+                    "load_3h_q95_kwh": 40.0,
+                }
+            ],
+        }
+
+        report = asyncio.run(
+            run_zone_chain(
+                context,
+                client=None,
+                heuristic_source="test_no_nash",
+                apply_nash=False,
+            )
+        )
+
+        window = report["price_change_windows_3h"][0]
+        self.assertEqual(report["source"], "test_no_nash")
+        self.assertEqual(window["nash_status"], "skipped")
+        self.assertIsNone(window["nash_equilibrium_reached"])
+        self.assertEqual(window["suggested_price_shift_pct"], 11.0)
+        self.assertEqual(report["nash_equilibrium_summary"], "Nash equilibrium skipped for 1 pricing windows")
+
+    def test_single_model_mode_uses_one_agent_call(self):
+        class FakeClient:
+            def __init__(self):
+                self.prompts = []
+
+            async def complete_json(self, prompt, *, temperature):
+                self.prompts.append(prompt)
+                return {
+                    "forecast_total_kwh": 100.0,
+                    "forecast_peak_kwh": 20.0,
+                    "predicted_change_pct": 5.0,
+                    "grid_stress_level": "Medium",
+                    "forecast_summary": "Moderate demand.",
+                    "agent_reasoning": "One moderate window.",
+                    "demand_drivers": ["moderate load"],
+                    "elasticity_factor": 0.2,
+                    "confidence": "medium",
+                    "suggested_price_shift_pct": 5,
+                    "action_label": "Raise price",
+                    "price_rationale": "Moderate stress supports a small service-fee increase.",
+                    "price_change_windows_3h": [
+                        {
+                            "window_start": "2022-09-09 00:00:00",
+                            "window_end": "2022-09-09 02:00:00",
+                            "suggested_price_shift_pct": 5,
+                            "action_label": "Raise price",
+                            "price_rationale": "Moderate stress window.",
+                        }
+                    ],
+                    AGENT_COMPLETION_USAGE_KEY: {
+                        "prompt_tokens": 12,
+                        "completion_tokens": 8,
+                        "total_tokens": 20,
+                    },
+                }
+
+        context = {
+            "category": "Commercial",
+            "zone_id": "102",
+            "forecast_total_kwh": 100.0,
+            "forecast_peak_kwh": 20.0,
+            "predicted_change_pct": 5.0,
+            "actual_total_kwh": None,
+            "mae_kwh": None,
+            "rmse_kwh": None,
+            "mape_pct": None,
+            "rae": None,
+            "wape_pct": None,
+            "grid_stress_level": "Medium",
+            "weather": {"rain_hours": 0},
+            "hourly_shape": {"night_20_6": 1.0, "morning_7_10": 0.8, "evening_17_22": 0.7},
+            "profile": {"poi_total": 10},
+            "hourly_averages": {"mean_predicted_kwh": 10.0, "mean_energy_price": 1.0},
+            "pricing_windows_3h": [
+                {
+                    "window_start": "2022-09-09 00:00:00",
+                    "window_end": "2022-09-09 02:00:00",
+                    "sum_predicted_kwh": 30.0,
+                    "mean_predicted_kwh": 10.0,
+                    "load_stress_level": "Medium",
+                    "load_3h_q95_kwh": 100.0,
+                }
+            ],
+        }
+        client = FakeClient()
+
+        report = asyncio.run(
+            run_zone_chain(
+                context,
+                client=client,
+                temperature=0.2,
+                chain_mode="single_model",
+            )
+        )
+
+        self.assertEqual(len(client.prompts), 1)
+        self.assertEqual(report["source"], "single_model")
+        self.assertEqual(report["agent_reasoning"], "One moderate window.")
+        self.assertEqual(report["agent_total_tokens"], 20)
+        self.assertEqual(len(report["agent_call_usage"]), 1)
+        self.assertEqual(report[ECONOMIST_AGENT_OUTPUT_KEY]["selected_response_source"], "single_model")
+
     def test_splits_economist_agent_output_from_trace_reports(self):
         trace_reports, economist_outputs = split_economist_agent_outputs(
             [
@@ -533,6 +664,7 @@ class ConfigTests(unittest.TestCase):
         config = AgentConfig.from_file(Path("config.example.yaml"))
         self.assertEqual(config.api_key, "sk-...")
         self.assertEqual(config.model, "meta-llama/llama-3.1-8b-instruct")
+        self.assertEqual(config.single_model_model, "openai/gpt-4.1")
         self.assertEqual(config.timeout_seconds, 90)
 
     def test_reads_run_yaml_config(self):
@@ -550,7 +682,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.run.forecast_models, ["timesfm", "chronos", "lstm", "AR"])
         self.assertEqual(config.run.experiment_seeds, [7, 42, 99])
         self.assertEqual(config.run.agent_mode, "agents")
-        self.assertEqual(config.run.agent_modes, ["agents", "rules"])
+        self.assertEqual(config.run.agent_modes, ["agents", "agents_no_nash", "single_model", "rules"])
         self.assertEqual(config.run.diurnal_blend_alphas, [0.0, 0.3, 0.6])
         self.assertEqual(config.run.timesfm_repo, "google/timesfm-2.5-200m-pytorch")
         self.assertEqual(config.run.timesfm_exog_cols[:4], ["T", "U", "nRAIN", "e_price"])
@@ -574,6 +706,25 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.forecast_model, "timesfm")
         self.assertEqual(config.timesfm_context_hours, 48)
         self.assertEqual(config.timesfm_exog_cols, ["T", "U"])
+
+    def test_normalizes_new_agent_modes(self):
+        self.assertEqual(normalize_agent_mode("no-nash"), "agents_no_nash")
+        self.assertEqual(normalize_agent_mode("single"), "single_model")
+
+    def test_selects_single_model_specific_agent_model(self):
+        config = AgentConfig(
+            api_key="sk-test",
+            base_url="https://example.test",
+            model="small-model",
+            single_model_model="large-model",
+        )
+        selected = select_agent_config_for_mode(config, agent_mode="single_model", cli_model=None)
+        cli_selected = select_agent_config_for_mode(config, agent_mode="single_model", cli_model="cli-model")
+        normal_selected = select_agent_config_for_mode(config, agent_mode="agents", cli_model=None)
+
+        self.assertEqual(selected.model, "large-model")
+        self.assertEqual(cli_selected.model, "small-model")
+        self.assertEqual(normal_selected.model, "small-model")
 
 
 class ForecastingTests(unittest.TestCase):
@@ -614,6 +765,30 @@ class ForecastingTests(unittest.TestCase):
         self.assertEqual(len(result), 48)
         self.assertIn("predicted_kwh", result)
         self.assertGreater(result["predicted_kwh"].sum(), 0)
+
+    def test_ar_forecast_uses_service_price_adjustment(self):
+        history = pd.DataFrame(
+            {
+                "time": pd.date_range("2023-01-01", periods=24 * 7, freq="h"),
+                "actual_kwh": [10.0] * (24 * 7),
+                "s_price": [1.0] * (24 * 7),
+            }
+        )
+        forecast_start = pd.Timestamp("2023-01-08")
+        full_frame = pd.DataFrame(
+            {
+                "time": pd.date_range(forecast_start, periods=6, freq="h"),
+                "actual_kwh": [np.nan] * 6,
+                "s_price": [1.5] * 6,
+            }
+        )
+
+        baseline = ar_forecast(history, forecast_start, 6)
+        adjusted = ar_forecast(history, forecast_start, 6, full_frame=full_frame)
+
+        self.assertTrue((adjusted["predicted_kwh"] < baseline["predicted_kwh"]).all())
+        self.assertTrue((adjusted["service_price_adjustment_kwh"] < 0).all())
+        self.assertTrue(adjusted.attrs["service_price_adjustment"]["enabled"])
 
     def test_forecast_metrics_include_error_standards(self):
         hourly = pd.DataFrame(
@@ -707,6 +882,59 @@ class ForecastingTests(unittest.TestCase):
         self.assertEqual(result["predicted_kwh"].tolist(), [1.0, 2.0])
         self.assertEqual(result["q10_kwh"].tolist(), [0.5, 1.5])
         self.assertEqual(result["q90_kwh"].tolist(), [1.5, 2.5])
+
+    def test_chronos_forecast_passes_service_price_covariates(self):
+        test_case = self
+
+        class FakeChronos2:
+            def __init__(self):
+                self.inputs = []
+
+            def predict_quantiles(self, inputs, prediction_length, quantile_levels, **kwargs):
+                self.inputs.append(inputs)
+                payload = inputs[0]
+                test_case.assertIsInstance(payload, dict)
+                test_case.assertIn("s_price", payload["past_covariates"])
+                test_case.assertIn("s_price", payload["future_covariates"])
+                np.testing.assert_allclose(payload["future_covariates"]["s_price"], [1.5, 1.6])
+                center = torch.arange(1, prediction_length + 1, dtype=torch.float32)
+                quantiles = torch.stack([center - 0.5, center, center + 0.5], dim=-1).unsqueeze(0)
+                return [quantiles], [center.unsqueeze(0)]
+
+        fake = FakeChronos2()
+        history = pd.DataFrame(
+            {
+                "time": pd.date_range("2023-01-01", periods=24, freq="h"),
+                "actual_kwh": [float(hour + 1) for hour in range(24)],
+                "s_price": [1.0] * 24,
+            }
+        )
+        full_frame = pd.DataFrame(
+            {
+                "time": pd.date_range("2023-01-02", periods=2, freq="h"),
+                "actual_kwh": [np.nan, np.nan],
+                "s_price": [1.5, 1.6],
+            }
+        )
+        with patch("forecasting.load_chronos_model", return_value=fake):
+            result = chronos_forecast(
+                history,
+                pd.DataFrame(),
+                full_frame,
+                pd.Timestamp("2023-01-02"),
+                2,
+                repo="fake",
+                context_hours=24,
+                step_horizon=2,
+                exog_cols=["s_price"],
+                diurnal_blend_alpha=0.0,
+                device="cpu",
+                roll_actuals=False,
+            )
+
+        self.assertEqual(result["predicted_kwh"].tolist(), [1.0, 2.0])
+        self.assertEqual(result.attrs["chronos_covariates"], ["s_price"])
+        self.assertEqual(len(fake.inputs), 1)
 
     def test_lstm_forecast_produces_hourly_predictions(self):
         times = pd.date_range("2023-01-01", periods=60, freq="h")
@@ -881,6 +1109,110 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(window["price_conditioned_mean_predicted_kwh"], 18.0)
         self.assertEqual(window["price_conditioned_load_stress_level"], "Medium")
         self.assertIn("predicted_service_price", window["price_conditioned_baseline_source"])
+
+    def test_price_conditioned_baseline_runs_for_ar(self):
+        class PipelineData:
+            pass
+
+        times = pd.date_range("2022-09-09", periods=3, freq="h")
+        pipeline_data = PipelineData()
+        pipeline_data.profiles = pd.DataFrame(
+            [{"zone_id": "102", "category": "User-selected", "capacity_kw_proxy": 100.0}]
+        )
+        pipeline_data.load = pd.DataFrame({"time": times, "102": [10.0, 10.0, 10.0]})
+        pipeline_data.service_price = pd.DataFrame({"time": times, "102": [1.0, 1.0, 1.0]})
+        pipeline_data.energy_price = pd.DataFrame({"time": times, "102": [0.5, 0.5, 0.5]})
+        pipeline_data.occupancy = pd.DataFrame({"time": times, "102": [0.1, 0.1, 0.1]})
+        pipeline_data.weather = pd.DataFrame({"time": times, "T": [20.0] * 3, "U": [60.0] * 3, "nRAIN": [0.0] * 3})
+        reports = [
+            {
+                "zone_id": "102",
+                "category": "User-selected",
+                "price_change_windows_3h": [
+                    {
+                        "window_start": "2022-09-09 00:00:00",
+                        "window_end": "2022-09-09 02:00:00",
+                        "mean_service_price": 1.0,
+                        "pre_nash_suggested_price_shift_pct": 10.0,
+                        "suggested_price_shift_pct": 10.0,
+                    }
+                ],
+            }
+        ]
+        contexts = [
+            {
+                "zone_id": "102",
+                "category": "User-selected",
+                "forecast_start": "2022-09-09 00:00:00",
+                "forecast_horizon_days": 1,
+            }
+        ]
+        quantiles = pd.DataFrame(
+            [
+                {
+                    "zone_id": "102",
+                    "stress_source_file": "volume.csv",
+                    "stress_window_hours": 3,
+                    "historical_windows": 10,
+                    "load_3h_q50_kwh": 20.0,
+                    "load_3h_q80_kwh": 35.0,
+                    "load_3h_q95_kwh": 40.0,
+                }
+            ]
+        )
+
+        def fake_forecast_zone(**kwargs):
+            self.assertEqual(kwargs["forecast_model"], "AR")
+            self.assertEqual(kwargs["service_price"]["102"].tolist(), [1.1, 1.1, 1.1])
+            hourly = pd.DataFrame(
+                {
+                    "time": times,
+                    "predicted_kwh": [18.0, 18.0, 18.0],
+                    "actual_kwh": [np.nan, np.nan, np.nan],
+                    "s_price": [1.1, 1.1, 1.1],
+                    "e_price": [0.5, 0.5, 0.5],
+                }
+            )
+            return ForecastResult(hourly=hourly, summary={})
+
+        with patch("orchestrator.forecast_zone", side_effect=fake_forecast_zone):
+            updated = apply_price_conditioned_baseline_forecasts(
+                reports=reports,
+                contexts=contexts,
+                pipeline_data=pipeline_data,
+                zone_load_quantiles=quantiles,
+                forecast_start="2022-09-09 00:00:00",
+                horizon_days=1,
+                history_days=7,
+                validation_days=1,
+                forecast_model="AR",
+                timesfm_repo="fake",
+                timesfm_context_hours=24,
+                timesfm_step_horizon=24,
+                timesfm_exog_cols=None,
+                timesfm_diurnal_blend_alpha=0.0,
+                ar_diurnal_blend_alpha=0.0,
+                chronos_repo="fake",
+                chronos_context_hours=24,
+                chronos_step_horizon=24,
+                chronos_diurnal_blend_alpha=0.0,
+                chronos_device="cpu",
+                lstm_context_hours=24,
+                lstm_step_horizon=24,
+                lstm_exog_cols=None,
+                lstm_hidden_size=8,
+                lstm_num_layers=1,
+                lstm_epochs=1,
+                lstm_learning_rate=0.01,
+                lstm_batch_size=8,
+                lstm_diurnal_blend_alpha=0.0,
+                lstm_device="cpu",
+                lstm_seed=7,
+            )
+
+        window = updated[0]["price_change_windows_3h"][0]
+        self.assertEqual(window["price_conditioned_baseline_load_kwh"], 54.0)
+        self.assertIn("AR_forecast_with_predicted_service_price", window["price_conditioned_baseline_source"])
 
     def test_caches_zone_three_hour_load_quantiles_from_volume_csv(self):
         with tempfile.TemporaryDirectory() as temp_dir:

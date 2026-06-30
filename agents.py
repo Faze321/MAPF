@@ -8,7 +8,14 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from config import AgentConfig
-from prompts import SYSTEM_MESSAGE, behavior_prompt, economist_prompt, grid_prompt, repair_economist_prompt
+from prompts import (
+    SYSTEM_MESSAGE,
+    behavior_prompt,
+    economist_prompt,
+    grid_prompt,
+    repair_economist_prompt,
+    single_model_prompt,
+)
 
 
 GRID_STRESS_LEVELS = ("Low", "Medium", "High", "Extreme High")
@@ -107,9 +114,19 @@ async def run_zone_chain(
     client: ChatClient | None,
     temperature: float = 0.2,
     heuristic_source: str = "dry-run",
+    chain_mode: str = "agents",
+    apply_nash: bool = True,
 ) -> dict[str, Any]:
     if client is None:
-        return heuristic_zone_chain(context, source=heuristic_source)
+        return heuristic_zone_chain(context, source=heuristic_source, apply_nash=apply_nash)
+
+    if chain_mode == "single_model":
+        return await run_single_model_zone_chain(
+            context,
+            client=client,
+            temperature=temperature,
+            apply_nash=apply_nash,
+        )
 
     grid_result = await complete_agent_json(
         client,
@@ -153,9 +170,56 @@ async def run_zone_chain(
         grid,
         behavior,
         economist,
-        source="model",
+        source="model" if apply_nash else "model_no_nash",
         economist_debug=economist_debug,
         agent_call_usage=agent_call_usage,
+        apply_nash=apply_nash,
+    )
+
+
+async def run_single_model_zone_chain(
+    context: dict[str, Any],
+    *,
+    client: ChatClient,
+    temperature: float,
+    apply_nash: bool,
+) -> dict[str, Any]:
+    result = await complete_agent_json(
+        client,
+        single_model_prompt(context),
+        context=context,
+        temperature=temperature,
+        stage="agent.single_model",
+        agent="Single Model Analyst",
+    )
+    response = result.content
+    grid = merge_grid_fallback(response, context)
+    behavior = merge_behavior_fallback(response, context)
+    economist = merge_economist_fallback(response, context)
+    validation_errors = validate_economist_report(response, context.get("pricing_windows_3h", []))
+    debug = {
+        "zone_id": context.get("zone_id"),
+        "category": context.get("category"),
+        "forecast_start": context.get("forecast_start"),
+        "forecast_end": context.get("forecast_end"),
+        "expected_price_window_count": len(context.get("pricing_windows_3h", []))
+        if isinstance(context.get("pricing_windows_3h"), list)
+        else 0,
+        "single_model_response": response,
+        "single_model_validation_errors": validation_errors,
+        "selected_response_source": "single_model",
+        "agent_call_usage": [result.usage],
+        "agent_usage_summary": summarize_agent_call_usage([result.usage]),
+    }
+    return combine_reports(
+        context,
+        grid,
+        behavior,
+        economist,
+        source="single_model" if apply_nash else "single_model_no_nash",
+        economist_debug=debug,
+        agent_call_usage=[result.usage],
+        apply_nash=apply_nash,
     )
 
 
@@ -165,6 +229,8 @@ async def run_all_zone_chains(
     client: ChatClient | None,
     temperature: float = 0.2,
     heuristic_source: str = "dry-run",
+    chain_mode: str = "agents",
+    apply_nash: bool = True,
 ) -> list[dict[str, Any]]:
     tasks = [
         run_zone_chain(
@@ -172,6 +238,8 @@ async def run_all_zone_chains(
             client=client,
             temperature=temperature,
             heuristic_source=heuristic_source,
+            chain_mode=chain_mode,
+            apply_nash=apply_nash,
         )
         for context in contexts
     ]
@@ -371,11 +439,16 @@ def optional_float_usage(value: Any) -> float:
         return 0.0
 
 
-def heuristic_zone_chain(context: dict[str, Any], *, source: str = "dry-run") -> dict[str, Any]:
+def heuristic_zone_chain(
+    context: dict[str, Any],
+    *,
+    source: str = "dry-run",
+    apply_nash: bool = True,
+) -> dict[str, Any]:
     grid = heuristic_grid(context)
     behavior = heuristic_behavior(context)
     economist = heuristic_economist(context, grid)
-    return combine_reports(context, grid, behavior, economist, source=source)
+    return combine_reports(context, grid, behavior, economist, source=source, apply_nash=apply_nash)
 
 
 def heuristic_grid(context: dict[str, Any]) -> dict[str, Any]:
@@ -468,12 +541,17 @@ def combine_reports(
     source: str,
     economist_debug: dict[str, Any] | None = None,
     agent_call_usage: list[dict[str, Any]] | None = None,
+    apply_nash: bool = True,
 ) -> dict[str, Any]:
     price_windows = normalize_price_windows(
         economist.get("price_change_windows_3h"),
         context.get("pricing_windows_3h", []),
     )
-    price_windows = apply_nash_equilibrium_to_windows(context, behavior, price_windows)
+    price_windows = (
+        apply_nash_equilibrium_to_windows(context, behavior, price_windows)
+        if apply_nash
+        else skip_nash_equilibrium_for_windows(context, behavior, price_windows)
+    )
     nash_summary = summarize_nash_equilibrium(price_windows)
     final_shift = average_price_shift(price_windows, as_float(economist.get("suggested_price_shift_pct"), 0))
     usage_summary = summarize_agent_call_usage(agent_call_usage or [])
@@ -520,11 +598,16 @@ def combine_reports(
     return report
 
 
-def recompute_report_nash(context: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
-    price_windows = apply_nash_equilibrium_to_windows(
-        context,
-        {},
-        report.get("price_change_windows_3h") or [],
+def recompute_report_nash(
+    context: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    apply_nash: bool = True,
+) -> dict[str, Any]:
+    price_windows = (
+        apply_nash_equilibrium_to_windows(context, {}, report.get("price_change_windows_3h") or [])
+        if apply_nash
+        else skip_nash_equilibrium_for_windows(context, {}, report.get("price_change_windows_3h") or [])
     )
     nash_summary = summarize_nash_equilibrium(price_windows)
     updated = dict(report)
@@ -797,6 +880,53 @@ def apply_nash_equilibrium_to_windows(
     return [solve_nash_equilibrium_window(context, behavior, window) for window in windows]
 
 
+def skip_nash_equilibrium_for_windows(
+    context: dict[str, Any],
+    behavior: dict[str, Any],
+    windows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [mark_nash_equilibrium_skipped(context, behavior, window) for window in windows]
+
+
+def mark_nash_equilibrium_skipped(
+    context: dict[str, Any],
+    behavior: dict[str, Any],
+    window: dict[str, Any],
+) -> dict[str, Any]:
+    baseline_load = window_predicted_load(window)
+    capacity_limit, capacity_source = capacity_limit_kwh(context, window)
+    elasticity = estimate_elasticity_factor(context, behavior, window)
+    tolerance_pct = estimate_price_tolerance_pct(context, window)
+    raw_shift = as_float(window.get("suggested_price_shift_pct"), 0)
+    expected_load = expected_load_after_price(baseline_load, raw_shift, elasticity)
+    discomfort_score = user_discomfort_score(raw_shift, tolerance_pct)
+    enriched = dict(window)
+    enriched.update(
+        {
+            "pre_nash_suggested_price_shift_pct": raw_shift,
+            "suggested_price_shift_pct": round(raw_shift, 2),
+            "nash_equilibrium_reached": None,
+            "nash_status": "skipped",
+            "nash_iterations": 0,
+            "nash_iteration_trace": [],
+            "baseline_load_kwh": round(baseline_load, 4),
+            "baseline_load_source": window_predicted_load_source(window),
+            "target_peak_reduction_pct": round(target_peak_reduction_pct(baseline_load, capacity_limit), 4),
+            "elasticity_factor": round(elasticity, 4),
+            "capacity_limit_kwh": round(capacity_limit, 4),
+            "capacity_limit_source": capacity_source,
+            "expected_load_kwh": round(expected_load, 4),
+            "grid_safe": expected_load <= capacity_limit + 1e-9,
+            "user_tolerant": discomfort_score <= NASH_MAX_DISCOMFORT_SCORE + 1e-9,
+            "price_stable": None,
+            "discomfort_score": round(discomfort_score, 4),
+            "max_discomfort_score": NASH_MAX_DISCOMFORT_SCORE,
+            "price_stability_epsilon_pct": NASH_PRICE_STABILITY_EPSILON_PCT,
+        }
+    )
+    return enriched
+
+
 def solve_nash_equilibrium_window(
     context: dict[str, Any],
     behavior: dict[str, Any],
@@ -873,6 +1003,14 @@ def solve_nash_equilibrium_window(
 
 def summarize_nash_equilibrium(windows: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(windows)
+    if total and all(window.get("nash_status") == "skipped" for window in windows):
+        return {
+            "nash_equilibrium_reached": None,
+            "nash_equilibrium_windows": total,
+            "nash_equilibrium_reached_windows": 0,
+            "nash_equilibrium_rounds": 0,
+            "nash_equilibrium_summary": f"Nash equilibrium skipped for {total} pricing windows",
+        }
     reached = sum(1 for window in windows if window.get("nash_equilibrium_reached") is True)
     rounds = max((int(window.get("nash_iterations") or 0) for window in windows), default=0)
     all_reached = total > 0 and reached == total

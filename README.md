@@ -36,6 +36,7 @@ For model-backed agents:
 ```powershell
 Copy-Item config.example.yaml config.yaml
 # Edit config.yaml and set agent.api_key / agent.model / agent.base_url
+# Optional: set agent.single_model_model to use a stronger model only for --agent-mode single_model
 # Set run.dry_run: false
 python main.py
 ```
@@ -51,6 +52,8 @@ python main.py --dry-run --zones 102 --weather-file weather_central.csv --foreca
 python main.py --dry-run --forecast-model chronos
 python main.py --dry-run --forecast-model lstm
 python main.py --dry-run --forecast-model AR
+python main.py --agent-mode agents_no_nash --zones 102 --forecast-model timesfm
+python main.py --agent-mode single_model --model openai/gpt-4.1 --zones 102 --forecast-model timesfm
 python main.py --zones 102 105 --forecast-starts "2022-09-09 00:00:00" "2022-10-14 00:00:00" "2022-12-16 00:00:00" "2023-02-24 00:00:00" --forecast-models timesfm chronos lstm AR
 python main.py --forecast-starts "2022-09-09 00:00:00" "2022-10-14 00:00:00" --forecast-models chronos lstm --experiment-zone-count 12 --experiment-seeds 7 42 99
 python main.py --forecast-starts "2022-09-09 00:00:00" --forecast-models chronos lstm --agent-modes agents rules --diurnal-blend-alphas 0.0 0.3 0.6
@@ -62,19 +65,27 @@ Runtime defaults can be stored under `run:` in `config.yaml`, so common settings
 
 For broader experimental validation, set `run.forecast_starts` and `run.forecast_models`, or pass `--forecast-starts` and `--forecast-models`. If `run.zones` / `--zones` is omitted in an experiment matrix, the runner selects a representative zone set from the cached zone profiles. `run.experiment_zone_count` / `--experiment-zone-count` controls the size of that set; the example config uses 12 zones instead of the earlier two-zone quick check.
 
-Experiment matrices can also sweep `run.experiment_seeds`, `run.agent_modes`, and `run.diurnal_blend_alphas`. Seeds are recorded for every model and passed into LSTM training. `agent_modes: ["agents", "rules"]` runs the LLM-backed agent chain against the deterministic rule-only pricing baseline, so `price_accuracy`, price bias, `stress_accuracy`, and `miss_stress_rate` can be compared directly. `diurnal_blend_alphas` applies the same daily-shape blend weight to TimesFM, Chronos, LSTM, and AR for fair blend ablations.
+Experiment matrices can also sweep `run.experiment_seeds`, `run.agent_modes`, and `run.diurnal_blend_alphas`. Seeds are recorded for every model and passed into LSTM training. `agent_modes` supports `agents` for the full three-stage LLM chain with Nash equilibrium, `agents_no_nash` for the same chain without the Nash equilibrium adjustment, `single_model` for one stronger model call that replaces the Grid/Behaviour/Economist calls, and `rules` for the deterministic rule-only pricing baseline. This lets `price_accuracy`, price bias, `stress_accuracy`, and `miss_stress_rate` be compared directly across ablations. `diurnal_blend_alphas` applies the same daily-shape blend weight to TimesFM, Chronos, LSTM, and AR for fair blend ablations.
+
+For `single_model`, configure a dedicated model under `agent.single_model_model`. The normal three-stage `agents` mode continues to use `agent.model`; `--model` still overrides the active model for one command-line run.
+
+```yaml
+agent:
+  model: "meta-llama/llama-3.1-8b-instruct"
+  single_model_model: "openai/gpt-4.1"
+```
 
 Multi-value runs execute the full forecast-start by forecaster by seed by agent-mode by blend matrix while keeping each combination in a separate folder under `output/experiments/`, for example `output/experiments/zones_auto_4starts/2022-09-09_000000/seed_42/agent_rules/blend_0_3/lstm/`. The experiment root writes raw concatenated tables plus aggregate summaries with `n`, `mean`, `std`, and `sem`: `experiment_forecast_summary.csv`, `experiment_price_summary.csv`, `experiment_rationale_summary.csv`, and `experiment_decision_quality_summary.csv`.
 
-Set `run.forecast_model: "timesfm"` to use `google/timesfm-2.5-200m-pytorch` for load forecasting. Set `run.forecast_model: "lstm"` to train a small local PyTorch LSTM per zone. Set `run.forecast_model: "AR"` for a fast autoregressive baseline run without TimesFM.
-Set `run.forecast_model: "chronos"` to use Chronos. The default Chronos config uses `amazon/chronos-2`, rolls actual observations into the context during retrospective multi-day evaluation, and exports the same `predicted_kwh`, `q10_kwh`, `q50_kwh`, and `q90_kwh` columns as TimesFM.
+Set `run.forecast_model: "timesfm"` to use `google/timesfm-2.5-200m-pytorch` for load forecasting. Set `run.forecast_model: "lstm"` to train a small local PyTorch LSTM per zone. Set `run.forecast_model: "AR"` for a fast autoregressive baseline run without TimesFM; AR applies a calibrated service-price response adjustment when `s_price` is available.
+Set `run.forecast_model: "chronos"` to use Chronos. The default Chronos config uses `amazon/chronos-2`, passes known future covariates including `s_price`, rolls actual observations into the context during retrospective multi-day evaluation, and exports the same `predicted_kwh`, `q10_kwh`, `q50_kwh`, and `q90_kwh` columns as TimesFM.
 
 The TimesFM path now follows the `zone102_timefm1.ipynb` workflow:
 
 - `run.weather_file` chooses the weather source. Use `weather_central.csv` to match `zone102_timefm1.ipynb`; the default project path uses `weather_airport.csv`.
 - `run.history_days: 7` builds the context window.
 - `run.validation_days: 1` reserves the day before `forecast_start` for bias calibration.
-- `run.timesfm_exog_cols` controls dynamic numerical covariates. The notebook-style default is `T`, `U`, `nRAIN`, `e_price`, `s_price`, `is_weekend`, and `temp_price_idx`. The post-price baseline forecast forces `s_price` into the covariates so the predicted service price can affect the load baseline.
+- `run.timesfm_exog_cols` controls dynamic numerical covariates. The notebook-style default is `T`, `U`, `nRAIN`, `e_price`, `s_price`, `is_weekend`, and `temp_price_idx`. The post-price baseline forecast forces `s_price` into the TimesFM, LSTM, and Chronos covariates so the predicted service price can affect the load baseline; AR uses the same `s_price` through its local service-price response adjustment.
 - `run.timesfm_diurnal_blend_alpha` blends the TimesFM point forecast with the recent hourly load profile. `1.0` matches the notebook setting; `0.0` disables the blend.
 - `run.timesfm_roll_actuals: true` rolls known actual values into the context during multi-day validation/forecast steps.
 

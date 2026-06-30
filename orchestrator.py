@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import traceback
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -101,6 +102,8 @@ def run_pipeline(
 ) -> dict[str, Path]:
     forecast_model = normalize_forecast_model_name(forecast_model)
     agent_mode = normalize_agent_mode(agent_mode)
+    apply_nash = agent_mode != "agents_no_nash"
+    chain_mode = "single_model" if agent_mode == "single_model" else "agents"
     output_dir.mkdir(parents=True, exist_ok=True)
     shared_cache_dir = cache_dir or output_dir / "cache"
     run_output_dir = forecast_output_dir(output_dir, forecast_model)
@@ -180,11 +183,12 @@ def run_pipeline(
         heuristic_source = "rules"
     elif dry_run:
         client = None
-        heuristic_source = "dry-run"
+        heuristic_source = f"dry-run_{agent_mode}" if agent_mode != "agents" else "dry-run"
     else:
         config = AgentConfig.from_file(config_path, model=model, required=True)
         if not config.api_key:
             raise RuntimeError("agent.api_key is required in config.yaml, or pass --dry-run")
+        config = select_agent_config_for_mode(config, agent_mode=agent_mode, cli_model=model)
         client = AgentChatClient(config)
         heuristic_source = "dry-run"
     try:
@@ -194,6 +198,8 @@ def run_pipeline(
                 client=client,
                 temperature=temperature,
                 heuristic_source=heuristic_source,
+                chain_mode=chain_mode,
+                apply_nash=apply_nash,
             )
         )
     except AgentStageError:
@@ -233,6 +239,7 @@ def run_pipeline(
             lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
             lstm_device=lstm_device,
             lstm_seed=lstm_seed,
+            apply_nash=apply_nash,
         )
     except Exception as exc:
         raise PipelineStageError(stage="price_conditioned_forecast", original=exc) from exc
@@ -246,6 +253,17 @@ def run_pipeline(
         )
     except Exception as exc:
         raise PipelineStageError(stage="write_outputs", original=exc) from exc
+
+
+def select_agent_config_for_mode(
+    config: AgentConfig,
+    *,
+    agent_mode: str,
+    cli_model: str | None,
+) -> AgentConfig:
+    if agent_mode == "single_model" and cli_model is None and config.single_model_model:
+        return replace(config, model=config.single_model_model)
+    return config
 
 
 def run_experiment_matrix(
@@ -905,13 +923,14 @@ def apply_price_conditioned_baseline_forecasts(
     lstm_diurnal_blend_alpha: float,
     lstm_device: str,
     lstm_seed: int,
+    apply_nash: bool = True,
 ) -> list[dict[str, Any]]:
     normalized_model = normalize_forecast_model_name(forecast_model)
-    if normalized_model not in {"timesfm", "lstm"}:
+    if normalized_model not in {"timesfm", "lstm", "chronos", "AR"}:
         return [
             mark_price_conditioned_baseline_unavailable(
                 report,
-                f"forecast_model_{normalized_model}_does_not_use_service_price_covariates",
+                f"unsupported_forecast_model_{normalized_model}",
             )
             for report in reports
         ]
@@ -966,6 +985,7 @@ def apply_price_conditioned_baseline_forecasts(
             chronos_repo=chronos_repo,
             chronos_context_hours=chronos_context_hours,
             chronos_step_horizon=chronos_step_horizon,
+            chronos_exog_cols=ensure_service_price_exog_cols(DEFAULT_TIMESFM_EXOG_COLS),
             chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
             chronos_device=chronos_device,
             chronos_roll_actuals=False,
@@ -992,7 +1012,7 @@ def apply_price_conditioned_baseline_forecasts(
             conditioned_windows,
             forecast_model=normalized_model,
         )
-        updated_reports.append(recompute_report_nash(context, updated_report))
+        updated_reports.append(recompute_report_nash(context, updated_report, apply_nash=apply_nash))
     return updated_reports
 
 

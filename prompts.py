@@ -71,6 +71,24 @@ def economist_prompt(
     )
 
 
+def single_model_prompt(context: dict[str, Any]) -> str:
+    horizon = horizon_label(context)
+    economist_context = compact_economist_context(context)
+    return (
+        f"""Single-model pricing analyst.
+
+        Task: use one stronger model pass to replace the separate Grid Analyst, Behavioural Agent, and Market Economist stages for the next {horizon}. Use only forecast-derived information, category, service price, energy price, predicted 3-hour load_stress_level, weather, occupancy, and load shape. Estimate price-response elasticity and prescribe service-fee shifts for each 3-hour pricing window. Avoid extreme changes.
+
+        Do not use actual future load, actual future stress, forecast error, stress correctness, or any evaluation/ground-truth fields. Those fields are intentionally not provided to you.
+
+        Return JSON with keys: forecast_total_kwh, forecast_peak_kwh, predicted_change_pct, grid_stress_level, forecast_summary, agent_reasoning, demand_drivers, elasticity_factor, confidence, suggested_price_shift_pct, action_label, price_rationale, price_change_windows_3h.
+        grid_stress_level must be exactly one of: Low, Medium, High, Extreme High.
+        price_change_windows_3h must contain one item for each context.pricing_windows_3h item, with keys: window_start, window_end, suggested_price_shift_pct, action_label, price_rationale.
+
+        Context:\n{json.dumps(economist_context, ensure_ascii=False)}"""
+    )
+
+
 def repair_economist_prompt(
     context: dict[str, Any],
     grid_report: dict[str, Any],

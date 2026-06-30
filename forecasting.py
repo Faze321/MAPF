@@ -11,6 +11,9 @@ from config import normalize_forecast_model_name
 _TIMESFM_MODEL_CACHE: dict[tuple[str, int, int], Any] = {}
 _CHRONOS_MODEL_CACHE: dict[tuple[str, str], Any] = {}
 DEFAULT_TIMESFM_EXOG_COLS = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
+SERVICE_PRICE_FALLBACK_ELASTICITY = 0.1
+SERVICE_PRICE_ADJUSTMENT_MAX_RATIO = 0.3
+SERVICE_PRICE_RESPONSE_MIN_OBS = 12
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,7 @@ def forecast_zone(
     chronos_repo: str = "amazon/chronos-2",
     chronos_context_hours: int = 512,
     chronos_step_horizon: int = 24,
+    chronos_exog_cols: list[str] | None = None,
     chronos_diurnal_blend_alpha: float = 0.0,
     chronos_device: str = "auto",
     chronos_roll_actuals: bool = True,
@@ -108,6 +112,7 @@ def forecast_zone(
         chronos_repo=chronos_repo,
         chronos_context_hours=chronos_context_hours,
         chronos_step_horizon=chronos_step_horizon,
+        chronos_exog_cols=chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS,
         chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
         chronos_device=chronos_device,
         chronos_roll_actuals=chronos_roll_actuals,
@@ -189,9 +194,13 @@ def forecast_zone(
         "chronos_repo": chronos_repo if normalized_model.startswith("chronos") else None,
         "chronos_context_hours": int(chronos_context_hours) if normalized_model.startswith("chronos") else None,
         "chronos_step_horizon": int(chronos_step_horizon) if normalized_model.startswith("chronos") else None,
+        "chronos_covariates": (chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS)
+        if normalized_model.startswith("chronos")
+        else None,
         "chronos_diurnal_blend_alpha": round(float(chronos_diurnal_blend_alpha), 4) if normalized_model.startswith("chronos") else None,
         "chronos_device": chronos_device if normalized_model.startswith("chronos") else None,
         "chronos_roll_actuals": bool(chronos_roll_actuals) if normalized_model.startswith("chronos") else None,
+        "service_price_adjustment": forecast_attrs.get("service_price_adjustment"),
         "lstm_context_hours": int(lstm_context_hours) if normalized_model == "lstm" else None,
         "lstm_step_horizon": int(lstm_step_horizon) if normalized_model == "lstm" else None,
         "lstm_exog_cols": (lstm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS) if normalized_model == "lstm" else None,
@@ -248,6 +257,7 @@ def forecast_load(
     chronos_repo: str,
     chronos_context_hours: int,
     chronos_step_horizon: int,
+    chronos_exog_cols: list[str],
     chronos_diurnal_blend_alpha: float,
     chronos_device: str,
     chronos_roll_actuals: bool,
@@ -270,6 +280,8 @@ def forecast_load(
             history,
             forecast_start,
             horizon_hours,
+            validation=validation,
+            full_frame=full_frame,
             diurnal_blend_alpha=ar_diurnal_blend_alpha,
         )
     if normalized == "timesfm":
@@ -296,6 +308,7 @@ def forecast_load(
             repo=chronos_repo,
             context_hours=chronos_context_hours,
             step_horizon=chronos_step_horizon,
+            exog_cols=chronos_exog_cols,
             diurnal_blend_alpha=chronos_diurnal_blend_alpha,
             device=chronos_device,
             roll_actuals=chronos_roll_actuals,
@@ -462,14 +475,17 @@ def chronos_forecast(
     diurnal_blend_alpha: float,
     device: str,
     roll_actuals: bool,
+    exog_cols: list[str] | None = None,
 ) -> pd.DataFrame:
     context_load = history["actual_kwh"].astype(float).to_numpy(dtype=np.float64)
     if len(context_load) == 0:
         raise ValueError("Chronos requires at least one historical value")
 
     step = max(1, int(step_horizon))
+    exog_cols = list(exog_cols or [])
     pipeline = load_chronos_model(repo, device)
     rolling_load = context_load.copy()
+    rolling_exog = build_exog_matrix(history, exog_cols)
     diurnal_by_hour = build_diurnal_profile(history)
 
     calibration: dict[str, Any] = {
@@ -481,11 +497,15 @@ def chronos_forecast(
     bias_vec = np.zeros(step, dtype=np.float64)
     if not validation.empty:
         val_horizon = min(step, len(validation))
+        val_exog = align_exog(build_exog_matrix(validation.iloc[:val_horizon], exog_cols), val_horizon)
         val_raw, _, _ = run_chronos_prediction(
             pipeline,
             rolling_load,
             val_horizon,
             context_hours,
+            exog_context=rolling_exog,
+            exog_horizon=val_exog,
+            exog_cols=exog_cols,
         )
         val_times = pd.to_datetime(validation["time"].iloc[:val_horizon])
         val_point = blend_with_diurnal(
@@ -503,6 +523,7 @@ def chronos_forecast(
             "metrics": compute_forecast_metrics(val_cmp),
         }
         rolling_load = np.concatenate([rolling_load, validation["actual_kwh"].astype(float).to_numpy(dtype=np.float64)])
+        rolling_exog = np.vstack([rolling_exog, build_exog_matrix(validation, exog_cols)])
 
     rows: list[pd.DataFrame] = []
     remaining = horizon_hours
@@ -511,11 +532,21 @@ def chronos_forecast(
         chunk_horizon = min(step, remaining)
         chunk_start = forecast_start + pd.Timedelta(hours=offset)
         chunk_times = pd.date_range(chunk_start, periods=chunk_horizon, freq="h")
+        chunk_frame = (
+            full_frame.set_index("time")
+            .reindex(chunk_times)
+            .rename_axis("time")
+            .reset_index()
+        )
+        chunk_exog = align_exog(build_exog_matrix(chunk_frame, exog_cols), chunk_horizon)
         raw, raw_q10, raw_q90 = run_chronos_prediction(
             pipeline,
             rolling_load,
             chunk_horizon,
             context_hours,
+            exog_context=rolling_exog,
+            exog_horizon=chunk_exog,
+            exog_cols=exog_cols,
         )
         bias = align_vector(bias_vec, chunk_horizon)
         bias_corrected = np.clip(raw[:chunk_horizon] - bias, 0, None)
@@ -539,23 +570,19 @@ def chronos_forecast(
             )
         )
 
-        chunk_frame = (
-            full_frame.set_index("time")
-            .reindex(chunk_times)
-            .rename_axis("time")
-            .reset_index()
-        )
         actual_chunk = chunk_frame.get("actual_kwh")
         if roll_actuals and actual_chunk is not None and actual_chunk.notna().all():
             roll_values = actual_chunk.astype(float).to_numpy(dtype=np.float64)
         else:
             roll_values = point
         rolling_load = np.concatenate([rolling_load, roll_values])
+        rolling_exog = np.vstack([rolling_exog, chunk_exog])
         remaining -= chunk_horizon
         offset += chunk_horizon
 
     result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["time", "predicted_kwh"])
     result.attrs["calibration"] = calibration
+    result.attrs["chronos_covariates"] = exog_cols
     return result
 
 
@@ -814,6 +841,10 @@ def run_chronos_prediction(
     context_load: np.ndarray,
     horizon: int,
     context_hours: int,
+    *,
+    exog_context: np.ndarray | None = None,
+    exog_horizon: np.ndarray | None = None,
+    exog_cols: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     try:
         import torch
@@ -821,7 +852,12 @@ def run_chronos_prediction(
         raise RuntimeError("torch is required for forecast_model: chronos.") from exc
 
     ctx = context_load[-context_hours:].astype(np.float32)
-    inputs = [torch.tensor(ctx, dtype=torch.float32)]
+    inputs: list[Any]
+    covariate_input = build_chronos_covariate_input(ctx, exog_context, exog_horizon, horizon, exog_cols or [])
+    if covariate_input is not None:
+        inputs = [covariate_input]
+    else:
+        inputs = [torch.tensor(ctx, dtype=torch.float32)]
     predict_kwargs: dict[str, Any] = {"limit_prediction_length": False}
     quantiles, _ = pipeline.predict_quantiles(
         inputs,
@@ -844,6 +880,43 @@ def run_chronos_prediction(
     q50 = q[0, :horizon, 1]
     q90 = q[0, :horizon, 2]
     return np.clip(q50, 0, None), np.clip(q10, 0, None), np.clip(q90, 0, None)
+
+
+def build_chronos_covariate_input(
+    context_load: np.ndarray,
+    exog_context: np.ndarray | None,
+    exog_horizon: np.ndarray | None,
+    horizon: int,
+    exog_cols: list[str],
+) -> dict[str, Any] | None:
+    if not exog_cols or exog_context is None or exog_horizon is None:
+        return None
+    ctx = np.asarray(context_load, dtype=np.float32)
+    if len(ctx) == 0:
+        return None
+    context_arr = np.asarray(exog_context, dtype=np.float64)
+    if len(context_arr) > len(ctx):
+        context_matrix = context_arr[-len(ctx) :]
+    else:
+        context_matrix = align_exog(context_arr, len(ctx))
+    horizon_matrix = align_exog(np.asarray(exog_horizon, dtype=np.float64), int(horizon))
+    if context_matrix.shape[1] == 0 or horizon_matrix.shape[1] == 0:
+        return None
+
+    past_covariates: dict[str, np.ndarray] = {}
+    future_covariates: dict[str, np.ndarray] = {}
+    for idx, col in enumerate(exog_cols):
+        if idx >= context_matrix.shape[1] or idx >= horizon_matrix.shape[1]:
+            continue
+        past_covariates[col] = context_matrix[:, idx].astype(np.float32)
+        future_covariates[col] = horizon_matrix[:, idx].astype(np.float32)
+    if not past_covariates or not future_covariates:
+        return None
+    return {
+        "target": ctx,
+        "past_covariates": past_covariates,
+        "future_covariates": future_covariates,
+    }
 
 
 def train_lstm_model(
@@ -1285,11 +1358,126 @@ def compute_forecast_metrics(hourly: pd.DataFrame) -> dict[str, float | None]:
     }
 
 
+def estimate_service_price_response(training_frame: pd.DataFrame) -> dict[str, Any]:
+    if "actual_kwh" not in training_frame or "s_price" not in training_frame:
+        return {"enabled": False, "reason": "missing_actual_or_service_price"}
+
+    data = training_frame.copy()
+    if "time" in data:
+        data["time"] = pd.to_datetime(data["time"])
+        data["hour"] = data["time"].dt.hour
+    elif "hour" not in data:
+        data["hour"] = 0
+    data["actual_kwh"] = pd.to_numeric(data["actual_kwh"], errors="coerce")
+    data["s_price"] = pd.to_numeric(data["s_price"], errors="coerce")
+    data = data[["actual_kwh", "s_price", "hour"]].dropna()
+    if data.empty:
+        return {"enabled": False, "reason": "no_valid_service_price_training_rows"}
+
+    mean_load = float(data["actual_kwh"].clip(lower=0).mean())
+    mean_price = float(data["s_price"].replace(0, np.nan).mean())
+    if not np.isfinite(mean_load) or mean_load <= 0 or not np.isfinite(mean_price) or mean_price <= 0:
+        return {"enabled": False, "reason": "invalid_mean_load_or_service_price"}
+
+    fallback_slope = -SERVICE_PRICE_FALLBACK_ELASTICITY * mean_load / max(mean_price, 1e-9)
+    max_abs_slope = SERVICE_PRICE_ADJUSTMENT_MAX_RATIO * mean_load / max(mean_price, 1e-9)
+    source = "fallback_elasticity"
+    slope = fallback_slope
+
+    if len(data) >= SERVICE_PRICE_RESPONSE_MIN_OBS and data["s_price"].nunique(dropna=True) >= 2:
+        load_baseline = data.groupby("hour")["actual_kwh"].transform("mean")
+        price_baseline = data.groupby("hour")["s_price"].transform("mean")
+        load_residual = data["actual_kwh"].to_numpy(dtype=np.float64) - load_baseline.to_numpy(dtype=np.float64)
+        price_residual = data["s_price"].to_numpy(dtype=np.float64) - price_baseline.to_numpy(dtype=np.float64)
+        if float(np.nanvar(price_residual)) <= 1e-12:
+            price_residual = data["s_price"].to_numpy(dtype=np.float64) - mean_price
+        denom = float(np.dot(price_residual, price_residual))
+        if denom > 1e-12:
+            empirical_slope = float(np.dot(price_residual, load_residual) / denom)
+            if np.isfinite(empirical_slope) and empirical_slope < 0:
+                slope = empirical_slope
+                source = "empirical_hourly_residual"
+            else:
+                source = "fallback_nonnegative_empirical_response"
+    else:
+        source = "fallback_insufficient_service_price_variation"
+
+    slope = float(np.clip(slope, -max_abs_slope, 0.0))
+    return {
+        "enabled": True,
+        "source": source,
+        "slope_kwh_per_service_price": round(slope, 6),
+        "fallback_elasticity": SERVICE_PRICE_FALLBACK_ELASTICITY,
+        "mean_training_load_kwh": round(mean_load, 4),
+        "mean_training_service_price": round(mean_price, 6),
+        "max_adjustment_ratio": SERVICE_PRICE_ADJUSTMENT_MAX_RATIO,
+        "training_rows": int(len(data)),
+    }
+
+
+def service_price_reference_for_times(
+    training_frame: pd.DataFrame,
+    times: pd.Series | pd.DatetimeIndex,
+    fallback_price: float,
+) -> np.ndarray:
+    index = pd.DatetimeIndex(times)
+    if "time" not in training_frame or "s_price" not in training_frame:
+        return np.full(len(index), fallback_price, dtype=np.float64)
+    data = training_frame[["time", "s_price"]].copy()
+    data["time"] = pd.to_datetime(data["time"])
+    data["s_price"] = pd.to_numeric(data["s_price"], errors="coerce")
+    data = data.dropna()
+    if data.empty:
+        return np.full(len(index), fallback_price, dtype=np.float64)
+    by_hour = data.groupby(data["time"].dt.hour)["s_price"].mean()
+    return np.asarray([float(by_hour.get(int(ts.hour), fallback_price)) for ts in index], dtype=np.float64)
+
+
+def apply_service_price_response_adjustment(
+    point: np.ndarray,
+    horizon_frame: pd.DataFrame | None,
+    training_frame: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    point_arr = np.asarray(point, dtype=np.float64)
+    zero_adjustment = np.zeros(len(point_arr), dtype=np.float64)
+    response = estimate_service_price_response(training_frame)
+    if not response.get("enabled"):
+        return np.clip(point_arr, 0, None), zero_adjustment, response
+    if horizon_frame is None or "s_price" not in horizon_frame or "time" not in horizon_frame:
+        metadata = {**response, "enabled": False, "reason": "missing_horizon_service_price"}
+        return np.clip(point_arr, 0, None), zero_adjustment, metadata
+
+    prices = pd.to_numeric(horizon_frame["s_price"], errors="coerce").ffill().bfill()
+    fallback_price = float(response["mean_training_service_price"])
+    prices = prices.fillna(fallback_price).to_numpy(dtype=np.float64)
+    prices = align_vector(prices, len(point_arr))
+    reference = service_price_reference_for_times(training_frame, horizon_frame["time"], fallback_price)
+    reference = align_vector(reference, len(point_arr))
+
+    slope = float(response["slope_kwh_per_service_price"])
+    raw_adjustment = slope * (prices - reference)
+    floor = max(float(response["mean_training_load_kwh"]) * 0.05, 1e-9)
+    limit = np.maximum(np.abs(point_arr) * SERVICE_PRICE_ADJUSTMENT_MAX_RATIO, floor)
+    adjustment = np.clip(raw_adjustment, -limit, limit)
+    adjusted = np.clip(point_arr + adjustment, 0, None)
+    metadata = {
+        **response,
+        "enabled": True,
+        "mean_horizon_service_price": round(float(np.nanmean(prices)), 6),
+        "mean_reference_service_price": round(float(np.nanmean(reference)), 6),
+        "mean_adjustment_kwh": round(float(np.nanmean(adjustment)), 6),
+        "max_abs_adjustment_kwh": round(float(np.nanmax(np.abs(adjustment))), 6),
+    }
+    return adjusted, adjustment, metadata
+
+
 def ar_forecast(
     history: pd.DataFrame,
     forecast_start: pd.Timestamp,
     horizon_hours: int,
     *,
+    validation: pd.DataFrame | None = None,
+    full_frame: pd.DataFrame | None = None,
     diurnal_blend_alpha: float = 0.0,
 ) -> pd.DataFrame:
     hist = history.set_index("time")["actual_kwh"].astype(float).sort_index()
@@ -1308,7 +1496,33 @@ def ar_forecast(
         diurnal_for_times(target_index, build_diurnal_profile(history)),
         diurnal_blend_alpha,
     )
-    return pd.DataFrame({"time": target_index, "predicted_kwh": predicted})
+    horizon_frame = None
+    if full_frame is not None and "time" in full_frame:
+        horizon_frame = (
+            full_frame.set_index("time")
+            .reindex(target_index)
+            .rename_axis("time")
+            .reset_index()
+        )
+    training_parts = [history]
+    if validation is not None and not validation.empty:
+        training_parts.append(validation)
+    training_frame = pd.concat(training_parts, ignore_index=True)
+    adjusted, service_price_adjustment, adjustment_meta = apply_service_price_response_adjustment(
+        predicted,
+        horizon_frame,
+        training_frame,
+    )
+    result = pd.DataFrame(
+        {
+            "time": target_index,
+            "base_predicted_kwh": predicted,
+            "service_price_adjustment_kwh": service_price_adjustment,
+            "predicted_kwh": adjusted,
+        }
+    )
+    result.attrs["service_price_adjustment"] = adjustment_meta
+    return result
 
 
 def summarize_price(price: pd.DataFrame, zone_id: str, start: pd.Timestamp, end: pd.Timestamp) -> dict[str, float]:

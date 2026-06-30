@@ -82,13 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--agent-mode",
         default=None,
-        help="Agent mode for a single run: agents or rules.",
+        help="Agent mode for a single run: agents, agents_no_nash, single_model, or rules.",
     )
     parser.add_argument(
         "--agent-modes",
         nargs="+",
         default=None,
-        help="Agent modes for ablation matrices: agents and/or rules.",
+        help="Agent modes for ablation matrices: agents, agents_no_nash, single_model, and/or rules.",
     )
     parser.add_argument(
         "--diurnal-blend-alpha",

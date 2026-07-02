@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -283,6 +282,3 @@ def finite_float(value: object) -> float:
         return 0.0
     return round(number, 4)
 
-
-def write_json(path: Path, payload: object) -> None:
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")

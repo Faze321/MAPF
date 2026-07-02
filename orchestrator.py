@@ -331,22 +331,25 @@ def run_experiment_matrix(
             for seed in seeds:
                 for agent_mode in modes:
                     for blend_alpha in blend_alphas:
-                        run_base_dir = experiment_variant_output_dir(
-                            time_output_dir,
-                            seed=seed,
-                            agent_mode=agent_mode,
-                            diurnal_blend_alpha=blend_alpha,
-                            add_seed_folder=add_seed_folder,
-                            add_mode_folder=add_mode_folder,
-                            add_blend_folder=add_blend_folder,
-                        )
+                        run_base_dir = time_output_dir
+                        if add_seed_folder and seed is not None:
+                            run_base_dir = run_base_dir / f"seed_{seed}"
+                        if add_mode_folder:
+                            run_base_dir = run_base_dir / f"agent_{safe_filename(agent_mode)}"
+                        if add_blend_folder and blend_alpha is not None:
+                            alpha_text = safe_filename(f"{float(blend_alpha):.3f}".rstrip("0").rstrip("."))
+                            run_base_dir = run_base_dir / f"blend_{alpha_text}"
                         run_output_dir = forecast_output_dir(run_base_dir, forecast_model)
                         run_kwargs = dict(pipeline_kwargs)
                         run_kwargs["agent_mode"] = agent_mode
                         if seed is not None:
                             run_kwargs["lstm_seed"] = seed
                         if blend_alpha is not None:
-                            apply_uniform_diurnal_blend(run_kwargs, blend_alpha)
+                            alpha_value = float(blend_alpha)
+                            run_kwargs["timesfm_diurnal_blend_alpha"] = alpha_value
+                            run_kwargs["ar_diurnal_blend_alpha"] = alpha_value
+                            run_kwargs["chronos_diurnal_blend_alpha"] = alpha_value
+                            run_kwargs["lstm_diurnal_blend_alpha"] = alpha_value
                         record: dict[str, Any] = {
                             "forecast_start": forecast_start,
                             "forecast_model": forecast_model,
@@ -438,14 +441,14 @@ def run_experiment_matrix(
         price_summary_path,
         metric_columns=[
             "price_accuracy",
-            "avg_adjusted_minus_actual_service_price",
-            "avg_adjusted_vs_actual_pct",
+            "avg_recommended_minus_observed_service_price",
+            "avg_recommended_vs_observed_pct",
         ],
     )
     write_numeric_summary(
         rationales,
         rationale_summary_path,
-        metric_columns=["stress_accuracy", "miss_stress_rate", "suggested_price_shift_pct"],
+        metric_columns=["stress_accuracy", "miss_stress_rate", "final_price_shift_pct"],
     )
     write_decision_quality_summary(prices, rationales, decision_summary_path)
     return {
@@ -727,8 +730,8 @@ def write_decision_quality_summary(
                 prices,
                 metrics=[
                     "price_accuracy",
-                    "avg_adjusted_minus_actual_service_price",
-                    "avg_adjusted_vs_actual_pct",
+                    "avg_recommended_minus_observed_service_price",
+                    "avg_recommended_vs_observed_pct",
                 ],
                 metric_family="price_decision",
             )
@@ -737,7 +740,7 @@ def write_decision_quality_summary(
         frames.append(
             long_metric_frame(
                 rationales,
-                metrics=["stress_accuracy", "miss_stress_rate", "suggested_price_shift_pct"],
+                metrics=["stress_accuracy", "miss_stress_rate", "final_price_shift_pct"],
                 metric_family="stress_and_price_trace",
             )
         )
@@ -810,38 +813,6 @@ def long_metric_frame(frame: pd.DataFrame, *, metrics: list[str], metric_family:
                 }
             )
     return pd.DataFrame(rows)
-
-
-def experiment_variant_output_dir(
-    time_output_dir: Path,
-    *,
-    seed: int | None,
-    agent_mode: str,
-    diurnal_blend_alpha: float | None,
-    add_seed_folder: bool,
-    add_mode_folder: bool,
-    add_blend_folder: bool,
-) -> Path:
-    path = time_output_dir
-    if add_seed_folder and seed is not None:
-        path = path / f"seed_{seed}"
-    if add_mode_folder:
-        path = path / f"agent_{safe_filename(agent_mode)}"
-    if add_blend_folder and diurnal_blend_alpha is not None:
-        path = path / f"blend_{format_blend_alpha(diurnal_blend_alpha)}"
-    return path
-
-
-def format_blend_alpha(value: float) -> str:
-    return safe_filename(f"{float(value):.3f}".rstrip("0").rstrip("."))
-
-
-def apply_uniform_diurnal_blend(kwargs: dict[str, Any], alpha: float) -> None:
-    value = float(alpha)
-    kwargs["timesfm_diurnal_blend_alpha"] = value
-    kwargs["ar_diurnal_blend_alpha"] = value
-    kwargs["chronos_diurnal_blend_alpha"] = value
-    kwargs["lstm_diurnal_blend_alpha"] = value
 
 
 def select_representative_zone_ids(profiles: pd.DataFrame, *, count: int) -> list[str]:

@@ -72,7 +72,7 @@ For `single_model`, configure a dedicated model under `agent.single_model_model`
 ```yaml
 agent:
   model: "meta-llama/llama-3.1-8b-instruct"
-  single_model_model: "openai/gpt-4.1"
+  single_model_model: "meta-llama/llama-3.3-70b-instruct"
 ```
 
 Multi-value runs execute the full forecast-start by forecaster by seed by agent-mode by blend matrix while keeping each combination in a separate folder under `output/experiments/`, for example `output/experiments/zones_auto_4starts/2022-09-09_000000/seed_42/agent_rules/blend_0_3/lstm/`. The experiment root writes raw concatenated tables plus aggregate summaries with `n`, `mean`, `std`, and `sem`: `experiment_forecast_summary.csv`, `experiment_price_summary.csv`, `experiment_rationale_summary.csv`, and `experiment_decision_quality_summary.csv`.
@@ -104,8 +104,9 @@ Generated result files are written under a forecast-model subfolder, for example
 - `rationale_trace.csv`: machine-readable explainability table, including zone-level Nash equilibrium status plus `agent_time_cost_seconds`, `agent_prompt_tokens`, `agent_completion_tokens`, and `agent_total_tokens`.
 - `rationale_trace.md`: markdown table for a report or paper appendix.
 - `rationale_trace.json`: full structured agent outputs, including per-agent call usage details under `agent_call_usage`.
-- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, adjusted service price, actual service price, stress labels, price rationales, price-conditioned baseline diagnostics (`price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, `baseline_load_source`), and Nash equilibrium diagnostics (`expected_load_kwh`, `capacity_limit_kwh`, `elasticity_factor`, `grid_safe`, `user_tolerant`, and `price_stable`). The Nash capacity limit is the zone's historical 3-hour Q95 load threshold.
-- `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when the adjusted service price is within 8% of the actual service price.
+- `agent_debug_outputs.json`: full debug payloads for model-backed agent calls, including economist repair details or single-model responses.
+- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, recommended service price, observed service price, stress labels, price rationales, price-conditioned baseline diagnostics (`baseline_forecast_service_price`, `price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, `baseline_load_source`), and Nash equilibrium diagnostics (`expected_load_kwh`, `capacity_limit_kwh`, `elasticity_factor`, `grid_safe`, `user_tolerant`, and `price_stable`). The Nash capacity limit is the zone's historical 3-hour Q95 load threshold.
+- `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when the recommended service price is within 8% of the observed service price.
 - `explainability_rubric.md`: five-criterion human evaluation rubric for rationale quality.
 - `explainability_review_packet.csv`: review template for two independent raters plus an operator sanity-check column.
 - `forecast_metrics.csv` / `forecast_metrics.md`: per-zone forecast metrics including MAE, RMSE, MAPE, RAE, and WAPE.

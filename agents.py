@@ -547,11 +547,16 @@ def combine_reports(
         economist.get("price_change_windows_3h"),
         context.get("pricing_windows_3h", []),
     )
-    price_windows = (
-        apply_nash_equilibrium_to_windows(context, behavior, price_windows)
-        if apply_nash
-        else skip_nash_equilibrium_for_windows(context, behavior, price_windows)
-    )
+    if apply_nash:
+        price_windows = [
+            solve_nash_equilibrium_window(context, behavior, window)
+            for window in price_windows
+        ]
+    else:
+        price_windows = [
+            mark_nash_equilibrium_skipped(context, behavior, window)
+            for window in price_windows
+        ]
     nash_summary = summarize_nash_equilibrium(price_windows)
     final_shift = average_price_shift(price_windows, as_float(economist.get("suggested_price_shift_pct"), 0))
     usage_summary = summarize_agent_call_usage(agent_call_usage or [])
@@ -604,11 +609,17 @@ def recompute_report_nash(
     *,
     apply_nash: bool = True,
 ) -> dict[str, Any]:
-    price_windows = (
-        apply_nash_equilibrium_to_windows(context, {}, report.get("price_change_windows_3h") or [])
-        if apply_nash
-        else skip_nash_equilibrium_for_windows(context, {}, report.get("price_change_windows_3h") or [])
-    )
+    report_windows = report.get("price_change_windows_3h") or []
+    if apply_nash:
+        price_windows = [
+            solve_nash_equilibrium_window(context, {}, window)
+            for window in report_windows
+        ]
+    else:
+        price_windows = [
+            mark_nash_equilibrium_skipped(context, {}, window)
+            for window in report_windows
+        ]
     nash_summary = summarize_nash_equilibrium(price_windows)
     updated = dict(report)
     updated["price_change_windows_3h"] = price_windows
@@ -870,22 +881,6 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
             }
         )
     return normalized
-
-
-def apply_nash_equilibrium_to_windows(
-    context: dict[str, Any],
-    behavior: dict[str, Any],
-    windows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    return [solve_nash_equilibrium_window(context, behavior, window) for window in windows]
-
-
-def skip_nash_equilibrium_for_windows(
-    context: dict[str, Any],
-    behavior: dict[str, Any],
-    windows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    return [mark_nash_equilibrium_skipped(context, behavior, window) for window in windows]
 
 
 def mark_nash_equilibrium_skipped(

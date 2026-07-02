@@ -56,6 +56,11 @@ TRACE_COLUMNS = [
     "agent_total_tokens",
     "source",
 ]
+TRACE_OUTPUT_RENAMES = {
+    "predicted_load_kwh": "forecast_total_kwh",
+    "actual_load_kwh": "actual_total_kwh",
+    "suggested_price_shift_pct": "final_price_shift_pct",
+}
 
 
 def write_outputs(
@@ -72,7 +77,7 @@ def write_outputs(
     trace_csv = output_dir / "rationale_trace.csv"
     trace_md = output_dir / "rationale_trace.md"
     trace_json = output_dir / "rationale_trace.json"
-    economist_outputs_json = output_dir / "economist_agent_outputs.json"
+    agent_debug_outputs_json = output_dir / "agent_debug_outputs.json"
     metrics_csv = output_dir / "forecast_metrics.csv"
     metrics_md = output_dir / "forecast_metrics.md"
     price_schedule_csv = output_dir / "price_schedule_3h.csv"
@@ -85,11 +90,12 @@ def write_outputs(
 
     selected_zones.to_csv(selected_path, index=False)
     contexts_path.write_text(json.dumps(contexts, indent=2, ensure_ascii=False), encoding="utf-8")
-    trace_reports, economist_outputs = split_economist_agent_outputs(reports)
-    economist_outputs_json.write_text(json.dumps(economist_outputs, indent=2, ensure_ascii=False), encoding="utf-8")
+    trace_reports, agent_debug_outputs = split_agent_debug_outputs(reports)
+    agent_debug_outputs_json.write_text(json.dumps(agent_debug_outputs, indent=2, ensure_ascii=False), encoding="utf-8")
 
     trace = pd.DataFrame(trace_reports)
     trace = trace[[col for col in TRACE_COLUMNS if col in trace.columns]]
+    trace = trace.rename(columns=TRACE_OUTPUT_RENAMES)
     trace.to_csv(trace_csv, index=False)
     trace_json.write_text(json.dumps(trace_reports, indent=2, ensure_ascii=False), encoding="utf-8")
     trace_md.write_text(markdown_table(trace), encoding="utf-8")
@@ -107,7 +113,7 @@ def write_outputs(
         "rationale_trace_csv": trace_csv,
         "rationale_trace_md": trace_md,
         "rationale_trace_json": trace_json,
-        "economist_agent_outputs_json": economist_outputs_json,
+        "agent_debug_outputs_json": agent_debug_outputs_json,
         "forecast_metrics_csv": metrics_csv,
         "forecast_metrics_md": metrics_md,
         "price_schedule_3h_csv": price_schedule_csv,
@@ -122,16 +128,20 @@ def write_outputs(
     return outputs
 
 
-def split_economist_agent_outputs(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def split_agent_debug_outputs(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     trace_reports: list[dict[str, Any]] = []
-    economist_outputs: list[dict[str, Any]] = []
+    agent_debug_outputs: list[dict[str, Any]] = []
     for report in reports:
         clean_report = {key: value for key, value in report.items() if key != ECONOMIST_AGENT_OUTPUT_KEY}
         trace_reports.append(clean_report)
         debug = report.get(ECONOMIST_AGENT_OUTPUT_KEY)
         if isinstance(debug, dict):
-            economist_outputs.append(debug)
-    return trace_reports, economist_outputs
+            agent_debug_outputs.append(debug)
+    return trace_reports, agent_debug_outputs
+
+
+def split_economist_agent_outputs(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    return split_agent_debug_outputs(reports)
 
 
 def write_forecast_outputs(
@@ -226,8 +236,8 @@ def write_price_schedule_outputs(
                 "sum_predicted_kwh": window.get("sum_predicted_kwh"),
                 "mean_predicted_kwh": window.get("mean_predicted_kwh"),
                 "sum_actual_kwh": window.get("sum_actual_kwh"),
-                "actual_service_price": window.get("mean_service_price"),
-                "mean_energy_price": window.get("mean_energy_price"),
+                "observed_service_price": window.get("mean_service_price"),
+                "observed_energy_price": window.get("mean_energy_price"),
                 "load_stress_level": window.get("load_stress_level") or window.get("grid_stress_level"),
                 "stress_load_3h_kwh": window.get("stress_load_3h_kwh"),
                 "actual_load_stress_level": window.get("actual_load_stress_level") or window.get("actual_grid_stress_level"),
@@ -237,14 +247,14 @@ def write_price_schedule_outputs(
                 "load_3h_q50_kwh": window.get("load_3h_q50_kwh"),
                 "load_3h_q80_kwh": window.get("load_3h_q80_kwh"),
                 "load_3h_q95_kwh": window.get("load_3h_q95_kwh"),
-                "pre_nash_suggested_price_shift_pct": window.get("pre_nash_suggested_price_shift_pct"),
-                "price_conditioned_service_price": window.get("price_conditioned_service_price"),
+                "model_price_shift_pct": window.get("pre_nash_suggested_price_shift_pct"),
+                "baseline_forecast_service_price": window.get("price_conditioned_service_price"),
                 "price_conditioned_baseline_load_kwh": window.get("price_conditioned_baseline_load_kwh"),
                 "price_conditioned_mean_predicted_kwh": window.get("price_conditioned_mean_predicted_kwh"),
                 "price_conditioned_peak_predicted_kwh": window.get("price_conditioned_peak_predicted_kwh"),
                 "price_conditioned_load_stress_level": window.get("price_conditioned_load_stress_level"),
                 "price_conditioned_baseline_source": window.get("price_conditioned_baseline_source"),
-                "suggested_price_shift_pct": window.get("suggested_price_shift_pct"),
+                "final_price_shift_pct": window.get("suggested_price_shift_pct"),
                 "nash_equilibrium_reached": window.get("nash_equilibrium_reached"),
                 "nash_status": window.get("nash_status"),
                 "nash_iterations": window.get("nash_iterations"),
@@ -265,7 +275,7 @@ def write_price_schedule_outputs(
                 "price_rationale": window.get("price_rationale"),
                 "source": report.get("source"),
             }
-            row.update(price_comparison_fields(row["actual_service_price"], row["suggested_price_shift_pct"]))
+            row.update(price_comparison_fields(row["observed_service_price"], row["final_price_shift_pct"]))
             rows.append(row)
     frame = pd.DataFrame(rows)
     frame.to_csv(price_schedule_csv, index=False)
@@ -300,11 +310,11 @@ def explainability_review_row(report: dict[str, Any], window: dict[str, Any] | N
         "source": report.get("source"),
         "window_start": item.get("window_start"),
         "window_end": item.get("window_end"),
-        "predicted_load_kwh": item.get("sum_predicted_kwh") if is_window else report.get("predicted_load_kwh"),
-        "actual_load_kwh": item.get("sum_actual_kwh") if is_window else report.get("actual_load_kwh"),
+        "forecast_load_kwh": item.get("sum_predicted_kwh") if is_window else report.get("predicted_load_kwh"),
+        "observed_load_kwh": item.get("sum_actual_kwh") if is_window else report.get("actual_load_kwh"),
         "predicted_stress_level": item.get("load_stress_level") or report.get("grid_stress_level"),
         "actual_stress_level": item.get("actual_load_stress_level") or report.get("actual_grid_stress_level"),
-        "suggested_price_shift_pct": item.get("suggested_price_shift_pct")
+        "final_price_shift_pct": item.get("suggested_price_shift_pct")
         if is_window
         else report.get("suggested_price_shift_pct"),
         "action_label": item.get("action_label") if is_window else report.get("action_label"),
@@ -332,16 +342,16 @@ def price_comparison_fields(actual_price: Any, shift_pct: Any) -> dict[str, Any]
     shift = optional_float(shift_pct)
     if actual is None or shift is None:
         return {
-            "adjusted_service_price": None,
-            "adjusted_minus_actual_service_price": None,
-            "adjusted_vs_actual_pct": None,
+            "recommended_service_price": None,
+            "recommended_minus_observed_service_price": None,
+            "recommended_vs_observed_pct": None,
         }
     adjusted = actual * (1 + shift / 100)
     diff = adjusted - actual
     return {
-        "adjusted_service_price": round(adjusted, 4),
-        "adjusted_minus_actual_service_price": round(diff, 4),
-        "adjusted_vs_actual_pct": round((diff / actual) * 100, 4) if actual != 0 else None,
+        "recommended_service_price": round(adjusted, 4),
+        "recommended_minus_observed_service_price": round(diff, 4),
+        "recommended_vs_observed_pct": round((diff / actual) * 100, 4) if actual != 0 else None,
     }
 
 
@@ -353,24 +363,24 @@ def build_price_comparison_summary(frame: pd.DataFrame) -> pd.DataFrame:
         "price_error_threshold_pct",
         "price_pass_windows",
         "price_accuracy",
-        "avg_actual_service_price",
-        "avg_adjusted_service_price",
-        "avg_adjusted_minus_actual_service_price",
-        "avg_adjusted_vs_actual_pct",
+        "avg_observed_service_price",
+        "avg_recommended_service_price",
+        "avg_recommended_minus_observed_service_price",
+        "avg_recommended_vs_observed_pct",
     ]
-    if frame.empty or "adjusted_service_price" not in frame:
+    if frame.empty or "recommended_service_price" not in frame:
         return pd.DataFrame(columns=columns)
 
     numeric_columns = [
-        "actual_service_price",
-        "adjusted_service_price",
-        "adjusted_minus_actual_service_price",
-        "adjusted_vs_actual_pct",
+        "observed_service_price",
+        "recommended_service_price",
+        "recommended_minus_observed_service_price",
+        "recommended_vs_observed_pct",
     ]
     working = frame.copy()
     for column in numeric_columns:
         working[column] = pd.to_numeric(working[column], errors="coerce")
-    working = working.dropna(subset=["actual_service_price", "adjusted_service_price"])
+    working = working.dropna(subset=["observed_service_price", "recommended_service_price"])
     if working.empty:
         return pd.DataFrame(columns=columns)
 
@@ -388,16 +398,19 @@ def price_summary_row(zone_id: Any, category: Any, group: pd.DataFrame) -> dict[
         "price_error_threshold_pct": PRICE_ERROR_THRESHOLD_PCT,
         "price_pass_windows": int(price_pass_mask(group).sum()),
         "price_accuracy": round(float(price_pass_mask(group).mean()), 4),
-        "avg_actual_service_price": round(float(group["actual_service_price"].mean()), 4),
-        "avg_adjusted_service_price": round(float(group["adjusted_service_price"].mean()), 4),
-        "avg_adjusted_minus_actual_service_price": round(float(group["adjusted_minus_actual_service_price"].mean()), 4),
-        "avg_adjusted_vs_actual_pct": round(float(group["adjusted_vs_actual_pct"].mean()), 4),
+        "avg_observed_service_price": round(float(group["observed_service_price"].mean()), 4),
+        "avg_recommended_service_price": round(float(group["recommended_service_price"].mean()), 4),
+        "avg_recommended_minus_observed_service_price": round(
+            float(group["recommended_minus_observed_service_price"].mean()),
+            4,
+        ),
+        "avg_recommended_vs_observed_pct": round(float(group["recommended_vs_observed_pct"].mean()), 4),
     }
 
 
 def price_pass_mask(group: pd.DataFrame) -> pd.Series:
-    threshold = group["actual_service_price"].abs() * PRICE_ERROR_THRESHOLD_RATIO
-    return group["adjusted_minus_actual_service_price"].abs() <= threshold
+    threshold = group["observed_service_price"].abs() * PRICE_ERROR_THRESHOLD_RATIO
+    return group["recommended_minus_observed_service_price"].abs() <= threshold
 
 
 def optional_float(value: Any) -> float | None:
@@ -520,7 +533,14 @@ def markdown_table(frame: pd.DataFrame) -> str:
         return ""
     display = frame.copy()
     for col in display.columns:
-        display[col] = display[col].map(format_cell)
+        formatted_values = []
+        for value in display[col]:
+            if pd.isna(value):
+                formatted_values.append("")
+                continue
+            text = str(value).replace("\n", " ")
+            formatted_values.append(text[:220] + "..." if len(text) > 223 else text)
+        display[col] = formatted_values
     widths = {
         col: max(len(str(col)), *(len(str(value)) for value in display[col]))
         for col in display.columns
@@ -532,11 +552,3 @@ def markdown_table(frame: pd.DataFrame) -> str:
         for _, row in display.iterrows()
     ]
     return "\n".join([header, separator, *rows]) + "\n"
-
-
-def format_cell(value: Any) -> str:
-    if pd.isna(value):
-        return ""
-    text = str(value)
-    text = text.replace("\n", " ")
-    return text[:220] + "..." if len(text) > 223 else text

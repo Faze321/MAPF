@@ -59,7 +59,7 @@ from prompts import compact_economist_context, economist_prompt, grid_prompt
 from reporting import (
     build_price_comparison_summary,
     price_comparison_fields,
-    split_economist_agent_outputs,
+    split_agent_debug_outputs,
     write_outputs,
 )
 from zone_selection import select_zone_categories
@@ -507,8 +507,8 @@ class AgentParsingTests(unittest.TestCase):
         self.assertEqual(len(report["agent_call_usage"]), 1)
         self.assertEqual(report[ECONOMIST_AGENT_OUTPUT_KEY]["selected_response_source"], "single_model")
 
-    def test_splits_economist_agent_output_from_trace_reports(self):
-        trace_reports, economist_outputs = split_economist_agent_outputs(
+    def test_splits_agent_debug_output_from_trace_reports(self):
+        trace_reports, agent_debug_outputs = split_agent_debug_outputs(
             [
                 {
                     "zone_id": "102",
@@ -523,10 +523,10 @@ class AgentParsingTests(unittest.TestCase):
         )
 
         self.assertEqual(trace_reports, [{"zone_id": "102", "action_label": "Raise price"}])
-        self.assertEqual(economist_outputs[0]["zone_id"], "102")
-        self.assertEqual(economist_outputs[0]["initial_response"]["suggested_price_shift_pct"], 8)
+        self.assertEqual(agent_debug_outputs[0]["zone_id"], "102")
+        self.assertEqual(agent_debug_outputs[0]["initial_response"]["suggested_price_shift_pct"], 8)
 
-    def test_write_outputs_saves_economist_agent_output_separately(self):
+    def test_write_outputs_saves_agent_debug_output_separately(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             output_dir = Path(temp_dir)
             outputs = write_outputs(
@@ -548,10 +548,10 @@ class AgentParsingTests(unittest.TestCase):
                 forecast_results={},
             )
 
-            economist_outputs = json.loads(outputs["economist_agent_outputs_json"].read_text(encoding="utf-8"))
+            agent_debug_outputs = json.loads(outputs["agent_debug_outputs_json"].read_text(encoding="utf-8"))
             trace_reports = json.loads(outputs["rationale_trace_json"].read_text(encoding="utf-8"))
-            self.assertEqual(economist_outputs[0]["zone_id"], "102")
-            self.assertEqual(economist_outputs[0]["initial_response"]["suggested_price_shift_pct"], 8)
+            self.assertEqual(agent_debug_outputs[0]["zone_id"], "102")
+            self.assertEqual(agent_debug_outputs[0]["initial_response"]["suggested_price_shift_pct"], 8)
             self.assertNotIn(ECONOMIST_AGENT_OUTPUT_KEY, trace_reports[0])
 
     def test_prompt_includes_forecast_horizon_days(self):
@@ -664,7 +664,7 @@ class ConfigTests(unittest.TestCase):
         config = AgentConfig.from_file(Path("config.example.yaml"))
         self.assertEqual(config.api_key, "sk-...")
         self.assertEqual(config.model, "meta-llama/llama-3.1-8b-instruct")
-        self.assertEqual(config.single_model_model, "openai/gpt-4.1")
+        self.assertEqual(config.single_model_model, "meta-llama/llama-3.3-70b-instruct")
         self.assertEqual(config.timeout_seconds, 90)
 
     def test_reads_run_yaml_config(self):
@@ -974,10 +974,10 @@ class ForecastingTests(unittest.TestCase):
 class SelectionTests(unittest.TestCase):
     def test_builds_price_comparison_fields_and_summary(self):
         fields = price_comparison_fields(1.0, 10)
-        self.assertEqual(fields["adjusted_service_price"], 1.1)
-        self.assertEqual(fields["adjusted_minus_actual_service_price"], 0.1)
-        self.assertEqual(fields["adjusted_vs_actual_pct"], 10.0)
-        self.assertNotIn("abs_adjusted_minus_actual_service_price", fields)
+        self.assertEqual(fields["recommended_service_price"], 1.1)
+        self.assertEqual(fields["recommended_minus_observed_service_price"], 0.1)
+        self.assertEqual(fields["recommended_vs_observed_pct"], 10.0)
+        self.assertNotIn("abs_recommended_minus_observed_service_price", fields)
 
         summary = build_price_comparison_summary(
             pd.DataFrame(
@@ -985,33 +985,33 @@ class SelectionTests(unittest.TestCase):
                     {
                         "zone_id": "102",
                         "category": "User-selected",
-                        "actual_service_price": 1.0,
-                        "adjusted_service_price": 1.05,
-                        "adjusted_minus_actual_service_price": 0.05,
-                        "adjusted_vs_actual_pct": 5.0,
+                        "observed_service_price": 1.0,
+                        "recommended_service_price": 1.05,
+                        "recommended_minus_observed_service_price": 0.05,
+                        "recommended_vs_observed_pct": 5.0,
                     },
                     {
                         "zone_id": "102",
                         "category": "User-selected",
-                        "actual_service_price": 2.0,
-                        "adjusted_service_price": 1.8,
-                        "adjusted_minus_actual_service_price": -0.2,
-                        "adjusted_vs_actual_pct": -10.0,
+                        "observed_service_price": 2.0,
+                        "recommended_service_price": 1.8,
+                        "recommended_minus_observed_service_price": -0.2,
+                        "recommended_vs_observed_pct": -10.0,
                     },
                 ]
             )
         )
         self.assertNotIn("ALL", summary["zone_id"].tolist())
-        self.assertNotIn("avg_abs_adjusted_minus_actual_service_price", summary.columns)
+        self.assertNotIn("avg_abs_recommended_minus_observed_service_price", summary.columns)
         zone_summary = summary[summary["zone_id"] == "102"].iloc[0]
         self.assertEqual(zone_summary["price_windows"], 2)
         self.assertEqual(zone_summary["price_error_threshold_pct"], 8.0)
         self.assertEqual(zone_summary["price_pass_windows"], 1)
         self.assertAlmostEqual(zone_summary["price_accuracy"], 0.5)
-        self.assertAlmostEqual(zone_summary["avg_actual_service_price"], 1.5)
-        self.assertAlmostEqual(zone_summary["avg_adjusted_service_price"], 1.425)
-        self.assertAlmostEqual(zone_summary["avg_adjusted_minus_actual_service_price"], -0.075)
-        self.assertAlmostEqual(zone_summary["avg_adjusted_vs_actual_pct"], -2.5)
+        self.assertAlmostEqual(zone_summary["avg_observed_service_price"], 1.5)
+        self.assertAlmostEqual(zone_summary["avg_recommended_service_price"], 1.425)
+        self.assertAlmostEqual(zone_summary["avg_recommended_minus_observed_service_price"], -0.075)
+        self.assertAlmostEqual(zone_summary["avg_recommended_vs_observed_pct"], -2.5)
 
     def test_builds_hourly_agent_context_and_three_hour_windows(self):
         hourly = pd.DataFrame(
@@ -1390,8 +1390,8 @@ class SelectionTests(unittest.TestCase):
                             "zone_id": "102",
                             "category": "User-selected",
                             "price_accuracy": 0.5 if kwargs["agent_mode"] == "rules" else 0.75,
-                            "avg_adjusted_minus_actual_service_price": 0.1,
-                            "avg_adjusted_vs_actual_pct": 5.0,
+                            "avg_recommended_minus_observed_service_price": 0.1,
+                            "avg_recommended_vs_observed_pct": 5.0,
                         }
                     ]
                 ).to_csv(price_path, index=False)
@@ -1402,7 +1402,7 @@ class SelectionTests(unittest.TestCase):
                             "source": kwargs["agent_mode"],
                             "stress_accuracy": 0.8,
                             "miss_stress_rate": 0.1,
-                            "suggested_price_shift_pct": 3,
+                            "final_price_shift_pct": 3,
                         }
                     ]
                 ).to_csv(rationale_path, index=False)

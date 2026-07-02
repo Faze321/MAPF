@@ -106,57 +106,40 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def resolve_forecast_starts(args, run_config) -> list[str]:
-    cli_starts = normalize_string_list(args.forecast_starts)
-    if cli_starts:
-        return cli_starts
-    if args.forecast_start:
-        return [args.forecast_start]
-    if run_config.forecast_starts:
-        return run_config.forecast_starts
-    return [run_config.forecast_start] if run_config.forecast_start else []
-
-
-def resolve_forecast_models(args, run_config) -> list[str]:
-    cli_models = normalize_forecast_model_list(args.forecast_models)
-    if cli_models:
-        return cli_models
-    if args.forecast_model:
-        return normalize_forecast_model_list([args.forecast_model]) or [args.forecast_model]
-    if run_config.forecast_models:
-        return run_config.forecast_models
-    return [run_config.forecast_model]
-
-
-def resolve_experiment_seeds(args, run_config) -> list[int] | None:
-    cli_seeds = normalize_int_list(args.experiment_seeds)
-    return cli_seeds if cli_seeds else run_config.experiment_seeds
-
-
-def resolve_agent_modes(args, run_config) -> list[str] | None:
-    cli_modes = normalize_agent_mode_list(args.agent_modes)
-    if cli_modes:
-        return cli_modes
-    return run_config.agent_modes
-
-
-def resolve_diurnal_blend_alphas(args, run_config) -> list[float] | None:
-    cli_alphas = normalize_float_list(args.diurnal_blend_alphas)
-    if cli_alphas:
-        return cli_alphas
-    return run_config.diurnal_blend_alphas
-
-
 def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
     config_path = Path(args.config)
     app_config = AppConfig.from_file(config_path, required=False)
     run_config = app_config.run
-    forecast_starts = resolve_forecast_starts(args, run_config)
-    forecast_models = resolve_forecast_models(args, run_config)
-    experiment_seeds = resolve_experiment_seeds(args, run_config)
-    agent_modes = resolve_agent_modes(args, run_config)
-    diurnal_blend_alphas = resolve_diurnal_blend_alphas(args, run_config)
+
+    cli_starts = normalize_string_list(args.forecast_starts)
+    if cli_starts:
+        forecast_starts = cli_starts
+    elif args.forecast_start:
+        forecast_starts = [args.forecast_start]
+    elif run_config.forecast_starts:
+        forecast_starts = run_config.forecast_starts
+    else:
+        forecast_starts = [run_config.forecast_start] if run_config.forecast_start else []
+
+    cli_models = normalize_forecast_model_list(args.forecast_models)
+    if cli_models:
+        forecast_models = cli_models
+    elif args.forecast_model:
+        forecast_models = normalize_forecast_model_list([args.forecast_model]) or [args.forecast_model]
+    elif run_config.forecast_models:
+        forecast_models = run_config.forecast_models
+    else:
+        forecast_models = [run_config.forecast_model]
+
+    cli_seeds = normalize_int_list(args.experiment_seeds)
+    experiment_seeds = cli_seeds if cli_seeds else run_config.experiment_seeds
+
+    cli_modes = normalize_agent_mode_list(args.agent_modes)
+    agent_modes = cli_modes if cli_modes else run_config.agent_modes
+
+    cli_alphas = normalize_float_list(args.diurnal_blend_alphas)
+    diurnal_blend_alphas = cli_alphas if cli_alphas else run_config.diurnal_blend_alphas
     run_matrix = (
         len(forecast_starts) > 1
         or len(forecast_models) > 1

@@ -1,5 +1,5 @@
 agent:
-  api_key: "sk-..."
+  api_key: "${OPENROUTER_API_KEY}"
   base_url: "https://openrouter.ai/api/v1"
   model: "qwen/qwen3-14b"
   single_model_model: "meta-llama/llama-3.3-70b-instruct"
@@ -7,10 +7,11 @@ agent:
 
 run:
   data_dir: "data"
-  output_dir: "output"
+  output_dir: "output/blend_test"
   weather_file: "weather_central.csv"
-  dry_run: true
+  dry_run: false
   force_cache: false
+  precomputed_window_data: null # path to a previous window_load_price_cache.csv
   max_poi_rows: null
   forecast_start: "2022-09-09 00:00:00"
   forecast_starts:
@@ -21,29 +22,30 @@ run:
   horizon_days: 2
   history_days: 7
   validation_days: 1
-  zones: null
-  experiment_zone_count: 12
-  forecast_model: "timesfm"
+  forecast_model: "timesfm" # options: "timesfm", "chronos", "lstm", "AR"
   forecast_models:
     - "timesfm"
     - "chronos"
     - "lstm"
     - "AR"
-  experiment_seeds:
-    - 7
-    - 42
-    - 99
-  agent_mode: "agents"
-  agent_modes:
-    - "agents"
-    - "agents_no_nash"
-    - "single_model"
-    - "rules"
-  diurnal_blend_alpha: null
   diurnal_blend_alphas:
     - 0.0
+    - 0.1
+    - 0.2
     - 0.3
+    - 0.4
+    - 0.5
     - 0.6
+    - 0.7
+    - 0.8
+    - 0.9
+    - 1.0
+  agent_modes:
+    # - "agents"
+    # - "agents_no_nash"
+    # - "single_model"
+    - "rules"
+# TimesFM
   timesfm_repo: "google/timesfm-2.5-200m-pytorch"
   timesfm_context_hours: 168
   timesfm_step_horizon: 24
@@ -55,16 +57,17 @@ run:
     - "s_price"
     - "is_weekend"
     - "temp_price_idx"
-  timesfm_diurnal_blend_alpha: 0.0
   timesfm_roll_actuals: true
-  ar_diurnal_blend_alpha: 0.0
+
+# Chronos
   chronos_repo: "amazon/chronos-2"
-  chronos_context_hours: 512
+  chronos_context_hours: 168
   chronos_step_horizon: 24
-  chronos_diurnal_blend_alpha: 0.0
   chronos_device: "auto"
   chronos_roll_actuals: true
-  lstm_context_hours: 24
+
+# LSTM
+  lstm_context_hours: 48
   lstm_step_horizon: 24
   lstm_exog_cols:
     - "T"
@@ -75,12 +78,32 @@ run:
     - "is_weekend"
     - "temp_price_idx"
   lstm_hidden_size: 64
-  lstm_num_layers: 1
+  lstm_num_layers: 2
   lstm_epochs: 50
   lstm_learning_rate: 0.001
   lstm_batch_size: 32
-  lstm_diurnal_blend_alpha: 0.0
   lstm_device: "auto"
   lstm_roll_actuals: true
   lstm_seed: 42
+  zones:
+    - "115"
+    - "215"
+    - "328"
+    - "512"
+    - "576"
+    - "633"
+    - "686"
+    - "705"
+    - "732"
+    - "783"
+    - "855"
+    - "883"
+    - "903"
+    - "972"
+    - "988"
+    - "1011"
+    - "1074"
+    - "1095"
+    - "1112"
+    - "1135"
   temperature: 0.2

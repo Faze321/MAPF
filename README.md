@@ -59,6 +59,7 @@ python main.py --forecast-starts "2022-09-09 00:00:00" "2022-10-14 00:00:00" --f
 python main.py --forecast-starts "2022-09-09 00:00:00" --forecast-models chronos lstm --agent-modes agents rules --diurnal-blend-alphas 0.0 0.3 0.6
 python main.py --config config.yaml --model anthropic/claude-sonnet-4.5 --forecast-start "2023-02-25 00:00:00"
 python main.py --force-cache
+python main.py --precomputed-window-data "output/timesfm/window_load_price_cache.csv"
 ```
 
 Runtime defaults can be stored under `run:` in `config.yaml`, so common settings do not need to be typed each time. Command-line options override YAML values only for that run. When `run.zones` / `--zones` is omitted, the pipeline keeps the original five-category automatic zone selection. When zones are provided, the pipeline skips category selection and validates only the specified zone ids.
@@ -75,7 +76,7 @@ agent:
   single_model_model: "meta-llama/llama-3.3-70b-instruct"
 ```
 
-Multi-value runs execute the full forecast-start by forecaster by seed by agent-mode by blend matrix while keeping each combination in a separate folder under `output/experiments/`, for example `output/experiments/zones_auto_4starts/2022-09-09_000000/seed_42/agent_rules/blend_0_3/lstm/`. The experiment root writes raw concatenated tables plus aggregate summaries with `n`, `mean`, `std`, and `sem`: `experiment_forecast_summary.csv`, `experiment_price_summary.csv`, `experiment_rationale_summary.csv`, and `experiment_decision_quality_summary.csv`.
+Multi-value runs execute the full forecast-start by forecaster by seed by agent-mode by blend matrix while keeping each combination in a separate folder under `output/experiments/`, for example `output/experiments/20zonesx4timesx3modes_11blends/2022-09-09_000000/seed_42/agent_rules/blend_0_3/lstm/`. The experiment root writes raw concatenated tables plus aggregate summaries with `n`, `mean`, `std`, and `sem`: `experiment_forecast_summary.csv`, `experiment_price_summary.csv`, `experiment_rationale_summary.csv`, and `experiment_decision_quality_summary.csv`.
 
 Set `run.forecast_model: "timesfm"` to use `google/timesfm-2.5-200m-pytorch` for load forecasting. Set `run.forecast_model: "lstm"` to train a small local PyTorch LSTM per zone. Set `run.forecast_model: "AR"` for a fast autoregressive baseline run without TimesFM; AR applies a calibrated service-price response adjustment when `s_price` is available.
 Set `run.forecast_model: "chronos"` to use Chronos. The default Chronos config uses `amazon/chronos-2`, passes known future covariates including `s_price`, rolls actual observations into the context during retrospective multi-day evaluation, and exports the same `predicted_kwh`, `q10_kwh`, `q50_kwh`, and `q90_kwh` columns as TimesFM.
@@ -105,8 +106,9 @@ Generated result files are written under a forecast-model subfolder, for example
 - `rationale_trace.md`: markdown table for a report or paper appendix.
 - `rationale_trace.json`: full structured agent outputs, including per-agent call usage details under `agent_call_usage`.
 - `agent_debug_outputs.json`: full debug payloads for model-backed agent calls, including economist repair details or single-model responses.
-- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, recommended service price, observed service price, stress labels, price rationales, price-conditioned baseline diagnostics (`baseline_forecast_service_price`, `price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, `baseline_load_source`), and Nash equilibrium diagnostics (`expected_load_kwh`, `capacity_limit_kwh`, `elasticity_factor`, `grid_safe`, `user_tolerant`, and `price_stable`). The Nash capacity limit is the zone's historical 3-hour Q95 load threshold.
-- `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when the recommended service price is within 8% of the observed service price.
+- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, `predicted_service_price`, `actual_service_price`, `actual_energy_price`, stress labels, price rationales, price-conditioned baseline diagnostics (`forecaster_input_predicted_service_price`, `price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, `baseline_load_source`), and Nash equilibrium diagnostics (`expected_load_kwh`, `capacity_limit_kwh`, `elasticity_factor`, `grid_safe`, `user_tolerant`, and `price_stable`). The Nash capacity limit is the zone's historical 3-hour Q95 load threshold.
+- `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when `predicted_service_price` is within 8% of `actual_service_price`.
+- `window_load_price_cache.csv`: stable per-window replay input containing the original load forecast, the load forecast conditioned on predicted service price, the final predicted service price, and the Nash diagnostics needed to reproduce the window result.
 - `explainability_rubric.md`: five-criterion human evaluation rubric for rationale quality.
 - `explainability_review_packet.csv`: review template for two independent raters plus an operator sanity-check column.
 - `forecast_metrics.csv` / `forecast_metrics.md`: per-zone forecast metrics including MAE, RMSE, MAPE, RAE, and WAPE.
@@ -114,6 +116,8 @@ Generated result files are written under a forecast-model subfolder, for example
 - `forecast_details/zone_<id>_forecast_plot.png`: per-zone actual/predicted plot, P10-P90 band when available, residual bars, and metric summary.
 
 The first full run builds cached POI-to-zone assignments in `output/cache/`. Later runs reuse that shared cache unless `--force-cache` is passed.
+
+Set `run.precomputed_window_data` or pass `--precomputed-window-data` to reuse a previous `window_load_price_cache.csv`. Matching uses `forecast_model`, `agent_mode`, `zone_id`, `window_start`, and `window_end` when the metadata columns are present. A zone is reused only when every expected 3-hour window has both `predicted_service_price` and `price_conditioned_load_kwh`; a partial or missing zone falls back to the normal agent and price-conditioned forecast path. Reused zones skip the LLM pricing calls and the second load forecast, while the initial hourly load forecast still runs to produce metrics and plots.
 
 ## Data Notes
 

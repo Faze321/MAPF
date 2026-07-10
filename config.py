@@ -19,6 +19,7 @@ class RunConfig:
     weather_file: str = "weather_airport.csv"
     dry_run: bool = False
     force_cache: bool = False
+    precomputed_window_data: str | None = None
     max_poi_rows: int | None = None
     forecast_start: str | None = None
     horizon_days: int = 4
@@ -100,6 +101,7 @@ class RunConfig:
             weather_file=optional_str(settings.get("weather_file")) or "weather_airport.csv",
             dry_run=optional_bool(settings.get("dry_run"), False),
             force_cache=optional_bool(settings.get("force_cache"), False),
+            precomputed_window_data=optional_str(settings.get("precomputed_window_data")),
             max_poi_rows=optional_int(settings.get("max_poi_rows")),
             forecast_start=optional_str(settings.get("forecast_start")),
             horizon_days=horizon_days if horizon_days is not None else 4,

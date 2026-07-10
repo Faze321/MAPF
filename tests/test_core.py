@@ -39,6 +39,7 @@ from forecasting import (
     rebuild_quantile_interval,
 )
 from orchestrator import (
+    apply_precomputed_window_data,
     apply_load_quantile_stress,
     apply_price_conditioned_baseline_forecasts,
     build_agent_hourly_data,
@@ -48,7 +49,9 @@ from orchestrator import (
     attach_price_conditioned_baselines,
     ensure_service_price_exog_cols,
     forecast_output_dir,
+    load_precomputed_window_data,
     normalize_zone_ids,
+    partition_precomputed_contexts,
     run_experiment_matrix,
     select_agent_config_for_mode,
     select_representative_zone_ids,
@@ -538,6 +541,25 @@ class AgentParsingTests(unittest.TestCase):
                         "zone_id": "102",
                         "category": "User-selected",
                         "action_label": "Raise price",
+                        "price_change_windows_3h": [
+                            {
+                                "window_start": "2022-09-09 00:00:00",
+                                "window_end": "2022-09-09 02:00:00",
+                                "sum_predicted_kwh": 30.0,
+                                "mean_predicted_kwh": 10.0,
+                                "sum_actual_kwh": 24.0,
+                                "mean_service_price": 1.0,
+                                "mean_energy_price": 0.5,
+                                "actual_stress_load_3h_kwh": 24.0,
+                                "price_conditioned_baseline_load_kwh": 27.0,
+                                "price_conditioned_mean_predicted_kwh": 9.0,
+                                "price_conditioned_peak_predicted_kwh": 11.0,
+                                "price_conditioned_service_price": 1.08,
+                                "nash_status": "reached",
+                                "nash_equilibrium_reached": True,
+                                "suggested_price_shift_pct": 10.0,
+                            }
+                        ],
                         ECONOMIST_AGENT_OUTPUT_KEY: {
                             "zone_id": "102",
                             "initial_response": {"suggested_price_shift_pct": 8},
@@ -546,6 +568,8 @@ class AgentParsingTests(unittest.TestCase):
                     }
                 ],
                 forecast_results={},
+                forecast_model="timesfm",
+                agent_mode="agents",
             )
 
             agent_debug_outputs = json.loads(outputs["agent_debug_outputs_json"].read_text(encoding="utf-8"))
@@ -553,6 +577,86 @@ class AgentParsingTests(unittest.TestCase):
             self.assertEqual(agent_debug_outputs[0]["zone_id"], "102")
             self.assertEqual(agent_debug_outputs[0]["initial_response"]["suggested_price_shift_pct"], 8)
             self.assertNotIn(ECONOMIST_AGENT_OUTPUT_KEY, trace_reports[0])
+            price_schedule = pd.read_csv(outputs["price_schedule_3h_csv"])
+            self.assertIn("actual_service_price", price_schedule.columns)
+            self.assertIn("actual_energy_price", price_schedule.columns)
+            self.assertIn("predicted_service_price", price_schedule.columns)
+            self.assertNotIn("mean_predicted_kwh", price_schedule.columns)
+            self.assertNotIn("actual_stress_load_3h_kwh", price_schedule.columns)
+            window_cache = pd.read_csv(outputs["window_load_price_cache_csv"])
+            self.assertEqual(window_cache.loc[0, "forecast_model"], "timesfm")
+            self.assertEqual(window_cache.loc[0, "agent_mode"], "agents")
+            self.assertEqual(window_cache.loc[0, "forecast_load_kwh"], 30.0)
+            self.assertEqual(window_cache.loc[0, "price_conditioned_load_kwh"], 27.0)
+            self.assertEqual(window_cache.loc[0, "predicted_service_price"], 1.1)
+
+    def test_reuses_complete_precomputed_window_data(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "window_load_price_cache.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "zone_id": "102",
+                        "forecast_model": "timesfm",
+                        "agent_mode": "agents",
+                        "window_start": "2022-09-09 00:00:00",
+                        "window_end": "2022-09-09 02:00:00",
+                        "forecast_load_kwh": 30.0,
+                        "price_conditioned_load_kwh": 27.0,
+                        "price_conditioned_mean_load_kwh": 9.0,
+                        "price_conditioned_peak_load_kwh": 11.0,
+                        "predicted_service_price": 1.1,
+                        "forecaster_input_predicted_service_price": 1.08,
+                        "actual_service_price": 1.0,
+                        "final_price_shift_pct": 10.0,
+                        "nash_status": "reached",
+                        "nash_equilibrium_reached": True,
+                        "nash_iterations": 2,
+                    }
+                ]
+            ).to_csv(cache_path, index=False)
+            frame = load_precomputed_window_data(cache_path)
+            contexts = [
+                {
+                    "zone_id": "102",
+                    "pricing_windows_3h": [
+                        {
+                            "window_start": "2022-09-09 00:00:00",
+                            "window_end": "2022-09-09 02:00:00",
+                        }
+                    ],
+                }
+            ]
+            cached, live, rows = partition_precomputed_contexts(
+                contexts,
+                frame,
+                forecast_model="timesfm",
+                agent_mode="agents",
+            )
+            self.assertEqual(len(cached), 1)
+            self.assertEqual(live, [])
+            reports = [
+                {
+                    "zone_id": "102",
+                    "predicted_load_kwh": 29.0,
+                    "price_change_windows_3h": [
+                        {
+                            "window_start": "2022-09-09 00:00:00",
+                            "window_end": "2022-09-09 02:00:00",
+                            "mean_service_price": 1.0,
+                        }
+                    ],
+                }
+            ]
+            replayed = apply_precomputed_window_data(reports, rows, source_path=cache_path)[0]
+            window = replayed["price_change_windows_3h"][0]
+            self.assertEqual(window["sum_predicted_kwh"], 30.0)
+            self.assertEqual(window["price_conditioned_baseline_load_kwh"], 27.0)
+            self.assertEqual(window["predicted_service_price"], 1.1)
+            self.assertEqual(window["price_conditioned_service_price"], 1.08)
+            self.assertEqual(replayed["source"], "precomputed_window_data")
+            self.assertEqual(replayed["agent_total_tokens"], 0)
+            self.assertEqual(replayed["agent_time_cost_seconds"], 0.0)
 
     def test_prompt_includes_forecast_horizon_days(self):
         prompt = grid_prompt({"forecast_horizon_days": 3})
@@ -661,38 +765,112 @@ class AgentParsingTests(unittest.TestCase):
 
 class ConfigTests(unittest.TestCase):
     def test_reads_agent_yaml_config(self):
-        config = AgentConfig.from_file(Path("config.example.yaml"))
-        self.assertEqual(config.api_key, "sk-...")
-        self.assertEqual(config.model, "meta-llama/llama-3.1-8b-instruct")
-        self.assertEqual(config.single_model_model, "meta-llama/llama-3.3-70b-instruct")
-        self.assertEqual(config.timeout_seconds, 90)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text(
+                """
+agent:
+  api_key: "sk-test"
+  base_url: "https://openrouter.ai/api/v1"
+  model: "meta-llama/llama-3.1-8b-instruct"
+  single_model_model: "meta-llama/llama-3.3-70b-instruct"
+  timeout_seconds: 90
+""".strip(),
+                encoding="utf-8",
+            )
+            config = AgentConfig.from_file(config_path)
+            self.assertEqual(config.api_key, "sk-test")
+            self.assertEqual(config.model, "meta-llama/llama-3.1-8b-instruct")
+            self.assertEqual(config.single_model_model, "meta-llama/llama-3.3-70b-instruct")
+            self.assertEqual(config.timeout_seconds, 90)
 
     def test_reads_run_yaml_config(self):
-        config = AppConfig.from_file(Path("config.example.yaml"))
-        self.assertTrue(config.run.dry_run)
-        self.assertEqual(config.run.weather_file, "weather_central.csv")
-        self.assertEqual(config.run.forecast_start, "2022-09-09 00:00:00")
-        self.assertEqual(config.run.forecast_starts[:2], ["2022-09-09 00:00:00", "2022-10-14 00:00:00"])
-        self.assertEqual(config.run.horizon_days, 2)
-        self.assertEqual(config.run.history_days, 7)
-        self.assertEqual(config.run.validation_days, 1)
-        self.assertIsNone(config.run.zone_ids)
-        self.assertEqual(config.run.experiment_zone_count, 12)
-        self.assertEqual(config.run.forecast_model, "timesfm")
-        self.assertEqual(config.run.forecast_models, ["timesfm", "chronos", "lstm", "AR"])
-        self.assertEqual(config.run.experiment_seeds, [7, 42, 99])
-        self.assertEqual(config.run.agent_mode, "agents")
-        self.assertEqual(config.run.agent_modes, ["agents", "agents_no_nash", "single_model", "rules"])
-        self.assertEqual(config.run.diurnal_blend_alphas, [0.0, 0.3, 0.6])
-        self.assertEqual(config.run.timesfm_repo, "google/timesfm-2.5-200m-pytorch")
-        self.assertEqual(config.run.timesfm_exog_cols[:4], ["T", "U", "nRAIN", "e_price"])
-        self.assertEqual(config.run.ar_diurnal_blend_alpha, 0.0)
-        self.assertEqual(config.run.chronos_repo, "amazon/chronos-2")
-        self.assertEqual(config.run.chronos_context_hours, 512)
-        self.assertEqual(config.run.chronos_diurnal_blend_alpha, 0.0)
-        self.assertEqual(config.run.lstm_context_hours, 24)
-        self.assertEqual(config.run.lstm_epochs, 50)
-        self.assertEqual(config.run.lstm_diurnal_blend_alpha, 0.0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text(
+                """
+agent:
+  api_key: "sk-test"
+  base_url: "https://openrouter.ai/api/v1"
+  model: "meta-llama/llama-3.1-8b-instruct"
+run:
+  weather_file: "weather_central.csv"
+  dry_run: true
+  precomputed_window_data: "output/previous/window_load_price_cache.csv"
+  forecast_start: "2022-09-09 00:00:00"
+  forecast_starts:
+    - "2022-09-09 00:00:00"
+    - "2022-10-14 00:00:00"
+  horizon_days: 2
+  history_days: 7
+  validation_days: 1
+  zones: null
+  experiment_zone_count: 12
+  forecast_model: "timesfm"
+  forecast_models:
+    - "timesfm"
+    - "chronos"
+    - "lstm"
+    - "AR"
+  experiment_seeds:
+    - 7
+    - 42
+    - 99
+  agent_mode: "agents"
+  agent_modes:
+    - "agents"
+    - "agents_no_nash"
+    - "single_model"
+    - "rules"
+  diurnal_blend_alphas:
+    - 0.0
+    - 0.3
+    - 0.6
+  timesfm_repo: "google/timesfm-2.5-200m-pytorch"
+  timesfm_exog_cols:
+    - "T"
+    - "U"
+    - "nRAIN"
+    - "e_price"
+  ar_diurnal_blend_alpha: 0.0
+  chronos_repo: "amazon/chronos-2"
+  chronos_context_hours: 512
+  chronos_diurnal_blend_alpha: 0.0
+  lstm_context_hours: 24
+  lstm_epochs: 50
+  lstm_diurnal_blend_alpha: 0.0
+""".strip(),
+                encoding="utf-8",
+            )
+            config = AppConfig.from_file(config_path)
+            self.assertTrue(config.run.dry_run)
+            self.assertEqual(config.run.weather_file, "weather_central.csv")
+            self.assertEqual(
+                config.run.precomputed_window_data,
+                "output/previous/window_load_price_cache.csv",
+            )
+            self.assertEqual(config.run.forecast_start, "2022-09-09 00:00:00")
+            self.assertEqual(config.run.forecast_starts[:2], ["2022-09-09 00:00:00", "2022-10-14 00:00:00"])
+            self.assertEqual(config.run.horizon_days, 2)
+            self.assertEqual(config.run.history_days, 7)
+            self.assertEqual(config.run.validation_days, 1)
+            self.assertIsNone(config.run.zone_ids)
+            self.assertEqual(config.run.experiment_zone_count, 12)
+            self.assertEqual(config.run.forecast_model, "timesfm")
+            self.assertEqual(config.run.forecast_models, ["timesfm", "chronos", "lstm", "AR"])
+            self.assertEqual(config.run.experiment_seeds, [7, 42, 99])
+            self.assertEqual(config.run.agent_mode, "agents")
+            self.assertEqual(config.run.agent_modes, ["agents", "agents_no_nash", "single_model", "rules"])
+            self.assertEqual(config.run.diurnal_blend_alphas, [0.0, 0.3, 0.6])
+            self.assertEqual(config.run.timesfm_repo, "google/timesfm-2.5-200m-pytorch")
+            self.assertEqual(config.run.timesfm_exog_cols[:4], ["T", "U", "nRAIN", "e_price"])
+            self.assertEqual(config.run.ar_diurnal_blend_alpha, 0.0)
+            self.assertEqual(config.run.chronos_repo, "amazon/chronos-2")
+            self.assertEqual(config.run.chronos_context_hours, 512)
+            self.assertEqual(config.run.chronos_diurnal_blend_alpha, 0.0)
+            self.assertEqual(config.run.lstm_context_hours, 24)
+            self.assertEqual(config.run.lstm_epochs, 50)
+            self.assertEqual(config.run.lstm_diurnal_blend_alpha, 0.0)
 
     def test_reads_timesfm_config_keys(self):
         config = RunConfig.from_mapping(
@@ -974,10 +1152,13 @@ class ForecastingTests(unittest.TestCase):
 class SelectionTests(unittest.TestCase):
     def test_builds_price_comparison_fields_and_summary(self):
         fields = price_comparison_fields(1.0, 10)
-        self.assertEqual(fields["recommended_service_price"], 1.1)
-        self.assertEqual(fields["recommended_minus_observed_service_price"], 0.1)
-        self.assertEqual(fields["recommended_vs_observed_pct"], 10.0)
-        self.assertNotIn("abs_recommended_minus_observed_service_price", fields)
+        self.assertEqual(fields["predicted_service_price"], 1.1)
+        self.assertEqual(fields["predicted_minus_actual_service_price"], 0.1)
+        self.assertEqual(fields["predicted_vs_actual_pct"], 10.0)
+        self.assertNotIn("abs_predicted_minus_actual_service_price", fields)
+        explicit_price = price_comparison_fields(1.0, 99.0, 1.05)
+        self.assertEqual(explicit_price["predicted_service_price"], 1.05)
+        self.assertEqual(explicit_price["predicted_vs_actual_pct"], 5.0)
 
         summary = build_price_comparison_summary(
             pd.DataFrame(
@@ -985,33 +1166,33 @@ class SelectionTests(unittest.TestCase):
                     {
                         "zone_id": "102",
                         "category": "User-selected",
-                        "observed_service_price": 1.0,
-                        "recommended_service_price": 1.05,
-                        "recommended_minus_observed_service_price": 0.05,
-                        "recommended_vs_observed_pct": 5.0,
+                        "actual_service_price": 1.0,
+                        "predicted_service_price": 1.05,
+                        "predicted_minus_actual_service_price": 0.05,
+                        "predicted_vs_actual_pct": 5.0,
                     },
                     {
                         "zone_id": "102",
                         "category": "User-selected",
-                        "observed_service_price": 2.0,
-                        "recommended_service_price": 1.8,
-                        "recommended_minus_observed_service_price": -0.2,
-                        "recommended_vs_observed_pct": -10.0,
+                        "actual_service_price": 2.0,
+                        "predicted_service_price": 1.8,
+                        "predicted_minus_actual_service_price": -0.2,
+                        "predicted_vs_actual_pct": -10.0,
                     },
                 ]
             )
         )
         self.assertNotIn("ALL", summary["zone_id"].tolist())
-        self.assertNotIn("avg_abs_recommended_minus_observed_service_price", summary.columns)
+        self.assertNotIn("avg_abs_predicted_minus_actual_service_price", summary.columns)
         zone_summary = summary[summary["zone_id"] == "102"].iloc[0]
         self.assertEqual(zone_summary["price_windows"], 2)
         self.assertEqual(zone_summary["price_error_threshold_pct"], 8.0)
         self.assertEqual(zone_summary["price_pass_windows"], 1)
         self.assertAlmostEqual(zone_summary["price_accuracy"], 0.5)
-        self.assertAlmostEqual(zone_summary["avg_observed_service_price"], 1.5)
-        self.assertAlmostEqual(zone_summary["avg_recommended_service_price"], 1.425)
-        self.assertAlmostEqual(zone_summary["avg_recommended_minus_observed_service_price"], -0.075)
-        self.assertAlmostEqual(zone_summary["avg_recommended_vs_observed_pct"], -2.5)
+        self.assertAlmostEqual(zone_summary["avg_actual_service_price"], 1.5)
+        self.assertAlmostEqual(zone_summary["avg_predicted_service_price"], 1.425)
+        self.assertAlmostEqual(zone_summary["avg_predicted_minus_actual_service_price"], -0.075)
+        self.assertAlmostEqual(zone_summary["avg_predicted_vs_actual_pct"], -2.5)
 
     def test_builds_hourly_agent_context_and_three_hour_windows(self):
         hourly = pd.DataFrame(
@@ -1339,11 +1520,11 @@ class SelectionTests(unittest.TestCase):
             }
             self.assertEqual(len(run_dirs), 4)
             self.assertIn(
-                root / "output" / "experiments" / "zones_102_105_2starts" / "2022-09-09_000000" / "timesfm",
+                root / "output" / "experiments" / "2zonesx2timesx1modes_1blends" / "2022-09-09_000000" / "timesfm",
                 run_dirs,
             )
             self.assertIn(
-                root / "output" / "experiments" / "zones_102_105_2starts" / "2022-10-14_000000" / "timesfm",
+                root / "output" / "experiments" / "2zonesx2timesx1modes_1blends" / "2022-10-14_000000" / "timesfm",
                 run_dirs,
             )
 
@@ -1390,8 +1571,8 @@ class SelectionTests(unittest.TestCase):
                             "zone_id": "102",
                             "category": "User-selected",
                             "price_accuracy": 0.5 if kwargs["agent_mode"] == "rules" else 0.75,
-                            "avg_recommended_minus_observed_service_price": 0.1,
-                            "avg_recommended_vs_observed_pct": 5.0,
+                            "avg_predicted_minus_actual_service_price": 0.1,
+                            "avg_predicted_vs_actual_pct": 5.0,
                         }
                     ]
                 ).to_csv(price_path, index=False)

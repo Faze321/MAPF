@@ -9,7 +9,13 @@ from typing import Any
 
 import pandas as pd
 
-from agents import AgentChatClient, AgentStageError, recompute_report_nash, run_all_zone_chains
+from agents import (
+    AgentChatClient,
+    AgentStageError,
+    recompute_report_nash,
+    run_all_zone_chains,
+    summarize_nash_equilibrium,
+)
 from config import AgentConfig, normalize_agent_mode, normalize_forecast_model_name
 from data_loader import build_zone_3h_load_quantiles, build_zone_profiles, load_pipeline_data
 from forecasting import DEFAULT_TIMESFM_EXOG_COLS, ForecastResult, forecast_zone
@@ -23,6 +29,7 @@ ERROR_CODE_BY_STAGE = {
     "load_data": "MAPF-E020",
     "forecast": "MAPF-E100",
     "build_contexts": "MAPF-E110",
+    "precomputed_window_data": "MAPF-E120",
     "agent_chain": "MAPF-E200",
     "agent.grid": "MAPF-E210",
     "agent.behavior": "MAPF-E220",
@@ -99,6 +106,7 @@ def run_pipeline(
     lstm_roll_actuals: bool = True,
     lstm_seed: int = 42,
     temperature: float = 0.2,
+    precomputed_window_data: Path | str | None = None,
 ) -> dict[str, Path]:
     forecast_model = normalize_forecast_model_name(forecast_model)
     agent_mode = normalize_agent_mode(agent_mode)
@@ -178,38 +186,73 @@ def run_pipeline(
     except Exception as exc:
         raise PipelineStageError(stage="build_contexts", original=exc) from exc
 
-    if agent_mode == "rules":
-        client = None
-        heuristic_source = "rules"
-    elif dry_run:
-        client = None
-        heuristic_source = f"dry-run_{agent_mode}" if agent_mode != "agents" else "dry-run"
-    else:
-        config = AgentConfig.from_file(config_path, model=model, required=True)
-        if not config.api_key:
-            raise RuntimeError("agent.api_key is required in config.yaml, or pass --dry-run")
-        config = select_agent_config_for_mode(config, agent_mode=agent_mode, cli_model=model)
-        client = AgentChatClient(config)
-        heuristic_source = "dry-run"
     try:
-        reports = asyncio.run(
-            run_all_zone_chains(
-                contexts,
-                client=client,
-                temperature=temperature,
-                heuristic_source=heuristic_source,
-                chain_mode=chain_mode,
-                apply_nash=apply_nash,
-            )
+        precomputed_frame = load_precomputed_window_data(precomputed_window_data)
+        cached_contexts, live_contexts, cached_windows_by_zone = partition_precomputed_contexts(
+            contexts,
+            precomputed_frame,
+            forecast_model=forecast_model,
+            agent_mode=agent_mode,
         )
+    except Exception as exc:
+        raise PipelineStageError(stage="precomputed_window_data", original=exc) from exc
+
+    reports_by_zone: dict[str, dict[str, Any]] = {}
+    try:
+        if cached_contexts:
+            cached_reports = asyncio.run(
+                run_all_zone_chains(
+                    cached_contexts,
+                    client=None,
+                    temperature=temperature,
+                    heuristic_source="precomputed_window_data",
+                    chain_mode=chain_mode,
+                    apply_nash=False,
+                )
+            )
+            cached_reports = apply_precomputed_window_data(
+                cached_reports,
+                cached_windows_by_zone,
+                source_path=precomputed_window_data,
+            )
+            reports_by_zone.update({str(report.get("zone_id")): report for report in cached_reports})
+
+        if live_contexts:
+            if agent_mode == "rules":
+                client = None
+                heuristic_source = "rules"
+            elif dry_run:
+                client = None
+                heuristic_source = f"dry-run_{agent_mode}" if agent_mode != "agents" else "dry-run"
+            else:
+                config = AgentConfig.from_file(config_path, model=model, required=True)
+                if not config.api_key:
+                    raise RuntimeError("agent.api_key is required in config.yaml, or pass --dry-run")
+                config = select_agent_config_for_mode(config, agent_mode=agent_mode, cli_model=model)
+                client = AgentChatClient(config)
+                heuristic_source = "dry-run"
+            live_reports = asyncio.run(
+                run_all_zone_chains(
+                    live_contexts,
+                    client=client,
+                    temperature=temperature,
+                    heuristic_source=heuristic_source,
+                    chain_mode=chain_mode,
+                    apply_nash=apply_nash,
+                )
+            )
+            reports_by_zone.update({str(report.get("zone_id")): report for report in live_reports})
+        reports = [reports_by_zone[str(context.get("zone_id"))] for context in contexts]
     except AgentStageError:
         raise
     except Exception as exc:
         raise PipelineStageError(stage="agent_chain", original=exc) from exc
     try:
-        reports = apply_price_conditioned_baseline_forecasts(
-            reports=reports,
-            contexts=contexts,
+        live_zone_ids = {str(context.get("zone_id")) for context in live_contexts}
+        live_reports = [report for report in reports if str(report.get("zone_id")) in live_zone_ids]
+        live_reports = apply_price_conditioned_baseline_forecasts(
+            reports=live_reports,
+            contexts=live_contexts,
             pipeline_data=pipeline_data,
             zone_load_quantiles=zone_load_quantiles,
             forecast_start=forecast_start,
@@ -241,6 +284,8 @@ def run_pipeline(
             lstm_seed=lstm_seed,
             apply_nash=apply_nash,
         )
+        reports_by_zone.update({str(report.get("zone_id")): report for report in live_reports})
+        reports = [reports_by_zone[str(context.get("zone_id"))] for context in contexts]
     except Exception as exc:
         raise PipelineStageError(stage="price_conditioned_forecast", original=exc) from exc
     try:
@@ -250,6 +295,8 @@ def run_pipeline(
             contexts=contexts,
             reports=reports,
             forecast_results=forecast_results,
+            forecast_model=forecast_model,
+            agent_mode=agent_mode,
         )
     except Exception as exc:
         raise PipelineStageError(stage="write_outputs", original=exc) from exc
@@ -286,11 +333,7 @@ def run_experiment_matrix(
     modes = normalize_agent_modes(agent_modes, pipeline_kwargs.get("agent_mode", "agents"))
     blend_alphas = normalize_blend_alphas(diurnal_blend_alphas)
     selected_zone_ids = normalize_zone_ids(zone_ids)
-    experiment_dir = output_dir / "experiments" / (
-        experiment_name or experiment_slug(selected_zone_ids, starts)
-    )
     shared_cache_dir = output_dir / "cache"
-    experiment_dir.mkdir(parents=True, exist_ok=True)
     shared_cache_dir.mkdir(parents=True, exist_ok=True)
     base_force_cache = bool(pipeline_kwargs.pop("force_cache", False))
     if not selected_zone_ids:
@@ -304,6 +347,16 @@ def run_experiment_matrix(
             profiles,
             count=experiment_zone_count,
         )
+    experiment_dir = output_dir / "experiments" / (
+        experiment_name
+        or experiment_slug(
+            zone_count=len(selected_zone_ids),
+            time_count=len(starts),
+            mode_count=len(modes),
+            blend_count=len(blend_alphas),
+        )
+    )
+    experiment_dir.mkdir(parents=True, exist_ok=True)
 
     runs_path = experiment_dir / "experiment_runs.csv"
     metrics_path = experiment_dir / "experiment_forecast_metrics.csv"
@@ -441,8 +494,8 @@ def run_experiment_matrix(
         price_summary_path,
         metric_columns=[
             "price_accuracy",
-            "avg_recommended_minus_observed_service_price",
-            "avg_recommended_vs_observed_pct",
+            "avg_predicted_minus_actual_service_price",
+            "avg_predicted_vs_actual_pct",
         ],
     )
     write_numeric_summary(
@@ -536,10 +589,14 @@ def normalize_blend_alphas(diurnal_blend_alphas: Iterable[float] | None) -> list
     return values or [None]
 
 
-def experiment_slug(zone_ids: Iterable[str], forecast_starts: Iterable[str]) -> str:
-    zone_part = "_".join(safe_filename(zone_id) for zone_id in zone_ids) or "auto"
-    start_count = len(list(forecast_starts))
-    return f"zones_{zone_part}_{start_count}starts"
+def experiment_slug(
+    *,
+    zone_count: int,
+    time_count: int,
+    mode_count: int,
+    blend_count: int,
+) -> str:
+    return f"{int(zone_count)}zonesx{int(time_count)}timesx{int(mode_count)}modes_{int(blend_count)}blends"
 
 
 def forecast_start_slug(forecast_start: str) -> str:
@@ -730,8 +787,8 @@ def write_decision_quality_summary(
                 prices,
                 metrics=[
                     "price_accuracy",
-                    "avg_recommended_minus_observed_service_price",
-                    "avg_recommended_vs_observed_pct",
+                    "avg_predicted_minus_actual_service_price",
+                    "avg_predicted_vs_actual_pct",
                 ],
                 metric_family="price_decision",
             )
@@ -859,6 +916,264 @@ def select_representative_zone_ids(profiles: pd.DataFrame, *, count: int) -> lis
 def forecast_output_dir(output_dir: Path, forecast_model: str) -> Path:
     normalized = normalize_forecast_model_name(forecast_model)
     return output_dir / safe_filename(normalized or "forecast")
+
+
+def load_precomputed_window_data(path: Path | str | None) -> pd.DataFrame:
+    if path in (None, ""):
+        return pd.DataFrame()
+    cache_path = Path(path)
+    if not cache_path.is_file():
+        raise FileNotFoundError(f"Precomputed window data file not found: {cache_path}")
+    frame = pd.read_csv(cache_path, dtype={"zone_id": "string"})
+    if "price_conditioned_load_kwh" not in frame and "predicted_load_kwh" in frame:
+        frame["price_conditioned_load_kwh"] = frame["predicted_load_kwh"]
+    if "forecast_load_kwh" not in frame and "sum_predicted_kwh" in frame:
+        frame["forecast_load_kwh"] = frame["sum_predicted_kwh"]
+    required = {
+        "zone_id",
+        "window_start",
+        "window_end",
+        "predicted_service_price",
+        "price_conditioned_load_kwh",
+    }
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(
+            "Precomputed window data is missing required column(s): " + ", ".join(missing)
+        )
+    frame = frame.copy()
+    frame["zone_id"] = frame["zone_id"].astype("string").str.strip()
+    for column in ("window_start", "window_end"):
+        parsed = pd.to_datetime(frame[column], errors="coerce")
+        if parsed.isna().any():
+            bad_rows = parsed[parsed.isna()].index.tolist()[:5]
+            raise ValueError(f"Invalid {column} value in precomputed window data at row(s): {bad_rows}")
+        frame[column] = parsed.map(lambda value: value.isoformat())
+    return frame
+
+
+def partition_precomputed_contexts(
+    contexts: list[dict[str, Any]],
+    frame: pd.DataFrame,
+    *,
+    forecast_model: str,
+    agent_mode: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[tuple[str, str, str], dict[str, Any]]]]:
+    if frame.empty:
+        return [], list(contexts), {}
+
+    candidates = frame.copy()
+    if "forecast_model" in candidates:
+        model_values = candidates["forecast_model"].fillna("").astype(str).str.strip()
+        model_matches = model_values.map(
+            lambda value: not value or normalize_forecast_model_name(value) == forecast_model
+        )
+        candidates = candidates[model_matches]
+    if "agent_mode" in candidates:
+        mode_values = candidates["agent_mode"].fillna("").astype(str).str.strip()
+
+        def mode_matches(value: str) -> bool:
+            if not value:
+                return True
+            try:
+                return normalize_agent_mode(value) == agent_mode
+            except ValueError:
+                return False
+
+        candidates = candidates[mode_values.map(mode_matches)]
+
+    cache_index: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in candidates.to_dict(orient="records"):
+        key = precomputed_window_key(row.get("zone_id"), row.get("window_start"), row.get("window_end"))
+        if key in cache_index:
+            raise ValueError(
+                "Duplicate precomputed window data for "
+                f"zone={key[0]}, window_start={key[1]}, window_end={key[2]}"
+            )
+        cache_index[key] = {name: clean_precomputed_value(value) for name, value in row.items()}
+
+    cached_contexts: list[dict[str, Any]] = []
+    live_contexts: list[dict[str, Any]] = []
+    cached_windows_by_zone: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = {}
+    for context in contexts:
+        zone_id = str(context.get("zone_id"))
+        expected_windows = [
+            window for window in context.get("pricing_windows_3h") or [] if isinstance(window, dict)
+        ]
+        zone_rows: dict[tuple[str, str, str], dict[str, Any]] = {}
+        complete = bool(expected_windows)
+        for window in expected_windows:
+            key = precomputed_window_key(zone_id, window.get("window_start"), window.get("window_end"))
+            row = cache_index.get(key)
+            if (
+                row is None
+                or optional_number(row.get("predicted_service_price")) is None
+                or optional_number(row.get("price_conditioned_load_kwh")) is None
+            ):
+                complete = False
+                break
+            zone_rows[key] = row
+        if complete:
+            cached_contexts.append(context)
+            cached_windows_by_zone[zone_id] = zone_rows
+        else:
+            live_contexts.append(context)
+    return cached_contexts, live_contexts, cached_windows_by_zone
+
+
+def apply_precomputed_window_data(
+    reports: list[dict[str, Any]],
+    cached_windows_by_zone: dict[str, dict[tuple[str, str, str], dict[str, Any]]],
+    *,
+    source_path: Path | str | None,
+) -> list[dict[str, Any]]:
+    source_name = Path(source_path).name if source_path not in (None, "") else "precomputed data"
+    updated_reports: list[dict[str, Any]] = []
+    passthrough_fields = (
+        "load_stress_level",
+        "price_conditioned_load_stress_level",
+        "load_3h_q95_kwh",
+        "nash_equilibrium_reached",
+        "nash_status",
+        "nash_iterations",
+        "target_peak_reduction_pct",
+        "elasticity_factor",
+        "capacity_limit_kwh",
+        "capacity_limit_source",
+        "expected_load_kwh",
+        "grid_safe",
+        "user_tolerant",
+        "price_stable",
+        "discomfort_score",
+        "max_discomfort_score",
+        "price_stability_epsilon_pct",
+        "action_label",
+        "price_rationale",
+    )
+    boolean_fields = {
+        "nash_equilibrium_reached",
+        "grid_safe",
+        "user_tolerant",
+        "price_stable",
+    }
+
+    for report in reports:
+        zone_id = str(report.get("zone_id"))
+        zone_rows = cached_windows_by_zone[zone_id]
+        updated_windows: list[dict[str, Any]] = []
+        for window in report.get("price_change_windows_3h") or []:
+            if not isinstance(window, dict):
+                continue
+            key = precomputed_window_key(zone_id, window.get("window_start"), window.get("window_end"))
+            row = zone_rows[key]
+            updated = dict(window)
+            predicted_price = optional_number(row.get("predicted_service_price"))
+            conditioned_load = optional_number(row.get("price_conditioned_load_kwh"))
+            actual_price = optional_number(updated.get("mean_service_price"))
+            final_shift = optional_number(row.get("final_price_shift_pct"))
+            if final_shift is None and actual_price not in (None, 0) and predicted_price is not None:
+                final_shift = ((predicted_price / actual_price) - 1) * 100
+            pre_nash_shift = optional_number(row.get("pre_nash_price_shift_pct"))
+            if pre_nash_shift is None:
+                pre_nash_shift = final_shift
+
+            forecast_load = optional_number(row.get("forecast_load_kwh"))
+            if forecast_load is not None:
+                updated["sum_predicted_kwh"] = forecast_load
+            updated["predicted_service_price"] = predicted_price
+            updated["suggested_price_shift_pct"] = round(final_shift, 4) if final_shift is not None else None
+            updated["pre_nash_suggested_price_shift_pct"] = (
+                round(pre_nash_shift, 4) if pre_nash_shift is not None else None
+            )
+            updated["price_conditioned_baseline_load_kwh"] = conditioned_load
+            updated["price_conditioned_mean_predicted_kwh"] = optional_number(
+                row.get("price_conditioned_mean_load_kwh")
+            )
+            updated["price_conditioned_peak_predicted_kwh"] = optional_number(
+                row.get("price_conditioned_peak_load_kwh")
+            )
+            forecaster_price = optional_number(row.get("forecaster_input_predicted_service_price"))
+            updated["price_conditioned_service_price"] = (
+                forecaster_price if forecaster_price is not None else predicted_price
+            )
+            updated["price_conditioned_baseline_source"] = "precomputed_window_data"
+            cached_baseline_load = optional_number(row.get("baseline_load_kwh"))
+            updated["baseline_load_kwh"] = (
+                cached_baseline_load if cached_baseline_load is not None else conditioned_load
+            )
+            updated["baseline_load_source"] = row.get("baseline_load_source") or "precomputed_window_data"
+            for field in passthrough_fields:
+                value = row.get(field)
+                if value is not None:
+                    updated[field] = normalize_precomputed_bool(value) if field in boolean_fields else value
+            if row.get("nash_status") is None:
+                updated["nash_equilibrium_reached"] = None
+                updated["nash_status"] = "precomputed"
+                updated["nash_iterations"] = 0
+            updated_windows.append(updated)
+
+        updated_report = dict(report)
+        updated_report["price_change_windows_3h"] = updated_windows
+        shifts = [optional_number(window.get("suggested_price_shift_pct")) for window in updated_windows]
+        shifts = [value for value in shifts if value is not None]
+        forecast_loads = [optional_number(window.get("sum_predicted_kwh")) for window in updated_windows]
+        if forecast_loads and all(value is not None for value in forecast_loads):
+            updated_report["predicted_load_kwh"] = round(sum(value for value in forecast_loads if value is not None), 4)
+        if shifts:
+            updated_report["suggested_price_shift_pct"] = round(sum(shifts) / len(shifts), 2)
+        if updated_windows and all(window.get("nash_status") == "precomputed" for window in updated_windows):
+            nash_summary = {
+                "nash_equilibrium_reached": None,
+                "nash_equilibrium_windows": len(updated_windows),
+                "nash_equilibrium_reached_windows": 0,
+                "nash_equilibrium_rounds": 0,
+                "nash_equilibrium_summary": f"Reused precomputed results for {len(updated_windows)} pricing windows",
+            }
+        else:
+            nash_summary = summarize_nash_equilibrium(updated_windows)
+        updated_report.update(nash_summary)
+        updated_report["agent_reasoning"] = f"Reused window load and service-price predictions from {source_name}."
+        updated_report["action_label"] = "Reuse precomputed window predictions"
+        updated_report["price_rationale"] = f"Loaded complete 3-hour window predictions from {source_name}."
+        updated_report["agent_time_cost_seconds"] = 0.0
+        updated_report["agent_prompt_tokens"] = 0
+        updated_report["agent_completion_tokens"] = 0
+        updated_report["agent_total_tokens"] = 0
+        updated_report["agent_call_usage"] = []
+        updated_report["source"] = "precomputed_window_data"
+        updated_report["precomputed_window_data_source"] = str(source_path)
+        updated_reports.append(updated_report)
+    return updated_reports
+
+
+def precomputed_window_key(zone_id: Any, window_start: Any, window_end: Any) -> tuple[str, str, str]:
+    return (
+        str(zone_id).strip(),
+        pd.Timestamp(window_start).isoformat(),
+        pd.Timestamp(window_end).isoformat(),
+    )
+
+
+def clean_precomputed_value(value: Any) -> Any:
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value.item() if hasattr(value, "item") else value
+
+
+def normalize_precomputed_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
 
 
 def apply_price_conditioned_baseline_forecasts(

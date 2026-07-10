@@ -42,6 +42,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Rebuild cached zone profiles and POI assignment.",
     )
+    parser.add_argument(
+        "--precomputed-window-data",
+        default=None,
+        help=(
+            "CSV produced as window_load_price_cache.csv. Complete zone-window matches reuse "
+            "cached service-price and price-conditioned load predictions."
+        ),
+    )
     parser.add_argument("--max-poi-rows", type=int, default=None, help="Limit POI rows for quick experiments.")
     parser.add_argument("--forecast-start", default=None, help="ISO timestamp for the forecast window start.")
     parser.add_argument(
@@ -163,6 +171,11 @@ def main(argv: list[str] | None = None):
         "weather_file": args.weather_file or run_config.weather_file,
         "dry_run": args.dry_run if args.dry_run is not None else run_config.dry_run,
         "force_cache": args.force_cache if args.force_cache is not None else run_config.force_cache,
+        "precomputed_window_data": (
+            args.precomputed_window_data
+            if args.precomputed_window_data is not None
+            else run_config.precomputed_window_data
+        ),
         "max_poi_rows": args.max_poi_rows if args.max_poi_rows is not None else run_config.max_poi_rows,
         "horizon_days": args.horizon_days if args.horizon_days is not None else run_config.horizon_days,
         "history_days": args.history_days if args.history_days is not None else run_config.history_days,

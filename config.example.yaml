@@ -3,6 +3,7 @@ agent:
   base_url: "https://openrouter.ai/api/v1"
   model: "qwen/qwen3-14b"
   single_model_model: "meta-llama/llama-3.3-70b-instruct"
+  reasoning_effort: "none" # required for JSON mode with Qwen3 thinking models
   timeout_seconds: 90
 
 run:

@@ -8,6 +8,16 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from config import AgentConfig
+from load_policy import (
+    EXTREMELY_HIGH_STRESS,
+    HIGH_STRESS,
+    LOW_STRESS,
+    MEDIUM_STRESS,
+    classify_load_percentage,
+    load_percentage,
+    medium_load_bounds,
+    target_medium_load,
+)
 from prompts import (
     SYSTEM_MESSAGE,
     behavior_prompt,
@@ -18,7 +28,7 @@ from prompts import (
 )
 
 
-GRID_STRESS_LEVELS = ("Low", "Medium", "High", "Extreme High")
+GRID_STRESS_LEVELS = (LOW_STRESS, MEDIUM_STRESS, HIGH_STRESS, EXTREMELY_HIGH_STRESS)
 MODEL_RESPONSE_FAILED = "MODEL_RESPONSE_FAILED"
 ECONOMIST_AGENT_OUTPUT_KEY = "_economist_agent_output"
 AGENT_COMPLETION_USAGE_KEY = "_agent_completion_usage"
@@ -26,16 +36,19 @@ NASH_MAX_ITERATIONS = 6
 NASH_PRICE_STABILITY_EPSILON_PCT = 0.5
 NASH_MAX_DISCOMFORT_SCORE = 1.0
 NASH_MAX_ABS_PRICE_SHIFT_PCT = 25.0
+NASH_MEDIUM_MAX_PRICE_SHIFT_PCT = 3.0
 NASH_MIN_ELASTICITY = 0.05
 NASH_MAX_ELASTICITY = 0.7
 GRID_STRESS_LEVEL_BY_KEY = {level.lower(): level for level in GRID_STRESS_LEVELS}
 GRID_STRESS_LEVEL_BY_KEY.update(
     {
         "moderate": "Medium",
-        "critical": "Extreme High",
-        "critica": "Extreme High",
-        "extrame high": "Extreme High",
-        "extreme_high": "Extreme High",
+        "critical": EXTREMELY_HIGH_STRESS,
+        "critica": EXTREMELY_HIGH_STRESS,
+        "extrame high": EXTREMELY_HIGH_STRESS,
+        "extreme high": EXTREMELY_HIGH_STRESS,
+        "extreme_high": EXTREMELY_HIGH_STRESS,
+        "extremely_high": EXTREMELY_HIGH_STRESS,
     }
 )
 
@@ -87,16 +100,20 @@ class AgentChatClient:
         )
 
     async def complete_json(self, prompt: str, *, temperature: float) -> dict[str, Any]:
-        response = await self._client.chat.completions.create(
-            model=self.config.model,
-            messages=[
+        request: dict[str, Any] = {
+            "model": self.config.model,
+            "messages": [
                 {"role": "system", "content": SYSTEM_MESSAGE},
                 {"role": "user", "content": prompt},
             ],
-            response_format={"type": "json_object"},
-            temperature=temperature,
-        )
-        content = response.choices[0].message.content or "{}"
+            "response_format": {"type": "json_object"},
+            "temperature": temperature,
+        }
+        extra_body = reasoning_extra_body(self.config)
+        if extra_body is not None:
+            request["extra_body"] = extra_body
+        response = await self._client.chat.completions.create(**request)
+        content = completion_message_content(response, requested_model=self.config.model)
         payload = extract_json_object(content)
         payload[AGENT_COMPLETION_USAGE_KEY] = response_token_usage(response)
         return payload
@@ -106,6 +123,63 @@ class AgentChatClient:
 class DryRunChatClient:
     async def complete_json(self, prompt: str, *, temperature: float) -> dict[str, Any]:
         raise RuntimeError("DryRunChatClient should not receive raw prompts")
+
+
+def reasoning_extra_body(config: AgentConfig) -> dict[str, Any] | None:
+    effort = str(config.reasoning_effort or "").strip()
+    if not effort or config.model.strip().lower().startswith("meta-llama/"):
+        return None
+    return {"reasoning": {"effort": effort}}
+
+
+def completion_message_content(response: Any, *, requested_model: str) -> str:
+    choices = response_field(response, "choices")
+    if not choices:
+        details = provider_response_error_details(response)
+        suffix = f"; {details}" if details else ""
+        raise RuntimeError(
+            f"Model provider returned no completion choices for model {requested_model}{suffix}"
+        )
+    choice = choices[0]
+    message = response_field(choice, "message")
+    if message is None:
+        raise RuntimeError(
+            f"Model provider returned a completion choice without a message for model {requested_model}"
+        )
+    content = response_field(message, "content")
+    if not isinstance(content, str) or not content.strip():
+        refusal = response_field(message, "refusal")
+        refusal_text = f"; refusal={refusal}" if refusal else ""
+        raise RuntimeError(
+            f"Model provider returned empty completion content for model {requested_model}{refusal_text}"
+        )
+    return content
+
+
+def provider_response_error_details(response: Any) -> str:
+    error = response_field(response, "error")
+    if error is None:
+        model_extra = response_field(response, "model_extra")
+        if isinstance(model_extra, dict):
+            error = model_extra.get("error")
+    if error is None:
+        return ""
+    code = response_field(error, "code")
+    message = response_field(error, "message")
+    if isinstance(error, str):
+        message = error
+    parts = []
+    if code not in (None, ""):
+        parts.append(f"provider_error_code={code}")
+    if message not in (None, ""):
+        parts.append(f"provider_error_message={str(message)[:500]}")
+    return "; ".join(parts)
+
+
+def response_field(value: Any, field: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(field)
+    return getattr(value, field, None)
 
 
 async def run_zone_chain(
@@ -479,7 +553,7 @@ def heuristic_behavior(context: dict[str, Any]) -> dict[str, Any]:
         window
         for window in windows
         if normalize_grid_stress_level(window.get("load_stress_level") or window.get("grid_stress_level"), "Low")
-        in {"High", "Extreme High"}
+        in {HIGH_STRESS, EXTREMELY_HIGH_STRESS}
     ]
     peak_window = max(windows, key=lambda window: as_float(window.get("sum_predicted_kwh"), 0), default=None)
     if high_windows:
@@ -583,8 +657,10 @@ def combine_reports(
         "stress_miss_count": context.get("stress_miss_count"),
         "agent_reasoning": str(behavior.get("agent_reasoning") or ""),
         "suggested_price_shift_pct": final_shift,
-        "action_label": str(economist.get("action_label") or ""),
-        "price_rationale": str(economist.get("price_rationale") or ""),
+        "model_action_label": str(economist.get("action_label") or ""),
+        "model_price_rationale": str(economist.get("price_rationale") or ""),
+        "action_label": final_price_action_label(final_shift),
+        "price_rationale": summarize_medium_target_schedule(price_windows, final_shift),
         "price_change_windows_3h": price_windows,
         "nash_equilibrium_reached": nash_summary["nash_equilibrium_reached"],
         "nash_equilibrium_windows": nash_summary["nash_equilibrium_windows"],
@@ -626,6 +702,11 @@ def recompute_report_nash(
     updated["suggested_price_shift_pct"] = average_price_shift(
         price_windows,
         as_float(report.get("suggested_price_shift_pct"), 0),
+    )
+    updated["action_label"] = final_price_action_label(updated["suggested_price_shift_pct"])
+    updated["price_rationale"] = summarize_medium_target_schedule(
+        price_windows,
+        updated["suggested_price_shift_pct"],
     )
     updated["nash_equilibrium_reached"] = nash_summary["nash_equilibrium_reached"]
     updated["nash_equilibrium_windows"] = nash_summary["nash_equilibrium_windows"]
@@ -733,16 +814,14 @@ def as_float(value: Any, fallback: float) -> float:
 
 
 def base_price_shift(stress: str, category: str, change: float) -> tuple[int, str]:
-    if stress == "Extreme High" and category == "Residential":
+    if stress == EXTREMELY_HIGH_STRESS and category == "Residential":
         return 15, "Peak deflection fee"
-    if stress == "Extreme High":
-        return 10, "Congestion fee"
-    if stress == "High":
+    if stress == EXTREMELY_HIGH_STRESS:
+        return 15, "Congestion fee"
+    if stress == HIGH_STRESS:
         return 8, "High-load premium"
-    if stress == "Medium" and change > 10:
-        return 5, "Medium peak premium"
-    if stress == "Low" and change < -10:
-        return -5, "Utilization incentive"
+    if stress == LOW_STRESS:
+        return -8, "Utilization incentive"
     return 0, "Hold price"
 
 
@@ -754,7 +833,6 @@ def build_heuristic_price_windows(
     averages = context.get("hourly_averages") or {}
     mean_load = as_float(averages.get("mean_predicted_kwh"), 0)
     mean_service_price = as_float(averages.get("mean_service_price"), 0)
-    mean_energy_price = as_float(averages.get("mean_energy_price"), 0)
     stress = normalize_grid_stress_level(grid.get("grid_stress_level"), context.get("grid_stress_level"))
     category = str(context.get("category") or "")
     change = as_float(grid.get("predicted_change_pct"), context.get("predicted_change_pct", 0))
@@ -764,27 +842,13 @@ def build_heuristic_price_windows(
             window.get("load_stress_level") or window.get("grid_stress_level"),
             stress,
         )
-        window_base_shift, _ = base_price_shift(window_stress, category, change)
         window_load = as_float(window.get("mean_predicted_kwh"), mean_load)
         window_service_price = as_float(window.get("mean_service_price"), mean_service_price)
-        window_energy_price = as_float(window.get("mean_energy_price"), mean_energy_price)
-        adjustment = 0
-        if mean_load > 0:
-            load_ratio = window_load / mean_load
-            if load_ratio >= 1.15:
-                adjustment += 3
-            elif load_ratio <= 0.85:
-                adjustment -= 3
-        if mean_energy_price > 0:
-            energy_ratio = window_energy_price / mean_energy_price
-            if energy_ratio >= 1.08:
-                adjustment += 2
-            elif energy_ratio <= 0.92:
-                adjustment -= 1
-        shift = int(max(-15, min(15, round(window_base_shift + adjustment))))
-        if shift > window_base_shift:
+        elasticity = estimate_elasticity_factor(context, {}, window)
+        shift = round(price_shift_to_medium_band(context, window, elasticity), 2)
+        if shift > 0:
             label = "Raise price"
-        elif shift < window_base_shift:
+        elif shift < 0:
             label = "Reduce price"
         else:
             label = "Hold window price"
@@ -806,11 +870,22 @@ def build_heuristic_price_windows(
                 "load_3h_q50_kwh": window.get("load_3h_q50_kwh"),
                 "load_3h_q80_kwh": window.get("load_3h_q80_kwh"),
                 "load_3h_q95_kwh": window.get("load_3h_q95_kwh"),
+                "load_pct_of_q95": window.get("load_pct_of_q95"),
+                "actual_load_pct_of_q95": window.get("actual_load_pct_of_q95"),
+                "load_low_max_pct": window.get("load_low_max_pct"),
+                "load_medium_max_pct": window.get("load_medium_max_pct"),
+                "load_high_max_pct": window.get("load_high_max_pct"),
+                "historical_min_service_price": window.get("historical_min_service_price"),
+                "historical_max_service_price": window.get("historical_max_service_price"),
                 "suggested_price_shift_pct": shift,
                 "action_label": label,
                 "price_rationale": (
-                    f"{window_stress} 3-hour stress; mean load {window_load:.2f} kWh "
-                    f"vs horizon mean {mean_load:.2f} kWh; service price {window_service_price:.2f}."
+                    f"{window_stress} 3-hour load at "
+                    f"{as_float(window.get('load_pct_of_q95'), 0):.2f}% of historical Q95; "
+                    f"price shift targets the Medium band and keeps service price within "
+                    f"the zone historical range from "
+                    f"{as_float(window.get('historical_min_service_price'), window_service_price):.4f} "
+                    f"to {as_float(window.get('historical_max_service_price'), window_service_price):.4f}."
                 ),
             }
         )
@@ -875,6 +950,13 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
                 "load_3h_q50_kwh": fallback.get("load_3h_q50_kwh"),
                 "load_3h_q80_kwh": fallback.get("load_3h_q80_kwh"),
                 "load_3h_q95_kwh": fallback.get("load_3h_q95_kwh"),
+                "load_pct_of_q95": fallback.get("load_pct_of_q95"),
+                "actual_load_pct_of_q95": fallback.get("actual_load_pct_of_q95"),
+                "load_low_max_pct": fallback.get("load_low_max_pct"),
+                "load_medium_max_pct": fallback.get("load_medium_max_pct"),
+                "load_high_max_pct": fallback.get("load_high_max_pct"),
+                "historical_min_service_price": fallback.get("historical_min_service_price"),
+                "historical_max_service_price": fallback.get("historical_max_service_price"),
                 "suggested_price_shift_pct": shift,
                 "action_label": required_model_text(item, "action_label", item_missing),
                 "price_rationale": required_model_text(item, "price_rationale", item_missing),
@@ -893,26 +975,56 @@ def mark_nash_equilibrium_skipped(
     elasticity = estimate_elasticity_factor(context, behavior, window)
     tolerance_pct = estimate_price_tolerance_pct(context, window)
     raw_shift = as_float(window.get("suggested_price_shift_pct"), 0)
-    expected_load = expected_load_after_price(baseline_load, raw_shift, elasticity)
-    discomfort_score = user_discomfort_score(raw_shift, tolerance_pct)
+    policy_shift = price_shift_to_medium_band(context, window, elasticity)
+    expected_load = expected_load_after_price(baseline_load, policy_shift, elasticity)
+    lower_load, upper_load = medium_load_bounds(capacity_limit)
+    target_load = target_medium_load(baseline_load, capacity_limit)
+    min_price, max_price, price_bound_source = historical_service_price_bounds(context, window)
+    recommended_price = service_price_after_shift(window, policy_shift)
+    price_within_bounds = price_is_within_bounds(recommended_price, min_price, max_price)
+    discomfort_score = user_discomfort_score(policy_shift, tolerance_pct)
+    load_in_medium_band = lower_load <= expected_load < upper_load
     enriched = dict(window)
     enriched.update(
         {
+            "model_action_label": window.get("action_label"),
+            "model_price_rationale": window.get("price_rationale"),
+            "action_label": final_price_action_label(policy_shift),
+            "price_rationale": medium_target_price_rationale(
+                baseline_load,
+                capacity_limit,
+                policy_shift,
+                min_price,
+                max_price,
+            ),
             "pre_nash_suggested_price_shift_pct": raw_shift,
-            "suggested_price_shift_pct": round(raw_shift, 2),
+            "suggested_price_shift_pct": round(policy_shift, 2),
             "nash_equilibrium_reached": None,
             "nash_status": "skipped",
             "nash_iterations": 0,
             "nash_iteration_trace": [],
             "baseline_load_kwh": round(baseline_load, 4),
             "baseline_load_source": window_predicted_load_source(window),
-            "target_peak_reduction_pct": round(target_peak_reduction_pct(baseline_load, capacity_limit), 4),
+            "baseline_load_pct_of_q95": round(load_percentage(baseline_load, capacity_limit), 4),
+            "target_load_kwh": round(target_load, 4),
+            "target_load_pct_of_q95": round(load_percentage(target_load, capacity_limit), 4),
+            "medium_load_min_kwh": round(lower_load, 4),
+            "medium_load_max_kwh": round(upper_load, 4),
+            "target_peak_reduction_pct": round(target_peak_reduction_pct(baseline_load, upper_load), 4),
             "elasticity_factor": round(elasticity, 4),
             "capacity_limit_kwh": round(capacity_limit, 4),
             "capacity_limit_source": capacity_source,
             "expected_load_kwh": round(expected_load, 4),
-            "grid_safe": expected_load <= capacity_limit + 1e-9,
-            "user_tolerant": discomfort_score <= NASH_MAX_DISCOMFORT_SCORE + 1e-9,
+            "expected_load_pct_of_q95": round(load_percentage(expected_load, capacity_limit), 4),
+            "grid_safe": load_in_medium_band,
+            "load_in_medium_band": load_in_medium_band,
+            "historical_min_service_price": min_price,
+            "historical_max_service_price": max_price,
+            "recommended_service_price": recommended_price,
+            "predicted_service_price": recommended_price,
+            "price_bound_source": price_bound_source,
+            "price_within_historical_bounds": price_within_bounds,
+            "user_tolerant": price_within_bounds,
             "price_stable": None,
             "discomfort_score": round(discomfort_score, 4),
             "max_discomfort_score": NASH_MAX_DISCOMFORT_SCORE,
@@ -933,13 +1045,11 @@ def solve_nash_equilibrium_window(
     tolerance_pct = estimate_price_tolerance_pct(context, window)
     previous_shift = 0.0
     raw_shift = as_float(window.get("suggested_price_shift_pct"), 0)
-    required_reduction_pct = target_peak_reduction_pct(baseline_load, capacity_limit)
-    needed_shift = required_reduction_pct / elasticity if required_reduction_pct > 0 else 0.0
-    target_shift = max(raw_shift, needed_shift)
-    if required_reduction_pct <= 0 and raw_shift < 0:
-        target_shift = max(raw_shift, -tolerance_pct)
-    target_shift = max(-NASH_MAX_ABS_PRICE_SHIFT_PCT, min(NASH_MAX_ABS_PRICE_SHIFT_PCT, target_shift))
-    target_shift = max(-tolerance_pct, min(tolerance_pct, target_shift))
+    lower_load, upper_load = medium_load_bounds(capacity_limit)
+    target_load = target_medium_load(baseline_load, capacity_limit)
+    required_reduction_pct = target_peak_reduction_pct(baseline_load, upper_load)
+    target_shift = price_shift_to_medium_band(context, window, elasticity)
+    min_price, max_price, price_bound_source = historical_service_price_bounds(context, window)
     trace: list[dict[str, Any]] = []
     final_state: dict[str, Any] = {}
 
@@ -947,15 +1057,21 @@ def solve_nash_equilibrium_window(
         price_shift = round(target_shift, 4)
         expected_load = expected_load_after_price(baseline_load, price_shift, elasticity)
         discomfort_score = user_discomfort_score(price_shift, tolerance_pct)
-        grid_safe = expected_load <= capacity_limit + 1e-9
-        user_tolerant = discomfort_score <= NASH_MAX_DISCOMFORT_SCORE + 1e-9
+        recommended_price = service_price_after_shift(window, price_shift)
+        grid_safe = lower_load <= expected_load < upper_load
+        price_within_bounds = price_is_within_bounds(recommended_price, min_price, max_price)
+        user_tolerant = price_within_bounds
         price_stable = abs(price_shift - previous_shift) < NASH_PRICE_STABILITY_EPSILON_PCT
         final_state = {
             "iteration": iteration,
             "price_shift_pct": round(price_shift, 4),
             "expected_load_kwh": round(expected_load, 4),
+            "expected_load_pct_of_q95": round(load_percentage(expected_load, capacity_limit), 4),
             "grid_safe": grid_safe,
+            "load_in_medium_band": grid_safe,
             "user_tolerant": user_tolerant,
+            "recommended_service_price": recommended_price,
+            "price_within_historical_bounds": price_within_bounds,
             "price_stable": price_stable,
             "discomfort_score": round(discomfort_score, 4),
         }
@@ -970,22 +1086,51 @@ def solve_nash_equilibrium_window(
         and final_state.get("price_stable")
     )
     enriched = dict(window)
+    final_shift = round(float(final_state.get("price_shift_pct", target_shift)), 2)
     enriched.update(
         {
+            "model_action_label": window.get("action_label"),
+            "model_price_rationale": window.get("price_rationale"),
+            "action_label": final_price_action_label(final_shift),
+            "price_rationale": medium_target_price_rationale(
+                baseline_load,
+                capacity_limit,
+                final_shift,
+                min_price,
+                max_price,
+            ),
             "pre_nash_suggested_price_shift_pct": raw_shift,
-            "suggested_price_shift_pct": round(float(final_state.get("price_shift_pct", target_shift)), 2),
+            "suggested_price_shift_pct": final_shift,
             "nash_equilibrium_reached": reached,
             "nash_status": "reached" if reached else "not_reached",
             "nash_iterations": int(final_state.get("iteration", 0) or 0),
             "nash_iteration_trace": trace,
             "baseline_load_kwh": round(baseline_load, 4),
             "baseline_load_source": window_predicted_load_source(window),
+            "baseline_load_pct_of_q95": round(load_percentage(baseline_load, capacity_limit), 4),
+            "target_load_kwh": round(target_load, 4),
+            "target_load_pct_of_q95": round(load_percentage(target_load, capacity_limit), 4),
+            "medium_load_min_kwh": round(lower_load, 4),
+            "medium_load_max_kwh": round(upper_load, 4),
             "target_peak_reduction_pct": round(required_reduction_pct, 4),
             "elasticity_factor": round(elasticity, 4),
             "capacity_limit_kwh": round(capacity_limit, 4),
             "capacity_limit_source": capacity_source,
             "expected_load_kwh": round(float(final_state.get("expected_load_kwh", baseline_load)), 4),
+            "expected_load_pct_of_q95": round(
+                float(final_state.get("expected_load_pct_of_q95", load_percentage(baseline_load, capacity_limit))),
+                4,
+            ),
             "grid_safe": bool(final_state.get("grid_safe", False)),
+            "load_in_medium_band": bool(final_state.get("load_in_medium_band", False)),
+            "historical_min_service_price": min_price,
+            "historical_max_service_price": max_price,
+            "recommended_service_price": final_state.get("recommended_service_price"),
+            "predicted_service_price": final_state.get("recommended_service_price"),
+            "price_bound_source": price_bound_source,
+            "price_within_historical_bounds": bool(
+                final_state.get("price_within_historical_bounds", False)
+            ),
             "user_tolerant": bool(final_state.get("user_tolerant", False)),
             "price_stable": bool(final_state.get("price_stable", False)),
             "discomfort_score": round(float(final_state.get("discomfort_score", 0)), 4),
@@ -1029,6 +1174,17 @@ def average_price_shift(windows: list[dict[str, Any]], fallback: float) -> float
     return round(sum(values) / len(values), 2)
 
 
+def summarize_medium_target_schedule(
+    windows: list[dict[str, Any]],
+    average_shift_pct: float,
+) -> str:
+    return (
+        f"Final {len(windows)}-window service-price schedule applies an average "
+        f"{average_shift_pct:+.2f}% change to move or keep load in the 35%-80% Medium "
+        f"band, with each price constrained by its zone historical service-price range."
+    )
+
+
 def window_predicted_load(window: dict[str, Any]) -> float:
     for key in ("price_conditioned_baseline_load_kwh", "nash_baseline_load_kwh", "sum_predicted_kwh"):
         load = optional_float(window.get(key))
@@ -1064,6 +1220,128 @@ def target_peak_reduction_pct(load: float, capacity_limit: float) -> float:
     if load <= 0:
         return 0.0
     return max(0.0, ((load - capacity_limit) / load) * 100)
+
+
+def price_shift_to_medium_band(
+    context: dict[str, Any],
+    window: dict[str, Any],
+    elasticity: float,
+) -> float:
+    baseline_load = window_predicted_load(window)
+    reference_load, _ = capacity_limit_kwh(context, window)
+    if baseline_load <= 0 or reference_load <= 0 or elasticity <= 0:
+        return clamp_shift_to_historical_price_range(
+            context,
+            window,
+            as_float(window.get("suggested_price_shift_pct"), 0),
+        )
+
+    load_pct = load_percentage(baseline_load, reference_load)
+    stress = classify_load_percentage(load_pct)
+    target_load = target_medium_load(baseline_load, reference_load)
+    raw_shift = as_float(window.get("suggested_price_shift_pct"), 0)
+
+    if stress == MEDIUM_STRESS:
+        candidate = clamp(
+            raw_shift,
+            -NASH_MEDIUM_MAX_PRICE_SHIFT_PCT,
+            NASH_MEDIUM_MAX_PRICE_SHIFT_PCT,
+        )
+        expected_load = expected_load_after_price(baseline_load, candidate, elasticity)
+        lower_load, upper_load = medium_load_bounds(reference_load)
+        if not lower_load <= expected_load < upper_load:
+            candidate = 0.0
+    else:
+        candidate = ((1.0 - (target_load / baseline_load)) / elasticity) * 100.0
+
+    return clamp_shift_to_historical_price_range(context, window, candidate)
+
+
+def clamp_shift_to_historical_price_range(
+    context: dict[str, Any],
+    window: dict[str, Any],
+    shift_pct: float,
+) -> float:
+    current_price = optional_float(window.get("mean_service_price"))
+    min_price, max_price, _ = historical_service_price_bounds(context, window)
+    if current_price is None or current_price <= 0 or min_price is None or max_price is None:
+        return clamp(shift_pct, -NASH_MAX_ABS_PRICE_SHIFT_PCT, NASH_MAX_ABS_PRICE_SHIFT_PCT)
+    minimum_shift = ((min_price / current_price) - 1.0) * 100.0
+    maximum_shift = ((max_price / current_price) - 1.0) * 100.0
+    return clamp(shift_pct, minimum_shift, maximum_shift)
+
+
+def historical_service_price_bounds(
+    context: dict[str, Any],
+    window: dict[str, Any],
+) -> tuple[float | None, float | None, str]:
+    profile = context.get("profile") if isinstance(context.get("profile"), dict) else {}
+    minimum = first_positive_float(
+        window.get("historical_min_service_price"),
+        context.get("historical_min_service_price"),
+        profile.get("historical_min_service_price"),
+    )
+    maximum = first_positive_float(
+        window.get("historical_max_service_price"),
+        context.get("historical_max_service_price"),
+        profile.get("historical_max_service_price"),
+    )
+    if minimum is not None and maximum is not None and minimum <= maximum:
+        return minimum, maximum, "zone_historical_service_price_range"
+
+    current_price = optional_float(window.get("mean_service_price"))
+    if current_price is not None and current_price > 0:
+        return (
+            current_price * (1.0 - NASH_MAX_ABS_PRICE_SHIFT_PCT / 100.0),
+            current_price * (1.0 + NASH_MAX_ABS_PRICE_SHIFT_PCT / 100.0),
+            "fallback_current_service_price_plus_minus_25pct",
+        )
+    return None, None, "service_price_range_unavailable"
+
+
+def service_price_after_shift(window: dict[str, Any], shift_pct: float) -> float | None:
+    current_price = optional_float(window.get("mean_service_price"))
+    if current_price is None:
+        return None
+    return round(current_price * (1.0 + shift_pct / 100.0), 4)
+
+
+def price_is_within_bounds(
+    price: float | None,
+    minimum: float | None,
+    maximum: float | None,
+) -> bool:
+    if price is None or minimum is None or maximum is None:
+        return False
+    return minimum - 1e-9 <= price <= maximum + 1e-9
+
+
+def final_price_action_label(shift_pct: float) -> str:
+    if shift_pct > 0:
+        return "Raise price to reduce load toward Medium"
+    if shift_pct < 0:
+        return "Reduce price to increase load toward Medium"
+    return "Hold price in Medium load band"
+
+
+def medium_target_price_rationale(
+    load_kwh: float,
+    reference_load_kwh: float,
+    shift_pct: float,
+    minimum_price: float | None,
+    maximum_price: float | None,
+) -> str:
+    stress = classify_load_percentage(load_percentage(load_kwh, reference_load_kwh))
+    bounds = (
+        f"[{minimum_price:.4f}, {maximum_price:.4f}]"
+        if minimum_price is not None and maximum_price is not None
+        else "the available price range"
+    )
+    return (
+        f"{stress} load at {load_percentage(load_kwh, reference_load_kwh):.2f}% of historical "
+        f"3-hour Q95; apply {shift_pct:+.2f}% service-price change to move or keep load in "
+        f"the 35%-80% Medium band while keeping price within {bounds}."
+    )
 
 
 def estimate_elasticity_factor(

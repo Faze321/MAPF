@@ -19,11 +19,27 @@ from agents import (
 from config import AgentConfig, normalize_agent_mode, normalize_forecast_model_name
 from data_loader import build_zone_3h_load_quantiles, build_zone_profiles, load_pipeline_data
 from forecasting import DEFAULT_TIMESFM_EXOG_COLS, ForecastResult, forecast_zone
+from load_policy import (
+    EXTREMELY_HIGH_STRESS,
+    HIGH_MAX_LOAD_PCT,
+    HIGH_STRESS,
+    LOW_MAX_LOAD_PCT,
+    LOW_STRESS,
+    MEDIUM_MAX_LOAD_PCT,
+    MEDIUM_STRESS,
+    classify_load_percentage,
+    load_percentage,
+)
 from reporting import safe_filename, write_outputs
 from zone_selection import select_zone_categories
 
 
-STRESS_LEVEL_ORDER = {"Low": 0, "Medium": 1, "High": 2, "Extreme High": 3}
+STRESS_LEVEL_ORDER = {
+    LOW_STRESS: 0,
+    MEDIUM_STRESS: 1,
+    HIGH_STRESS: 2,
+    EXTREMELY_HIGH_STRESS: 3,
+}
 ERROR_CODE_BY_STAGE = {
     "zone_selection": "MAPF-E010",
     "load_data": "MAPF-E020",
@@ -475,6 +491,7 @@ def run_experiment_matrix(
                                 )
                             )
                             record["completed_at"] = pd.Timestamp.now().isoformat()
+                            raise
                         finally:
                             cache_attempted = True
                             run_records.append(record)
@@ -691,6 +708,26 @@ def classify_experiment_error(exc: Exception) -> dict[str, str]:
         "error_type": type(source).__name__,
         "error_message": str(source),
     }
+
+
+def format_failure_message(exc: Exception) -> str:
+    details = classify_experiment_error(exc)
+    lines = [
+        "Execution stopped because an error occurred.",
+        f"error_code: {details['error_code']}",
+        f"stage: {details['error_stage']}",
+    ]
+    if details["error_zone_id"]:
+        lines.append(f"zone_id: {details['error_zone_id']}")
+    if details["error_agent"]:
+        lines.append(f"agent: {details['error_agent']}")
+    lines.extend(
+        [
+            f"error_type: {details['error_type']}",
+            f"reason: {details['error_message']}",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def write_error_traceback(
@@ -1031,16 +1068,31 @@ def apply_precomputed_window_data(
     updated_reports: list[dict[str, Any]] = []
     passthrough_fields = (
         "load_stress_level",
+        "load_pct_of_q95",
+        "actual_load_pct_of_q95",
         "price_conditioned_load_stress_level",
         "load_3h_q95_kwh",
+        "load_low_max_pct",
+        "load_medium_max_pct",
+        "load_high_max_pct",
+        "historical_min_service_price",
+        "historical_max_service_price",
         "nash_equilibrium_reached",
         "nash_status",
         "nash_iterations",
         "target_peak_reduction_pct",
+        "baseline_load_pct_of_q95",
+        "target_load_kwh",
+        "target_load_pct_of_q95",
+        "medium_load_min_kwh",
+        "medium_load_max_kwh",
         "elasticity_factor",
         "capacity_limit_kwh",
         "capacity_limit_source",
         "expected_load_kwh",
+        "expected_load_pct_of_q95",
+        "load_in_medium_band",
+        "price_within_historical_bounds",
         "grid_safe",
         "user_tolerant",
         "price_stable",
@@ -1055,6 +1107,8 @@ def apply_precomputed_window_data(
         "grid_safe",
         "user_tolerant",
         "price_stable",
+        "load_in_medium_band",
+        "price_within_historical_bounds",
     }
 
     for report in reports:
@@ -1288,7 +1342,11 @@ def apply_price_conditioned_baseline_forecasts(
             lstm_roll_actuals=False,
             lstm_seed=lstm_seed,
         )
-        thresholds = load_stress_thresholds(thresholds_by_zone, zone_id)
+        thresholds = load_stress_thresholds(
+            thresholds_by_zone,
+            zone_id,
+            profile=profiles_by_zone.loc[zone_id].to_dict(),
+        )
         conditioned_windows = build_pricing_windows_3h(
             conditioned_result.hourly,
             stress_thresholds=thresholds,
@@ -1337,9 +1395,9 @@ def service_price_with_predicted_windows(
 
 def predicted_service_price(window: dict[str, Any]) -> float | None:
     base_price = optional_number(window.get("mean_service_price"))
-    shift_pct = optional_number(window.get("pre_nash_suggested_price_shift_pct"))
+    shift_pct = optional_number(window.get("suggested_price_shift_pct"))
     if shift_pct is None:
-        shift_pct = optional_number(window.get("suggested_price_shift_pct"))
+        shift_pct = optional_number(window.get("pre_nash_suggested_price_shift_pct"))
     if base_price is None or shift_pct is None:
         return None
     return round(base_price * (1 + shift_pct / 100), 4)
@@ -1447,7 +1505,11 @@ def build_contexts(
     for row in selected_zones.to_dict(orient="records"):
         zone_id = str(row["zone_id"])
         profile = profiles_by_zone.loc[zone_id].to_dict()
-        zone_stress_thresholds = load_stress_thresholds(stress_thresholds_by_zone, zone_id)
+        zone_stress_thresholds = load_stress_thresholds(
+            stress_thresholds_by_zone,
+            zone_id,
+            profile=profile,
+        )
         try:
             raw_result = forecast_zone(
                 zone_id=zone_id,
@@ -1518,7 +1580,17 @@ def build_contexts(
     return contexts, forecast_results
 
 
-def load_stress_thresholds(quantiles_by_zone: pd.DataFrame, zone_id: str) -> dict[str, Any]:
+def load_stress_thresholds(
+    quantiles_by_zone: pd.DataFrame,
+    zone_id: str,
+    *,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    profile = profile or {}
+    price_fields = {
+        "historical_min_service_price": safe_float(profile.get("historical_min_service_price")),
+        "historical_max_service_price": safe_float(profile.get("historical_max_service_price")),
+    }
     if zone_id not in quantiles_by_zone.index:
         return {
             "available": False,
@@ -1528,8 +1600,14 @@ def load_stress_thresholds(quantiles_by_zone: pd.DataFrame, zone_id: str) -> dic
             "q50": 0.0,
             "q80": 0.0,
             "q95": 0.0,
+            "reference_load_kwh": 0.0,
+            "low_max_pct": LOW_MAX_LOAD_PCT,
+            "medium_max_pct": MEDIUM_MAX_LOAD_PCT,
+            "high_max_pct": HIGH_MAX_LOAD_PCT,
+            **price_fields,
         }
     row = quantiles_by_zone.loc[zone_id]
+    q95 = safe_float(row.get("load_3h_q95_kwh"))
     return {
         "available": True,
         "source_file": str(row.get("stress_source_file", "volume.csv")),
@@ -1537,24 +1615,20 @@ def load_stress_thresholds(quantiles_by_zone: pd.DataFrame, zone_id: str) -> dic
         "historical_windows": int(row.get("historical_3h_windows", 0) or 0),
         "q50": safe_float(row.get("load_3h_q50_kwh")),
         "q80": safe_float(row.get("load_3h_q80_kwh")),
-        "q95": safe_float(row.get("load_3h_q95_kwh")),
+        "q95": q95,
+        "reference_load_kwh": q95,
+        "low_max_pct": LOW_MAX_LOAD_PCT,
+        "medium_max_pct": MEDIUM_MAX_LOAD_PCT,
+        "high_max_pct": HIGH_MAX_LOAD_PCT,
+        **price_fields,
     }
 
 
 def classify_load_stress(load_value: Any, thresholds: dict[str, Any]) -> str:
     if not thresholds.get("available", True):
-        return "Low"
-    try:
-        load = float(load_value)
-    except (TypeError, ValueError):
-        load = 0.0
-    if load > float(thresholds.get("q95", 0.0)):
-        return "Extreme High"
-    if load > float(thresholds.get("q80", 0.0)):
-        return "High"
-    if load > float(thresholds.get("q50", 0.0)):
-        return "Medium"
-    return "Low"
+        return LOW_STRESS
+    reference_load = thresholds.get("reference_load_kwh") or thresholds.get("q95", 0.0)
+    return classify_load_percentage(load_percentage(load_value, reference_load))
 
 
 def apply_load_quantile_stress(
@@ -1565,16 +1639,23 @@ def apply_load_quantile_stress(
     updated = dict(summary)
     stress_loads = [safe_float(window.get("sum_predicted_kwh")) for window in pricing_windows_3h]
     stress_load = max(stress_loads) if stress_loads else 0.0
+    stress_percentages = [safe_float(window.get("load_pct_of_q95")) for window in pricing_windows_3h]
     window_levels = [window.get("load_stress_level") for window in pricing_windows_3h]
     updated["grid_stress_level"] = max_stress_level(window_levels) if window_levels else classify_load_stress(stress_load, thresholds)
-    updated["grid_stress_basis"] = "forecast_3h_sum_predicted_kwh_vs_zone_volume_csv_3h_load_quantiles"
+    updated["grid_stress_basis"] = "forecast_3h_sum_predicted_kwh_as_pct_of_zone_historical_3h_q95"
     updated["grid_stress_load_kwh"] = stress_load
+    updated["grid_stress_load_pct_of_q95"] = max(stress_percentages) if stress_percentages else 0.0
     updated["grid_stress_source_file"] = thresholds.get("source_file", "volume.csv")
     updated["grid_stress_window_hours"] = thresholds.get("window_hours", 3)
     updated["grid_stress_historical_windows"] = thresholds.get("historical_windows", 0)
     updated["grid_stress_q50_kwh"] = thresholds.get("q50", 0.0)
     updated["grid_stress_q80_kwh"] = thresholds.get("q80", 0.0)
     updated["grid_stress_q95_kwh"] = thresholds.get("q95", 0.0)
+    updated["load_low_max_pct"] = thresholds.get("low_max_pct", LOW_MAX_LOAD_PCT)
+    updated["load_medium_max_pct"] = thresholds.get("medium_max_pct", MEDIUM_MAX_LOAD_PCT)
+    updated["load_high_max_pct"] = thresholds.get("high_max_pct", HIGH_MAX_LOAD_PCT)
+    updated["historical_min_service_price"] = thresholds.get("historical_min_service_price", 0.0)
+    updated["historical_max_service_price"] = thresholds.get("historical_max_service_price", 0.0)
     updated.update(stress_evaluation_metrics(pricing_windows_3h))
     return updated
 
@@ -1733,6 +1814,24 @@ def build_pricing_windows_3h(
             window["load_3h_q50_kwh"] = stress_thresholds.get("q50", 0.0)
             window["load_3h_q80_kwh"] = stress_thresholds.get("q80", 0.0)
             window["load_3h_q95_kwh"] = stress_thresholds.get("q95", 0.0)
+            reference_load = stress_thresholds.get("reference_load_kwh") or stress_thresholds.get("q95", 0.0)
+            window["load_pct_of_q95"] = round(load_percentage(stress_load, reference_load), 4)
+            window["actual_load_pct_of_q95"] = (
+                round(load_percentage(actual_stress_load, reference_load), 4)
+                if actual_stress_load is not None
+                else None
+            )
+            window["load_low_max_pct"] = stress_thresholds.get("low_max_pct", LOW_MAX_LOAD_PCT)
+            window["load_medium_max_pct"] = stress_thresholds.get("medium_max_pct", MEDIUM_MAX_LOAD_PCT)
+            window["load_high_max_pct"] = stress_thresholds.get("high_max_pct", HIGH_MAX_LOAD_PCT)
+            window["historical_min_service_price"] = stress_thresholds.get(
+                "historical_min_service_price",
+                0.0,
+            )
+            window["historical_max_service_price"] = stress_thresholds.get(
+                "historical_max_service_price",
+                0.0,
+            )
         windows.append(window)
     return windows
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 from config import (
@@ -12,7 +13,7 @@ from config import (
     normalize_int_list,
     normalize_string_list,
 )
-from orchestrator import run_experiment_matrix, run_pipeline
+from orchestrator import format_failure_message, run_experiment_matrix, run_pipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -242,5 +243,14 @@ def main(argv: list[str] | None = None):
         print(f"- {name}: {path}")
 
 
+def cli(argv: list[str] | None = None) -> int:
+    try:
+        main(argv)
+    except Exception as exc:
+        print(format_failure_message(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(cli())

@@ -9,7 +9,7 @@ This project implements the conference-work requirement in `Conference work.docx
    - Behavioural Agent: explain the demand drivers from POI mix, weather, time markers, and estimate a price-response elasticity factor.
    - Market Economist: prescribe a service-fee shift from stress, elasticity, and price context.
    - Price-conditioned Forecaster: rerun the forecaster with predicted service prices plus observed weather, occupancy, and energy-price conditions to estimate the current load baseline.
-   - Nash Equilibrium Check: test the price-conditioned baseline against Q95 grid capacity, user tolerance, and price stability for each 3-hour window.
+   - Nash Equilibrium Check: test whether each price-conditioned baseline can be moved into the Medium load band while respecting the zone's historical service-price range and price stability.
 4. Execute all five zone chains concurrently with `asyncio`.
 5. Export an explainability table with predicted vs. actual load, rationale, price shift, and Nash equilibrium status.
 
@@ -68,13 +68,30 @@ For broader experimental validation, set `run.forecast_starts` and `run.forecast
 
 Experiment matrices can also sweep `run.experiment_seeds`, `run.agent_modes`, and `run.diurnal_blend_alphas`. Seeds are recorded for every model and passed into LSTM training. `agent_modes` supports `agents` for the full three-stage LLM chain with Nash equilibrium, `agents_no_nash` for the same chain without the Nash equilibrium adjustment, `single_model` for one stronger model call that replaces the Grid/Behaviour/Economist calls, and `rules` for the deterministic rule-only pricing baseline. This lets `price_accuracy`, price bias, `stress_accuracy`, and `miss_stress_rate` be compared directly across ablations. `diurnal_blend_alphas` applies the same daily-shape blend weight to TimesFM, Chronos, LSTM, and AR for fair blend ablations.
 
+Runs are fail-fast. The first exception stops the current single run or experiment matrix immediately, prints the error code, stage, zone, agent, exception type, and original reason, and exits with status 1. Experiment matrices still save the failed row in `experiment_runs.csv` and a traceback under the experiment `errors/` directory before stopping.
+
 For `single_model`, configure a dedicated model under `agent.single_model_model`. The normal three-stage `agents` mode continues to use `agent.model`; `--model` still overrides the active model for one command-line run.
 
 ```yaml
 agent:
   model: "meta-llama/llama-3.1-8b-instruct"
   single_model_model: "meta-llama/llama-3.3-70b-instruct"
+  reasoning_effort: "none"
 ```
+
+`agent.reasoning_effort: "none"` disables model thinking for JSON-mode requests. This is required by Qwen3 providers that reject `response_format: json_object` while thinking is enabled. The client omits this parameter automatically for `meta-llama/*` models, which do not use Qwen3-style switchable thinking.
+
+## Load And Pricing Policy
+
+For each 3-hour window, the load percentage is:
+
+```text
+load_pct_of_q95 = predicted_3h_load_kwh / zone_historical_3h_Q95_load_kwh * 100
+```
+
+The stress labels use fixed percentage boundaries: below 35% is `Low`, 35% to below 80% is `Medium`, 80% to below 90% is `High`, and 90% or above is `Extremely High`. Historical Q50 and Q80 values remain available as diagnostics but do not define these labels.
+
+The pricing controller targets the interior of the Medium band. For Low load it reduces service price and targets 35.5% of Q95. For Medium load it permits at most a small +/-3% change, and rejects that change if it would move expected load outside Medium. For High and Extremely High load it increases service price and targets 79.5% of Q95; the larger distance from the target makes the Extremely High increase larger under the same elasticity and price conditions. Every final service price is clamped to the positive minimum and maximum `s_price` observed over that zone's full history. If the historical price range is too narrow to reach Medium, the output is marked `nash_status: not_reached` rather than violating the price bound.
 
 Multi-value runs execute the full forecast-start by forecaster by seed by agent-mode by blend matrix while keeping each combination in a separate folder under `output/experiments/`, for example `output/experiments/20zonesx4timesx3modes_11blends/2022-09-09_000000/seed_42/agent_rules/blend_0_3/lstm/`. The experiment root writes raw concatenated tables plus aggregate summaries with `n`, `mean`, `std`, and `sem`: `experiment_forecast_summary.csv`, `experiment_price_summary.csv`, `experiment_rationale_summary.csv`, and `experiment_decision_quality_summary.csv`.
 
@@ -106,9 +123,9 @@ Generated result files are written under a forecast-model subfolder, for example
 - `rationale_trace.md`: markdown table for a report or paper appendix.
 - `rationale_trace.json`: full structured agent outputs, including per-agent call usage details under `agent_call_usage`.
 - `agent_debug_outputs.json`: full debug payloads for model-backed agent calls, including economist repair details or single-model responses.
-- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, `predicted_service_price`, `actual_service_price`, `actual_energy_price`, stress labels, price rationales, price-conditioned baseline diagnostics (`forecaster_input_predicted_service_price`, `price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, `baseline_load_source`), and Nash equilibrium diagnostics (`expected_load_kwh`, `capacity_limit_kwh`, `elasticity_factor`, `grid_safe`, `user_tolerant`, and `price_stable`). The Nash capacity limit is the zone's historical 3-hour Q95 load threshold.
+- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, `predicted_service_price`, `actual_service_price`, `actual_energy_price`, stress labels, and price rationales. Policy diagnostics include `load_pct_of_q95`, `actual_load_pct_of_q95`, the 35/80/90 boundaries, `historical_min_service_price`, `historical_max_service_price`, `target_load_kwh`, `expected_load_pct_of_q95`, `load_in_medium_band`, and `price_within_historical_bounds`. Price-conditioned baseline fields include `forecaster_input_predicted_service_price`, `price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, and `baseline_load_source`. `capacity_limit_kwh` remains the zone's historical 3-hour Q95 reference load.
 - `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when `predicted_service_price` is within 8% of `actual_service_price`.
-- `window_load_price_cache.csv`: stable per-window replay input containing the original load forecast, the load forecast conditioned on predicted service price, the final predicted service price, and the Nash diagnostics needed to reproduce the window result.
+- `window_load_price_cache.csv`: stable per-window replay input containing the original load forecast, the load forecast conditioned on predicted service price, the final predicted service price, actual service and energy prices, load percentages, historical service-price bounds, and the Nash diagnostics needed to reproduce the window result.
 - `explainability_rubric.md`: five-criterion human evaluation rubric for rationale quality.
 - `explainability_review_packet.csv`: review template for two independent raters plus an operator sanity-check column.
 - `forecast_metrics.csv` / `forecast_metrics.md`: per-zone forecast metrics including MAE, RMSE, MAPE, RAE, and WAPE.

@@ -58,6 +58,24 @@ def build_zone_profiles(
     if profile_cache.exists() and not force_cache and max_poi_rows is None:
         cached = pd.read_csv(profile_cache, dtype={"zone_id": str})
         if "load_source_file" in cached.columns and (cached["load_source_file"] == LOAD_FILE).all():
+            price_bound_columns = {
+                "historical_min_service_price",
+                "historical_max_service_price",
+            }
+            if not price_bound_columns.issubset(cached.columns):
+                price = read_time_matrix(data_dir / "s_price.csv")
+                price_zone_ids = [str(col) for col in price.columns if col != "time"]
+                price_features = compute_price_features(price, price_zone_ids)
+                update_columns = [
+                    "mean_service_price",
+                    "service_price_std",
+                    "historical_min_service_price",
+                    "historical_max_service_price",
+                ]
+                cached = cached.drop(
+                    columns=[column for column in update_columns if column in cached.columns]
+                ).merge(price_features, on="zone_id", how="left")
+                cached.to_csv(profile_cache, index=False)
             return cached
 
     zone_ids = available_zone_ids(data_dir)
@@ -241,6 +259,8 @@ def compute_price_features(price: pd.DataFrame, zone_ids: list[str]) -> pd.DataF
     features = pd.DataFrame({"zone_id": zone_ids})
     features["mean_service_price"] = values.mean().fillna(0).to_numpy()
     features["service_price_std"] = values.std().fillna(0).to_numpy()
+    features["historical_min_service_price"] = values.min().fillna(0).to_numpy()
+    features["historical_max_service_price"] = values.max().fillna(0).to_numpy()
     return features
 
 

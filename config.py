@@ -157,6 +157,7 @@ class AgentConfig:
     base_url: str
     model: str
     single_model_model: str | None = None
+    reasoning_effort: str = "none"
     http_referer: str | None = None
     title: str | None = None
     timeout_seconds: float = 90.0
@@ -192,6 +193,7 @@ class AgentConfig:
             model=model or optional_str(settings.get("model")) or "meta-llama/llama-3.1-8b-instruct",
             single_model_model=optional_str(settings.get("single_model_model"))
             or optional_str(single_model_settings.get("model")),
+            reasoning_effort=optional_str(settings.get("reasoning_effort")) or "none",
             http_referer=optional_str(settings.get("http_referer")),
             title=optional_str(settings.get("title")) or "MAPF UrbanEV",
             timeout_seconds=float(settings.get("timeout_seconds", 90)),

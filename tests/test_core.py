@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import unittest
 import tempfile
@@ -15,19 +16,27 @@ from agents import (
     AgentChatClient,
     AgentStageError,
     capacity_limit_kwh,
+    completion_message_content,
     extract_json_object,
     heuristic_behavior,
     heuristic_economist,
     merge_economist_fallback,
     merge_grid_fallback,
     normalize_price_windows,
+    price_shift_to_medium_band,
+    reasoning_extra_body,
     run_zone_chain,
     solve_nash_equilibrium_window,
     validate_economist_report,
     window_predicted_load,
 )
 from config import AgentConfig, AppConfig, RunConfig, normalize_agent_mode
-from data_loader import available_zone_ids, build_zone_3h_load_quantiles, load_pipeline_data
+from data_loader import (
+    available_zone_ids,
+    build_zone_3h_load_quantiles,
+    compute_price_features,
+    load_pipeline_data,
+)
 from forecasting import (
     ForecastResult,
     ar_forecast,
@@ -48,16 +57,19 @@ from orchestrator import (
     classify_load_stress,
     attach_price_conditioned_baselines,
     ensure_service_price_exog_cols,
+    format_failure_message,
     forecast_output_dir,
     load_precomputed_window_data,
     normalize_zone_ids,
     partition_precomputed_contexts,
+    PipelineStageError,
     run_experiment_matrix,
     select_agent_config_for_mode,
     select_representative_zone_ids,
     select_requested_zones,
     service_price_with_predicted_windows,
 )
+from main import cli
 from prompts import compact_economist_context, economist_prompt, grid_prompt
 from reporting import (
     build_price_comparison_summary,
@@ -116,6 +128,64 @@ class AgentParsingTests(unittest.TestCase):
             {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10},
         )
         self.assertEqual(fake_client.chat.completions.kwargs["response_format"], {"type": "json_object"})
+        self.assertEqual(
+            fake_client.chat.completions.kwargs["extra_body"],
+            {"reasoning": {"effort": "none"}},
+        )
+
+    def test_agent_client_reports_provider_error_when_choices_are_missing(self):
+        class Response:
+            choices = None
+            model_extra = {
+                "error": {
+                    "code": 503,
+                    "message": "No available provider for the requested model",
+                }
+            }
+
+        with self.assertRaises(RuntimeError) as raised:
+            completion_message_content(Response(), requested_model="qwen/qwen3-14b")
+
+        message = str(raised.exception)
+        self.assertIn("returned no completion choices", message)
+        self.assertIn("model qwen/qwen3-14b", message)
+        self.assertIn("provider_error_code=503", message)
+        self.assertIn("No available provider", message)
+
+    def test_reasoning_parameter_is_omitted_for_meta_llama(self):
+        qwen_config = AgentConfig(
+            api_key="sk-test",
+            base_url="https://openrouter.ai/api/v1",
+            model="qwen/qwen3-14b",
+            reasoning_effort="none",
+        )
+        llama_config = AgentConfig(
+            api_key="sk-test",
+            base_url="https://openrouter.ai/api/v1",
+            model="meta-llama/llama-3.3-70b-instruct",
+            reasoning_effort="none",
+        )
+
+        self.assertEqual(reasoning_extra_body(qwen_config), {"reasoning": {"effort": "none"}})
+        self.assertIsNone(reasoning_extra_body(llama_config))
+
+    def test_agent_client_rejects_empty_completion_content(self):
+        response = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "refusal": "Request could not be completed",
+                    }
+                }
+            ]
+        }
+
+        with self.assertRaises(RuntimeError) as raised:
+            completion_message_content(response, requested_model="fake-model")
+
+        self.assertIn("empty completion content", str(raised.exception))
+        self.assertIn("Request could not be completed", str(raised.exception))
 
     def test_extracts_json_from_markdown_fence(self):
         payload = extract_json_object('```json\n{"a": 1, "b": "x"}\n```')
@@ -139,7 +209,7 @@ class AgentParsingTests(unittest.TestCase):
         )
         self.assertEqual(
             merge_grid_fallback({"grid_stress_level": "extrame high"}, context)["grid_stress_level"],
-            "Extreme High",
+            "Extremely High",
         )
 
     def test_heuristic_economist_returns_three_hour_price_windows(self):
@@ -247,8 +317,8 @@ class AgentParsingTests(unittest.TestCase):
 
         self.assertFalse(window["nash_equilibrium_reached"])
         self.assertEqual(window["capacity_limit_source"], "load_3h_q95_kwh")
-        self.assertAlmostEqual(window["target_peak_reduction_pct"], 25.0)
-        self.assertLessEqual(window["suggested_price_shift_pct"], window["max_discomfort_score"] * 15.0)
+        self.assertAlmostEqual(window["target_peak_reduction_pct"], 40.0)
+        self.assertEqual(window["suggested_price_shift_pct"], 25.0)
         self.assertFalse(window["grid_safe"])
         self.assertTrue(window["user_tolerant"])
         self.assertTrue(window["price_stable"])
@@ -286,9 +356,73 @@ class AgentParsingTests(unittest.TestCase):
         )
 
         self.assertTrue(window["nash_equilibrium_reached"])
-        self.assertEqual(window["suggested_price_shift_pct"], -10.0)
+        self.assertEqual(window["suggested_price_shift_pct"], -3.0)
+        self.assertTrue(window["load_in_medium_band"])
         self.assertNotIn("economic_feasible", window)
         self.assertNotIn("economic_feasible", window["nash_iteration_trace"][-1])
+
+    def test_load_policy_moves_each_tier_toward_medium(self):
+        context = {
+            "profile": {
+                "historical_min_service_price": 0.5,
+                "historical_max_service_price": 3.0,
+            }
+        }
+
+        def shift(load, suggested=0.0):
+            return price_shift_to_medium_band(
+                context,
+                {
+                    "sum_predicted_kwh": load,
+                    "load_3h_q95_kwh": 100.0,
+                    "mean_service_price": 1.0,
+                    "suggested_price_shift_pct": suggested,
+                },
+                elasticity=0.5,
+            )
+
+        low_shift = shift(30.0)
+        medium_shift = shift(60.0, suggested=10.0)
+        high_shift = shift(85.0)
+        extremely_high_shift = shift(100.0)
+
+        self.assertLess(low_shift, 0.0)
+        self.assertEqual(medium_shift, 3.0)
+        self.assertGreater(high_shift, 0.0)
+        self.assertGreater(extremely_high_shift, high_shift)
+
+        low_window = solve_nash_equilibrium_window(
+            context,
+            {"elasticity_factor": 0.5},
+            {
+                "sum_predicted_kwh": 30.0,
+                "load_3h_q95_kwh": 100.0,
+                "mean_service_price": 1.0,
+                "suggested_price_shift_pct": 0.0,
+            },
+        )
+        self.assertTrue(low_window["load_in_medium_band"])
+        self.assertGreaterEqual(low_window["expected_load_pct_of_q95"], 35.0)
+
+    def test_load_policy_clamps_service_price_to_zone_history(self):
+        shift = price_shift_to_medium_band(
+            {
+                "profile": {
+                    "historical_min_service_price": 0.9,
+                    "historical_max_service_price": 1.1,
+                }
+            },
+            {
+                "sum_predicted_kwh": 100.0,
+                "load_3h_q95_kwh": 100.0,
+                "mean_service_price": 1.0,
+                "suggested_price_shift_pct": 40.0,
+            },
+            elasticity=0.5,
+        )
+
+        self.assertAlmostEqual(shift, 10.0)
+        self.assertAlmostEqual(1.0 * (1 + shift / 100.0), 1.1)
 
     def test_run_zone_chain_repairs_invalid_economist_response(self):
         class FakeClient:
@@ -367,8 +501,11 @@ class AgentParsingTests(unittest.TestCase):
         }
         report = asyncio.run(run_zone_chain(context, client=client, temperature=0.2))
         self.assertEqual(len(client.prompts), 4)
-        self.assertEqual(report["action_label"], "Raise price")
-        self.assertEqual(report["price_change_windows_3h"][0]["action_label"], "Raise price")
+        self.assertEqual(report["action_label"], "Raise price to reduce load toward Medium")
+        self.assertEqual(
+            report["price_change_windows_3h"][0]["action_label"],
+            "Raise price to reduce load toward Medium",
+        )
         self.assertNotIn("MODEL_RESPONSE_FAILED", report["price_rationale"])
         debug = report[ECONOMIST_AGENT_OUTPUT_KEY]
         self.assertEqual(debug["zone_id"], "102")
@@ -425,7 +562,8 @@ class AgentParsingTests(unittest.TestCase):
         self.assertEqual(report["source"], "test_no_nash")
         self.assertEqual(window["nash_status"], "skipped")
         self.assertIsNone(window["nash_equilibrium_reached"])
-        self.assertEqual(window["suggested_price_shift_pct"], 11.0)
+        self.assertGreater(window["suggested_price_shift_pct"], 0.0)
+        self.assertLessEqual(window["suggested_price_shift_pct"], 25.0)
         self.assertEqual(report["nash_equilibrium_summary"], "Nash equilibrium skipped for 1 pricing windows")
 
     def test_single_model_mode_uses_one_agent_call(self):
@@ -550,6 +688,10 @@ class AgentParsingTests(unittest.TestCase):
                                 "sum_actual_kwh": 24.0,
                                 "mean_service_price": 1.0,
                                 "mean_energy_price": 0.5,
+                                "load_pct_of_q95": 75.0,
+                                "actual_load_pct_of_q95": 60.0,
+                                "historical_min_service_price": 0.8,
+                                "historical_max_service_price": 1.4,
                                 "actual_stress_load_3h_kwh": 24.0,
                                 "price_conditioned_baseline_load_kwh": 27.0,
                                 "price_conditioned_mean_predicted_kwh": 9.0,
@@ -581,6 +723,10 @@ class AgentParsingTests(unittest.TestCase):
             self.assertIn("actual_service_price", price_schedule.columns)
             self.assertIn("actual_energy_price", price_schedule.columns)
             self.assertIn("predicted_service_price", price_schedule.columns)
+            self.assertEqual(price_schedule.loc[0, "load_pct_of_q95"], 75.0)
+            self.assertEqual(price_schedule.loc[0, "actual_load_pct_of_q95"], 60.0)
+            self.assertEqual(price_schedule.loc[0, "historical_min_service_price"], 0.8)
+            self.assertEqual(price_schedule.loc[0, "historical_max_service_price"], 1.4)
             self.assertNotIn("mean_predicted_kwh", price_schedule.columns)
             self.assertNotIn("actual_stress_load_3h_kwh", price_schedule.columns)
             window_cache = pd.read_csv(outputs["window_load_price_cache_csv"])
@@ -589,6 +735,9 @@ class AgentParsingTests(unittest.TestCase):
             self.assertEqual(window_cache.loc[0, "forecast_load_kwh"], 30.0)
             self.assertEqual(window_cache.loc[0, "price_conditioned_load_kwh"], 27.0)
             self.assertEqual(window_cache.loc[0, "predicted_service_price"], 1.1)
+            self.assertEqual(window_cache.loc[0, "actual_load_pct_of_q95"], 60.0)
+            self.assertEqual(window_cache.loc[0, "historical_min_service_price"], 0.8)
+            self.assertEqual(window_cache.loc[0, "historical_max_service_price"], 1.4)
 
     def test_reuses_complete_precomputed_window_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -675,7 +824,7 @@ class AgentParsingTests(unittest.TestCase):
             "predicted_change_pct": 5.0,
             "grid_stress_level": "High",
             "actual_total_kwh": 120.0,
-            "actual_grid_stress_level": "Extreme High",
+            "actual_grid_stress_level": "Extremely High",
             "hourly_averages": {
                 "mean_predicted_kwh": 10.0,
                 "mean_actual_kwh": 12.0,
@@ -688,8 +837,8 @@ class AgentParsingTests(unittest.TestCase):
                     "window_end": "2022-09-09 02:00:00",
                     "sum_predicted_kwh": 60.0,
                     "sum_actual_kwh": 90.0,
-                    "actual_load_stress_level": "Extreme High",
-                    "actual_grid_stress_level": "Extreme High",
+                    "actual_load_stress_level": "Extremely High",
+                    "actual_grid_stress_level": "Extremely High",
                     "actual_stress_load_3h_kwh": 90.0,
                     "stress_correct": False,
                     "stress_missed": True,
@@ -764,6 +913,24 @@ class AgentParsingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_cli_stops_and_prints_failure_reason(self):
+        failure = PipelineStageError(
+            stage="forecast",
+            zone_id="102",
+            original=ValueError("forecast input is empty"),
+        )
+        with patch("main.main", side_effect=failure), patch("sys.stderr", new_callable=io.StringIO) as stderr:
+            exit_code = cli([])
+
+        self.assertEqual(exit_code, 1)
+        message = stderr.getvalue()
+        self.assertIn("Execution stopped because an error occurred.", message)
+        self.assertIn("error_code: MAPF-E100", message)
+        self.assertIn("stage: forecast", message)
+        self.assertIn("zone_id: 102", message)
+        self.assertIn("error_type: ValueError", message)
+        self.assertIn("reason: forecast input is empty", message)
+
     def test_reads_agent_yaml_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.yaml"
@@ -774,6 +941,7 @@ agent:
   base_url: "https://openrouter.ai/api/v1"
   model: "meta-llama/llama-3.1-8b-instruct"
   single_model_model: "meta-llama/llama-3.3-70b-instruct"
+  reasoning_effort: "none"
   timeout_seconds: 90
 """.strip(),
                 encoding="utf-8",
@@ -782,6 +950,7 @@ agent:
             self.assertEqual(config.api_key, "sk-test")
             self.assertEqual(config.model, "meta-llama/llama-3.1-8b-instruct")
             self.assertEqual(config.single_model_model, "meta-llama/llama-3.3-70b-instruct")
+            self.assertEqual(config.reasoning_effort, "none")
             self.assertEqual(config.timeout_seconds, 90)
 
     def test_reads_run_yaml_config(self):
@@ -1221,24 +1390,24 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(averages["mean_predicted_kwh"], 9.5)
         self.assertEqual(len(windows), 2)
         self.assertEqual(windows[0]["sum_predicted_kwh"], 36.0)
-        self.assertEqual(windows[0]["load_stress_level"], "High")
+        self.assertEqual(windows[0]["load_stress_level"], "Extremely High")
         self.assertEqual(windows[0]["sum_actual_kwh"], 42.0)
-        self.assertEqual(windows[0]["actual_load_stress_level"], "Extreme High")
-        self.assertFalse(windows[0]["stress_correct"])
-        self.assertTrue(windows[0]["stress_missed"])
+        self.assertEqual(windows[0]["actual_load_stress_level"], "Extremely High")
+        self.assertTrue(windows[0]["stress_correct"])
+        self.assertFalse(windows[0]["stress_missed"])
         summary = apply_load_quantile_stress(
             {"forecast_peak_kwh": 14.0},
             {"available": True, "q50": 25.0, "q80": 35.0, "q95": 40.0},
             windows,
         )
-        self.assertEqual(summary["grid_stress_level"], "High")
-        self.assertEqual(summary["actual_grid_stress_level"], "Extreme High")
+        self.assertEqual(summary["grid_stress_level"], "Extremely High")
+        self.assertEqual(summary["actual_grid_stress_level"], "Extremely High")
         self.assertEqual(summary["stress_eval_windows"], 2)
-        self.assertEqual(summary["stress_miss_count"], 1)
-        self.assertAlmostEqual(summary["stress_accuracy"], 0.5)
-        self.assertAlmostEqual(summary["miss_stress_rate"], 0.5)
+        self.assertEqual(summary["stress_miss_count"], 0)
+        self.assertAlmostEqual(summary["stress_accuracy"], 1.0)
+        self.assertAlmostEqual(summary["miss_stress_rate"], 0.0)
 
-    def test_price_conditioned_service_price_uses_pre_nash_shift(self):
+    def test_price_conditioned_service_price_uses_final_shift(self):
         times = pd.date_range("2022-09-09", periods=4, freq="h")
         service_price = pd.DataFrame({"time": times, "102": [1.0, 1.0, 1.0, 1.0]})
 
@@ -1256,8 +1425,21 @@ class SelectionTests(unittest.TestCase):
             ],
         )
 
-        self.assertEqual(adjusted["102"].tolist(), [1.1, 1.1, 1.1, 1.0])
+        self.assertEqual(adjusted["102"].tolist(), [1.2, 1.2, 1.2, 1.0])
         self.assertEqual(ensure_service_price_exog_cols(["T", "e_price", "U"]), ["T", "e_price", "s_price", "U"])
+
+    def test_service_price_history_bounds_ignore_zero_fill_values(self):
+        price = pd.DataFrame(
+            {
+                "time": pd.date_range("2022-09-09", periods=4, freq="h"),
+                "102": [0.0, 0.8, 1.2, 1.0],
+            }
+        )
+
+        features = compute_price_features(price, ["102"]).iloc[0]
+
+        self.assertAlmostEqual(features["historical_min_service_price"], 0.8)
+        self.assertAlmostEqual(features["historical_max_service_price"], 1.2)
 
     def test_attaches_price_conditioned_baseline_to_report_windows(self):
         report = {
@@ -1440,12 +1622,14 @@ class SelectionTests(unittest.TestCase):
             pipeline_data = load_pipeline_data(data_dir, profiles, ["102"])
             self.assertEqual(pipeline_data.load["102"].tolist(), [10.0, 11.0])
 
-    def test_classifies_grid_stress_from_zone_three_hour_quantiles(self):
-        thresholds = {"available": True, "q50": 50.0, "q80": 80.0, "q95": 95.0}
-        self.assertEqual(classify_load_stress(96, thresholds), "Extreme High")
-        self.assertEqual(classify_load_stress(90, thresholds), "High")
-        self.assertEqual(classify_load_stress(60, thresholds), "Medium")
-        self.assertEqual(classify_load_stress(50, thresholds), "Low")
+    def test_classifies_grid_stress_from_percentage_of_zone_q95(self):
+        thresholds = {"available": True, "q95": 100.0, "reference_load_kwh": 100.0}
+        self.assertEqual(classify_load_stress(34.99, thresholds), "Low")
+        self.assertEqual(classify_load_stress(35.0, thresholds), "Medium")
+        self.assertEqual(classify_load_stress(79.99, thresholds), "Medium")
+        self.assertEqual(classify_load_stress(80.0, thresholds), "High")
+        self.assertEqual(classify_load_stress(89.99, thresholds), "High")
+        self.assertEqual(classify_load_stress(90.0, thresholds), "Extremely High")
 
     def test_forecast_output_dir_uses_model_subfolder(self):
         self.assertEqual(forecast_output_dir(Path("output"), "chronos"), Path("output") / "chronos")
@@ -1627,8 +1811,10 @@ class SelectionTests(unittest.TestCase):
     def test_experiment_matrix_writes_detailed_error_records(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
+            calls = []
 
             def fake_run_pipeline(**kwargs):
+                calls.append(kwargs)
                 raise AgentStageError(
                     stage="agent.grid",
                     zone_id="102",
@@ -1637,18 +1823,22 @@ class SelectionTests(unittest.TestCase):
                 )
 
             with patch("orchestrator.run_pipeline", side_effect=fake_run_pipeline):
-                outputs = run_experiment_matrix(
-                    data_dir=root / "data",
-                    output_dir=root / "output",
-                    config_path=Path("config.yaml"),
-                    forecast_starts=["2022-09-09 00:00:00"],
-                    forecast_models=["timesfm"],
-                    zone_ids=["102"],
-                    agent_modes=["agents"],
-                    diurnal_blend_alphas=[0.3],
-                )
+                with self.assertRaises(AgentStageError) as raised:
+                    run_experiment_matrix(
+                        data_dir=root / "data",
+                        output_dir=root / "output",
+                        config_path=Path("config.yaml"),
+                        forecast_starts=["2022-09-09 00:00:00"],
+                        forecast_models=["timesfm", "AR"],
+                        zone_ids=["102"],
+                        agent_modes=["agents"],
+                        diurnal_blend_alphas=[0.3],
+                    )
 
-            runs = pd.read_csv(outputs["experiment_runs_csv"])
+            self.assertEqual(len(calls), 1)
+            runs_paths = list((root / "output" / "experiments").rglob("experiment_runs.csv"))
+            self.assertEqual(len(runs_paths), 1)
+            runs = pd.read_csv(runs_paths[0])
             self.assertEqual(runs.loc[0, "status"], "failed")
             self.assertEqual(runs.loc[0, "error_code"], "MAPF-E210")
             self.assertEqual(runs.loc[0, "error_stage"], "agent.grid")
@@ -1658,6 +1848,13 @@ class SelectionTests(unittest.TestCase):
             traceback_file = Path(runs.loc[0, "traceback_file"])
             self.assertTrue(traceback_file.exists())
             self.assertIn("TRACEBACK", traceback_file.read_text(encoding="utf-8"))
+            message = format_failure_message(raised.exception)
+            self.assertIn("Execution stopped because an error occurred.", message)
+            self.assertIn("error_code: MAPF-E210", message)
+            self.assertIn("stage: agent.grid", message)
+            self.assertIn("zone_id: 102", message)
+            self.assertIn("agent: Grid Analyst", message)
+            self.assertIn("reason: 'NoneType' object is not subscriptable", message)
 
     def test_selects_representative_zone_ids_beyond_category_five(self):
         profiles = pd.DataFrame(

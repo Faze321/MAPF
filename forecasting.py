@@ -1594,6 +1594,8 @@ def compact_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "poi_lifestyle",
         "poi_total",
         "mean_service_price",
+        "historical_min_service_price",
+        "historical_max_service_price",
     ]
     return {key: round_float(profile.get(key)) for key in keys}
 

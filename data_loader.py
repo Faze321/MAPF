@@ -7,6 +7,14 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from load_policy import (
+    HIGH_MAX_LOAD_PCT,
+    LOAD_POLICY_ID,
+    LOW_MAX_LOAD_PCT,
+    MEDIUM_MAX_LOAD_PCT,
+    load_threshold_kwh,
+)
+
 
 POI_COLUMNS = {
     "food and beverage services": "poi_food",
@@ -58,29 +66,45 @@ def build_zone_profiles(
     if profile_cache.exists() and not force_cache and max_poi_rows is None:
         cached = pd.read_csv(profile_cache, dtype={"zone_id": str})
         if "load_source_file" in cached.columns and (cached["load_source_file"] == LOAD_FILE).all():
-            price_bound_columns = {
+            deprecated_energy_price_columns = {
+                "historical_min_energy_price",
+                "historical_max_energy_price",
+            }
+            deprecated_present = deprecated_energy_price_columns.intersection(cached.columns)
+            if deprecated_present:
+                cached = cached.drop(columns=sorted(deprecated_present))
+            price_feature_columns = {
+                "mean_service_price",
+                "service_price_std",
                 "historical_min_service_price",
                 "historical_max_service_price",
+                "mean_energy_price",
+                "energy_price_std",
             }
-            if not price_bound_columns.issubset(cached.columns):
-                price = read_time_matrix(data_dir / "s_price.csv")
-                price_zone_ids = [str(col) for col in price.columns if col != "time"]
-                price_features = compute_price_features(price, price_zone_ids)
-                update_columns = [
-                    "mean_service_price",
-                    "service_price_std",
-                    "historical_min_service_price",
-                    "historical_max_service_price",
-                ]
+            price_features_missing = not price_feature_columns.issubset(cached.columns)
+            if price_features_missing:
+                service_price = read_time_matrix(data_dir / "s_price.csv")
+                energy_price = read_time_matrix(data_dir / "e_price.csv")
+                price_zone_ids = [str(col) for col in service_price.columns if col != "time"]
+                service_price_features = compute_price_features(
+                    service_price, price_zone_ids, price_type="service"
+                )
+                energy_price_features = compute_price_features(
+                    energy_price, price_zone_ids, price_type="energy"
+                )
                 cached = cached.drop(
-                    columns=[column for column in update_columns if column in cached.columns]
-                ).merge(price_features, on="zone_id", how="left")
+                    columns=[column for column in price_feature_columns if column in cached.columns]
+                )
+                cached = cached.merge(service_price_features, on="zone_id", how="left")
+                cached = cached.merge(energy_price_features, on="zone_id", how="left")
+            if deprecated_present or price_features_missing:
                 cached.to_csv(profile_cache, index=False)
             return cached
 
     zone_ids = available_zone_ids(data_dir)
     load = read_time_matrix(data_dir / LOAD_FILE)
-    price = read_time_matrix(data_dir / "s_price.csv")
+    service_price = read_time_matrix(data_dir / "s_price.csv")
+    energy_price = read_time_matrix(data_dir / "e_price.csv")
     station_profiles = build_station_profiles(data_dir)
     poi_counts = build_poi_zone_counts(
         data_dir,
@@ -90,14 +114,20 @@ def build_zone_profiles(
         max_poi_rows=max_poi_rows,
     )
     load_features = compute_load_features(load, zone_ids)
-    price_features = compute_price_features(price, zone_ids)
+    service_price_features = compute_price_features(
+        service_price, zone_ids, price_type="service"
+    )
+    energy_price_features = compute_price_features(
+        energy_price, zone_ids, price_type="energy"
+    )
 
     profiles = (
         pd.DataFrame({"zone_id": zone_ids})
         .merge(station_profiles, on="zone_id", how="left")
         .merge(poi_counts, on="zone_id", how="left")
         .merge(load_features, on="zone_id", how="left")
-        .merge(price_features, on="zone_id", how="left")
+        .merge(service_price_features, on="zone_id", how="left")
+        .merge(energy_price_features, on="zone_id", how="left")
     )
 
     for col in POI_COLUMNS.values():
@@ -119,7 +149,7 @@ def build_zone_profiles(
     return profiles
 
 
-def build_zone_3h_load_quantiles(
+def build_zone_3h_load_policy_thresholds(
     data_dir: Path,
     cache_dir: Path,
     *,
@@ -131,9 +161,33 @@ def build_zone_3h_load_quantiles(
     cache_file = cache_dir / "zone_3h_load_quantiles.csv"
     if cache_file.exists() and not force_cache:
         cached = pd.read_csv(cache_file, dtype={"zone_id": str})
-        source_ok = "stress_source_file" in cached.columns and (cached["stress_source_file"] == source_file).all()
-        window_ok = "stress_window_hours" in cached.columns and (cached["stress_window_hours"].astype(int) == int(window_hours)).all()
-        if source_ok and window_ok:
+        required_columns = {
+            "load_policy_id",
+            "historical_min_load_3h_kwh",
+            "historical_max_load_3h_kwh",
+            "historical_load_range_3h_kwh",
+            "low_medium_threshold_pct",
+            "medium_high_threshold_pct",
+            "high_extremely_high_threshold_pct",
+            "load_3h_low_medium_threshold_kwh",
+            "load_3h_medium_high_threshold_kwh",
+            "load_3h_high_extremely_high_threshold_kwh",
+        }
+        source_ok = "stress_source_file" in cached.columns and (
+            cached["stress_source_file"] == source_file
+        ).all()
+        window_ok = "stress_window_hours" in cached.columns and (
+            cached["stress_window_hours"].astype(int) == int(window_hours)
+        ).all()
+        policy_ok = required_columns.issubset(cached.columns) and (
+            (cached["load_policy_id"] == LOAD_POLICY_ID).all()
+            and np.isclose(cached["low_medium_threshold_pct"], LOW_MAX_LOAD_PCT).all()
+            and np.isclose(cached["medium_high_threshold_pct"], MEDIUM_MAX_LOAD_PCT).all()
+            and np.isclose(
+                cached["high_extremely_high_threshold_pct"], HIGH_MAX_LOAD_PCT
+            ).all()
+        )
+        if source_ok and window_ok and policy_ok:
             return cached
 
     load = read_time_matrix(data_dir / source_file)
@@ -144,20 +198,37 @@ def build_zone_3h_load_quantiles(
     rows = []
     for zone_id in zone_ids:
         zone_values = grouped[zone_id].dropna()
+        historical_min = finite_float(zone_values.min())
+        historical_max = finite_float(zone_values.max())
         rows.append(
             {
                 "zone_id": zone_id,
                 "stress_source_file": source_file,
                 "stress_window_hours": int(window_hours),
                 "historical_3h_windows": int(len(zone_values)),
-                "load_3h_q50_kwh": finite_float(zone_values.quantile(0.50)),
-                "load_3h_q80_kwh": finite_float(zone_values.quantile(0.80)),
-                "load_3h_q95_kwh": finite_float(zone_values.quantile(0.95)),
+                "load_policy_id": LOAD_POLICY_ID,
+                "historical_min_load_3h_kwh": historical_min,
+                "historical_max_load_3h_kwh": historical_max,
+                "historical_load_range_3h_kwh": finite_float(
+                    historical_max - historical_min
+                ),
+                "low_medium_threshold_pct": LOW_MAX_LOAD_PCT,
+                "medium_high_threshold_pct": MEDIUM_MAX_LOAD_PCT,
+                "high_extremely_high_threshold_pct": HIGH_MAX_LOAD_PCT,
+                "load_3h_low_medium_threshold_kwh": finite_float(
+                    load_threshold_kwh(historical_min, historical_max, LOW_MAX_LOAD_PCT)
+                ),
+                "load_3h_medium_high_threshold_kwh": finite_float(
+                    load_threshold_kwh(historical_min, historical_max, MEDIUM_MAX_LOAD_PCT)
+                ),
+                "load_3h_high_extremely_high_threshold_kwh": finite_float(
+                    load_threshold_kwh(historical_min, historical_max, HIGH_MAX_LOAD_PCT)
+                ),
             }
         )
-    quantiles = pd.DataFrame(rows)
-    quantiles.to_csv(cache_file, index=False)
-    return quantiles
+    thresholds = pd.DataFrame(rows)
+    thresholds.to_csv(cache_file, index=False)
+    return thresholds
 
 
 def build_station_profiles(data_dir: Path) -> pd.DataFrame:
@@ -254,13 +325,21 @@ def compute_load_features(load: pd.DataFrame, zone_ids: list[str]) -> pd.DataFra
     return features.replace([np.inf, -np.inf], np.nan).fillna(0)
 
 
-def compute_price_features(price: pd.DataFrame, zone_ids: list[str]) -> pd.DataFrame:
+def compute_price_features(
+    price: pd.DataFrame,
+    zone_ids: list[str],
+    *,
+    price_type: str = "service",
+) -> pd.DataFrame:
+    if price_type not in {"service", "energy"}:
+        raise ValueError(f"Unsupported price_type: {price_type}")
     values = price[zone_ids].astype(float).replace(0, np.nan)
     features = pd.DataFrame({"zone_id": zone_ids})
-    features["mean_service_price"] = values.mean().fillna(0).to_numpy()
-    features["service_price_std"] = values.std().fillna(0).to_numpy()
-    features["historical_min_service_price"] = values.min().fillna(0).to_numpy()
-    features["historical_max_service_price"] = values.max().fillna(0).to_numpy()
+    features[f"mean_{price_type}_price"] = values.mean().fillna(0).to_numpy()
+    features[f"{price_type}_price_std"] = values.std().fillna(0).to_numpy()
+    if price_type == "service":
+        features["historical_min_service_price"] = values.min().fillna(0).to_numpy()
+        features["historical_max_service_price"] = values.max().fillna(0).to_numpy()
     return features
 
 

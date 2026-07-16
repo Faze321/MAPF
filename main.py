@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "CSV produced as window_load_price_cache.csv. Complete zone-window matches reuse "
-            "cached service-price and price-conditioned load predictions."
+            "cached energy-price and price-conditioned load predictions."
         ),
     )
     parser.add_argument("--max-poi-rows", type=int, default=None, help="Limit POI rows for quick experiments.")

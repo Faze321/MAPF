@@ -26,7 +26,7 @@ def grid_prompt(context: dict[str, Any]) -> str:
         Task: predict the next {horizon} of charging load for this zone. Use the baseline forecast as the numerical anchor unless the context strongly justifies a small adjustment.
 
         Return JSON with keys: forecast_total_kwh, forecast_peak_kwh, predicted_change_pct, grid_stress_level, forecast_summary.
-        Classify each 3-hour load as a percentage of that zone's historical 3-hour Q95 load: below 35% is Low, 35% to below 80% is Medium, 80% to below 90% is High, and 90% or above is Extremely High.
+        Classify each 3-hour load by its position in that zone's full historical 3-hour load range: position = (load - historical minimum) / (historical maximum - historical minimum) * 100. Below 35% is Low, 35% to below 80% is Medium, 80% to below 90% is High, and 90% or above is Extremely High.
         grid_stress_level must be exactly one of: Low, Medium, High, Extremely High.
 
         Context:{json.dumps(context, ensure_ascii=False)}"""
@@ -57,9 +57,9 @@ def economist_prompt(
     return (
         f"""Phase C / Market Economist.
         
-        Task: prescribe service-fee shifts for the next {horizon} using only forecast-derived information, prior agent conclusions, category, service price, energy price, each 3-hour window's predicted load_stress_level, and the behavioural elasticity estimate. Residential users are more price-sensitive; CBD and hub users are less price-sensitive.
+        Task: prescribe electricity/energy-price shifts for the next {horizon} using only forecast-derived information, prior agent conclusions, category, actual service price, energy price, each 3-hour window's predicted load_stress_level, and the behavioural elasticity estimate. Residential users are more price-sensitive; CBD and hub users are less price-sensitive. Adjust only energy price; service price remains the observed actual value.
 
-        Pricing policy: keep expected load in the Medium band, defined as 35% to below 80% of the zone's historical 3-hour Q95 load. For Low load, reduce service price to increase load toward Medium. For Medium load, hold price or use only a small change that keeps load inside Medium. For High load, increase price to reduce load into Medium. For Extremely High load, use a larger price increase than for High when needed. Every recommended service price must remain between historical_min_service_price and historical_max_service_price for that zone.
+        Pricing policy: keep expected load in the Medium band, defined as 35% to below 80% through the zone's full historical 3-hour min-max load range. For Low load, reduce energy price to increase load toward Medium. For Medium load, hold energy price or use only a small change that keeps load inside Medium. For High load, increase energy price to reduce load into Medium. For Extremely High load, use a larger energy-price increase than for High when needed. Every recommended energy price must remain between min_allowed_energy_price and max_allowed_energy_price, defined as 0.4 and 2.0 times zone_mean_energy_price.
 
         Nash-equilibrium intent: each window should move toward a strategy where the expected load after price response is grid safe, users remain within tolerance, and the price recommendation is stable. The code will run the final mathematical equilibrium check after your JSON response.
 
@@ -80,14 +80,14 @@ def single_model_prompt(context: dict[str, Any]) -> str:
     return (
         f"""Single-model pricing analyst.
 
-        Task: use one stronger model pass to replace the separate Grid Analyst, Behavioural Agent, and Market Economist stages for the next {horizon}. Use only forecast-derived information, category, service price, energy price, predicted 3-hour load_stress_level, weather, occupancy, and load shape. Estimate price-response elasticity and prescribe service-fee shifts for each 3-hour pricing window.
+        Task: use one stronger model pass to replace the separate Grid Analyst, Behavioural Agent, and Market Economist stages for the next {horizon}. Use only forecast-derived information, category, actual service price, energy price, predicted 3-hour load_stress_level, weather, occupancy, and load shape. Estimate price-response elasticity and prescribe energy-price shifts for each 3-hour pricing window. Adjust only energy price; service price remains the observed actual value.
 
-        Pricing policy: reduce price for Low load, keep changes small for Medium, raise price for High, and raise it more strongly for Extremely High. Target the Medium load band and keep the resulting service price between the zone's historical minimum and maximum service prices.
+        Pricing policy: reduce energy price for Low load, keep changes small for Medium, raise energy price for High, and raise it more strongly for Extremely High. Target the Medium load band and keep the resulting energy price between 0.4 and 2.0 times the zone mean energy price.
 
         Do not use actual future load, actual future stress, forecast error, stress correctness, or any evaluation/ground-truth fields. Those fields are intentionally not provided to you.
 
         Return JSON with keys: forecast_total_kwh, forecast_peak_kwh, predicted_change_pct, grid_stress_level, forecast_summary, agent_reasoning, demand_drivers, elasticity_factor, confidence, suggested_price_shift_pct, action_label, price_rationale, price_change_windows_3h.
-        Classify each 3-hour load as a percentage of that zone's historical 3-hour Q95 load: below 35% is Low, 35% to below 80% is Medium, 80% to below 90% is High, and 90% or above is Extremely High.
+        Classify each 3-hour load by its position in that zone's full historical 3-hour min-max load range: below 35% is Low, 35% to below 80% is Medium, 80% to below 90% is High, and 90% or above is Extremely High.
         grid_stress_level must be exactly one of: Low, Medium, High, Extremely High.
         price_change_windows_3h must contain one item for each context.pricing_windows_3h item, with keys: window_start, window_end, suggested_price_shift_pct, action_label, price_rationale.
 
@@ -137,15 +137,19 @@ def compact_economist_context(context: dict[str, Any]) -> dict[str, Any]:
         "predicted_change_pct",
         "grid_stress_level",
         "capacity_kw_proxy",
-        "grid_stress_q50_kwh",
-        "grid_stress_q80_kwh",
-        "grid_stress_q95_kwh",
-        "grid_stress_load_pct_of_q95",
-        "load_low_max_pct",
-        "load_medium_max_pct",
-        "load_high_max_pct",
-        "historical_min_service_price",
-        "historical_max_service_price",
+        "historical_min_load_3h_kwh",
+        "historical_max_load_3h_kwh",
+        "historical_load_range_3h_kwh",
+        "grid_stress_load_range_position_pct",
+        "low_medium_threshold_pct",
+        "medium_high_threshold_pct",
+        "high_extremely_high_threshold_pct",
+        "load_3h_low_medium_threshold_kwh",
+        "load_3h_medium_high_threshold_kwh",
+        "load_3h_high_extremely_high_threshold_kwh",
+        "zone_mean_energy_price",
+        "min_allowed_energy_price",
+        "max_allowed_energy_price",
     ]
     compact = {key: context.get(key) for key in scalar_keys if key in context}
     if "hourly_averages" in context:
@@ -187,15 +191,19 @@ def forecast_only_pricing_windows(value: Any) -> list[dict[str, Any]]:
         "stress_load_3h_kwh",
         "stress_source_file",
         "stress_window_hours",
-        "load_3h_q50_kwh",
-        "load_3h_q80_kwh",
-        "load_3h_q95_kwh",
-        "load_pct_of_q95",
-        "load_low_max_pct",
-        "load_medium_max_pct",
-        "load_high_max_pct",
-        "historical_min_service_price",
-        "historical_max_service_price",
+        "historical_min_load_3h_kwh",
+        "historical_max_load_3h_kwh",
+        "historical_load_range_3h_kwh",
+        "load_range_position_pct",
+        "low_medium_threshold_pct",
+        "medium_high_threshold_pct",
+        "high_extremely_high_threshold_pct",
+        "load_3h_low_medium_threshold_kwh",
+        "load_3h_medium_high_threshold_kwh",
+        "load_3h_high_extremely_high_threshold_kwh",
+        "zone_mean_energy_price",
+        "min_allowed_energy_price",
+        "max_allowed_energy_price",
     }
     blocked = {"mean_abs_pct_error"}
     sanitized: list[dict[str, Any]] = []

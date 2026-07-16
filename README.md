@@ -3,13 +3,13 @@
 This project implements the conference-work requirement in `Conference work.docx`:
 
 1. Select five UrbanEV zones that behave like CBD/office, residential, transport hub, commercial/mall, and industrial demand profiles.
-2. Build compact context snippets from `volume.csv`, a configurable weather file, `poi.csv`, `inf.csv`, `occupancy.csv`, and `s_price.csv`.
+2. Build compact context snippets from `volume.csv`, a configurable weather file, `poi.csv`, `inf.csv`, `occupancy.csv`, `e_price.csv`, and `s_price.csv`.
 3. Run a sequential multi-agent chain per zone:
    - Grid Analyst: forecast 1-4 days of load and assign a grid stress level.
    - Behavioural Agent: explain the demand drivers from POI mix, weather, time markers, and estimate a price-response elasticity factor.
-   - Market Economist: prescribe a service-fee shift from stress, elasticity, and price context.
-   - Price-conditioned Forecaster: rerun the forecaster with predicted service prices plus observed weather, occupancy, and energy-price conditions to estimate the current load baseline.
-   - Nash Equilibrium Check: test whether each price-conditioned baseline can be moved into the Medium load band while respecting the zone's historical service-price range and price stability.
+   - Market Economist: prescribe an energy-price shift from stress, elasticity, and price context.
+   - Price-conditioned Forecaster: rerun the forecaster with predicted energy prices plus observed weather, occupancy, and service-price conditions to estimate the current load baseline.
+   - Nash Equilibrium Check: test whether each price-conditioned baseline can be moved into the Medium load band while keeping energy price between 0.4 and 2.0 times the zone mean energy price.
 4. Execute all five zone chains concurrently with `asyncio`.
 5. Export an explainability table with predicted vs. actual load, rationale, price shift, and Nash equilibrium status.
 
@@ -86,24 +86,27 @@ agent:
 For each 3-hour window, the load percentage is:
 
 ```text
-load_pct_of_q95 = predicted_3h_load_kwh / zone_historical_3h_Q95_load_kwh * 100
+load_range_position_pct =
+    (predicted_3h_load_kwh - historical_min_load_3h_kwh)
+    / (historical_max_load_3h_kwh - historical_min_load_3h_kwh)
+    * 100
 ```
 
-The stress labels use fixed percentage boundaries: below 35% is `Low`, 35% to below 80% is `Medium`, 80% to below 90% is `High`, and 90% or above is `Extremely High`. Historical Q50 and Q80 values remain available as diagnostics but do not define these labels.
+The historical load interval is built from the minimum and maximum of all 3-hour load sums in `volume.csv` for that zone. The stress labels use fixed positions within this interval: below 35% is `Low`, 35% to below 80% is `Medium`, 80% to below 90% is `High`, and 90% or above is `Extremely High`.
 
-The pricing controller targets the interior of the Medium band. For Low load it reduces service price and targets 35.5% of Q95. For Medium load it permits at most a small +/-3% change, and rejects that change if it would move expected load outside Medium. For High and Extremely High load it increases service price and targets 79.5% of Q95; the larger distance from the target makes the Extremely High increase larger under the same elasticity and price conditions. Every final service price is clamped to the positive minimum and maximum `s_price` observed over that zone's full history. If the historical price range is too narrow to reach Medium, the output is marked `nash_status: not_reached` rather than violating the price bound.
+The pricing controller targets the interior of the Medium band. For Low load it reduces energy price and targets the 35.5% position. For Medium load it permits at most a small +/-3% energy-price change, and rejects that change if it would move expected load outside Medium. For High and Extremely High load it increases energy price and targets the 79.5% position. The zone mean energy price is calculated from all positive `e_price` values in that zone. Every final energy price is clamped to `[0.4 * zone_mean_energy_price, 2.0 * zone_mean_energy_price]`; `s_price` remains the observed actual service price.
 
 Multi-value runs execute the full forecast-start by forecaster by seed by agent-mode by blend matrix while keeping each combination in a separate folder under `output/experiments/`, for example `output/experiments/20zonesx4timesx3modes_11blends/2022-09-09_000000/seed_42/agent_rules/blend_0_3/lstm/`. The experiment root writes raw concatenated tables plus aggregate summaries with `n`, `mean`, `std`, and `sem`: `experiment_forecast_summary.csv`, `experiment_price_summary.csv`, `experiment_rationale_summary.csv`, and `experiment_decision_quality_summary.csv`.
 
-Set `run.forecast_model: "timesfm"` to use `google/timesfm-2.5-200m-pytorch` for load forecasting. Set `run.forecast_model: "lstm"` to train a small local PyTorch LSTM per zone. Set `run.forecast_model: "AR"` for a fast autoregressive baseline run without TimesFM; AR applies a calibrated service-price response adjustment when `s_price` is available.
-Set `run.forecast_model: "chronos"` to use Chronos. The default Chronos config uses `amazon/chronos-2`, passes known future covariates including `s_price`, rolls actual observations into the context during retrospective multi-day evaluation, and exports the same `predicted_kwh`, `q10_kwh`, `q50_kwh`, and `q90_kwh` columns as TimesFM.
+Set `run.forecast_model: "timesfm"` to use `google/timesfm-2.5-200m-pytorch` for load forecasting. Set `run.forecast_model: "lstm"` to train a small local PyTorch LSTM per zone. Set `run.forecast_model: "AR"` for a fast autoregressive baseline run without TimesFM; AR applies a calibrated energy-price response adjustment when `e_price` is available.
+Set `run.forecast_model: "chronos"` to use Chronos. The default Chronos config uses `amazon/chronos-2`, passes known future covariates including `e_price` and actual `s_price`, rolls actual observations into the context during retrospective multi-day evaluation, and exports the same `predicted_kwh`, `q10_kwh`, `q50_kwh`, and `q90_kwh` columns as TimesFM.
 
 The TimesFM path now follows the `zone102_timefm1.ipynb` workflow:
 
 - `run.weather_file` chooses the weather source. Use `weather_central.csv` to match `zone102_timefm1.ipynb`; the default project path uses `weather_airport.csv`.
 - `run.history_days: 7` builds the context window.
 - `run.validation_days: 1` reserves the day before `forecast_start` for bias calibration.
-- `run.timesfm_exog_cols` controls dynamic numerical covariates. The notebook-style default is `T`, `U`, `nRAIN`, `e_price`, `s_price`, `is_weekend`, and `temp_price_idx`. The post-price baseline forecast forces `s_price` into the TimesFM, LSTM, and Chronos covariates so the predicted service price can affect the load baseline; AR uses the same `s_price` through its local service-price response adjustment.
+- `run.timesfm_exog_cols` controls dynamic numerical covariates. The notebook-style default is `T`, `U`, `nRAIN`, `e_price`, `s_price`, `is_weekend`, and `temp_price_idx`. The post-price baseline forecast forces predicted `e_price` into the TimesFM, LSTM, and Chronos covariates while retaining actual `s_price`; AR uses the predicted `e_price` through its local energy-price response adjustment.
 - `run.timesfm_diurnal_blend_alpha` blends the TimesFM point forecast with the recent hourly load profile. `1.0` matches the notebook setting; `0.0` disables the blend.
 - `run.timesfm_roll_actuals: true` rolls known actual values into the context during multi-day validation/forecast steps.
 
@@ -123,9 +126,9 @@ Generated result files are written under a forecast-model subfolder, for example
 - `rationale_trace.md`: markdown table for a report or paper appendix.
 - `rationale_trace.json`: full structured agent outputs, including per-agent call usage details under `agent_call_usage`.
 - `agent_debug_outputs.json`: full debug payloads for model-backed agent calls, including economist repair details or single-model responses.
-- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, `predicted_service_price`, `actual_service_price`, `actual_energy_price`, stress labels, and price rationales. Policy diagnostics include `load_pct_of_q95`, `actual_load_pct_of_q95`, the 35/80/90 boundaries, `historical_min_service_price`, `historical_max_service_price`, `target_load_kwh`, `expected_load_pct_of_q95`, `load_in_medium_band`, and `price_within_historical_bounds`. Price-conditioned baseline fields include `forecaster_input_predicted_service_price`, `price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, and `baseline_load_source`. `capacity_limit_kwh` remains the zone's historical 3-hour Q95 reference load.
-- `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone pricing decision accuracy. A price action passes when `predicted_service_price` is within 8% of `actual_service_price`.
-- `window_load_price_cache.csv`: stable per-window replay input containing the original load forecast, the load forecast conditioned on predicted service price, the final predicted service price, actual service and energy prices, load percentages, historical service-price bounds, and the Nash diagnostics needed to reproduce the window result.
+- `price_schedule_3h.csv` / `price_schedule_3h.md`: per-3-hour window price actions, `predicted_energy_price`, `actual_energy_price`, unchanged `actual_service_price`, stress labels, and price rationales. Policy diagnostics include `load_range_position_pct`, the historical 3-hour load range and 35/80/90 boundaries, `zone_mean_energy_price`, `min_allowed_energy_price`, `max_allowed_energy_price`, `energy_price_bound_source`, `target_load_kwh`, `expected_load_range_position_pct`, `load_in_medium_band`, and `price_within_allowed_bounds`. Price-conditioned baseline fields include `forecaster_input_predicted_energy_price`, `price_conditioned_baseline_load_kwh`, `baseline_load_kwh`, and `baseline_load_source`.
+- `price_comparison_summary.csv` / `price_comparison_summary.md`: per-zone energy-pricing decision accuracy. A price action passes when `predicted_energy_price` is within 8% of `actual_energy_price`.
+- `window_load_price_cache.csv`: stable per-window replay input containing the original load forecast, the load forecast conditioned on predicted energy price, the final predicted energy price, actual energy and service prices, `zone_mean_energy_price`, the 0.4-2.0 allowed bounds, load percentages, and Nash diagnostics.
 - `explainability_rubric.md`: five-criterion human evaluation rubric for rationale quality.
 - `explainability_review_packet.csv`: review template for two independent raters plus an operator sanity-check column.
 - `forecast_metrics.csv` / `forecast_metrics.md`: per-zone forecast metrics including MAE, RMSE, MAPE, RAE, and WAPE.
@@ -134,17 +137,21 @@ Generated result files are written under a forecast-model subfolder, for example
 
 The first full run builds cached POI-to-zone assignments in `output/cache/`. Later runs reuse that shared cache unless `--force-cache` is passed.
 
-Set `run.precomputed_window_data` or pass `--precomputed-window-data` to reuse a previous `window_load_price_cache.csv`. Matching uses `forecast_model`, `agent_mode`, `zone_id`, `window_start`, and `window_end` when the metadata columns are present. A zone is reused only when every expected 3-hour window has both `predicted_service_price` and `price_conditioned_load_kwh`; a partial or missing zone falls back to the normal agent and price-conditioned forecast path. Reused zones skip the LLM pricing calls and the second load forecast, while the initial hourly load forecast still runs to produce metrics and plots.
+`zone_3h_load_quantiles.csv` keeps its filename for backward compatibility but now stores the historical 3-hour load range policy. Its columns include `load_policy_id`, `historical_min_load_3h_kwh`, `historical_max_load_3h_kwh`, `historical_load_range_3h_kwh`, the three percentage boundaries, and their corresponding kWh thresholds. A legacy Q50/Q80/Q95 file, a different policy id, or stale percentages is automatically invalidated and overwritten on the next run.
+
+Set `run.precomputed_window_data` or pass `--precomputed-window-data` to reuse a previous `window_load_price_cache.csv`. Matching uses `forecast_model`, `agent_mode`, `zone_id`, `window_start`, and `window_end` when the metadata columns are present. A zone is reused only when every expected 3-hour window has both `predicted_energy_price` and `price_conditioned_load_kwh`; a partial or missing zone falls back to the normal agent and price-conditioned forecast path. Reused zones skip the LLM pricing calls and the second load forecast, while the initial hourly load forecast still runs to produce metrics and plots.
 
 ## Data Notes
 
 The POI file in this release contains only three broad POI labels: `food and beverage services`, `business and residential`, and `lifestyle services`. The five zone categories are therefore selected as operational proxies:
 
 - CBD / Office: high business/residential density plus morning/noon load shape.
-- Residential: night/evening charging plateau.
+- Residential: night/evening charging plateau with a penalty for food/lifestyle POI dominance.
 - Transport Hub: high charging capacity and bursty peaks.
 - Commercial / Mall: high food/lifestyle density plus evening/weekend lift.
 - Industrial: stable high base load with large charging capacity.
+
+Each feature is median-filled, clipped to its 5th-95th percentile range, and standardized before scoring so a small number of extreme zones cannot dominate a category. The final five zones are selected jointly to maximize the total category score while requiring a different zone for every category.
 
 ## Data Folder
 

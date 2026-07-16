@@ -11,9 +11,9 @@ from config import normalize_forecast_model_name
 _TIMESFM_MODEL_CACHE: dict[tuple[str, int, int], Any] = {}
 _CHRONOS_MODEL_CACHE: dict[tuple[str, str], Any] = {}
 DEFAULT_TIMESFM_EXOG_COLS = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
-SERVICE_PRICE_FALLBACK_ELASTICITY = 0.1
-SERVICE_PRICE_ADJUSTMENT_MAX_RATIO = 0.3
-SERVICE_PRICE_RESPONSE_MIN_OBS = 12
+ENERGY_PRICE_FALLBACK_ELASTICITY = 0.1
+ENERGY_PRICE_ADJUSTMENT_MAX_RATIO = 0.3
+ENERGY_PRICE_RESPONSE_MIN_OBS = 12
 
 
 @dataclass(frozen=True)
@@ -151,7 +151,10 @@ def forecast_zone(
     hourly = add_error_columns(hourly)
     metrics = compute_forecast_metrics(hourly)
 
-    price_summary = summarize_price(service_price, zone_id, history_start, forecast_end)
+    price_summary = {
+        **summarize_price(service_price, zone_id, history_start, forecast_end, "service"),
+        **summarize_price(energy_price, zone_id, history_start, forecast_end, "energy"),
+    }
     weather_summary = summarize_weather(weather, forecast_start, forecast_end)
     occupancy_summary = summarize_occupancy(occupancy, zone_id, history_start, forecast_end)
     capacity = float(profile.get("capacity_kw_proxy", 0.0) or 0.0)
@@ -200,7 +203,7 @@ def forecast_zone(
         "chronos_diurnal_blend_alpha": round(float(chronos_diurnal_blend_alpha), 4) if normalized_model.startswith("chronos") else None,
         "chronos_device": chronos_device if normalized_model.startswith("chronos") else None,
         "chronos_roll_actuals": bool(chronos_roll_actuals) if normalized_model.startswith("chronos") else None,
-        "service_price_adjustment": forecast_attrs.get("service_price_adjustment"),
+        "energy_price_adjustment": forecast_attrs.get("energy_price_adjustment"),
         "lstm_context_hours": int(lstm_context_hours) if normalized_model == "lstm" else None,
         "lstm_step_horizon": int(lstm_step_horizon) if normalized_model == "lstm" else None,
         "lstm_exog_cols": (lstm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS) if normalized_model == "lstm" else None,
@@ -1358,9 +1361,9 @@ def compute_forecast_metrics(hourly: pd.DataFrame) -> dict[str, float | None]:
     }
 
 
-def estimate_service_price_response(training_frame: pd.DataFrame) -> dict[str, Any]:
-    if "actual_kwh" not in training_frame or "s_price" not in training_frame:
-        return {"enabled": False, "reason": "missing_actual_or_service_price"}
+def estimate_energy_price_response(training_frame: pd.DataFrame) -> dict[str, Any]:
+    if "actual_kwh" not in training_frame or "e_price" not in training_frame:
+        return {"enabled": False, "reason": "missing_actual_or_energy_price"}
 
     data = training_frame.copy()
     if "time" in data:
@@ -1369,28 +1372,28 @@ def estimate_service_price_response(training_frame: pd.DataFrame) -> dict[str, A
     elif "hour" not in data:
         data["hour"] = 0
     data["actual_kwh"] = pd.to_numeric(data["actual_kwh"], errors="coerce")
-    data["s_price"] = pd.to_numeric(data["s_price"], errors="coerce")
-    data = data[["actual_kwh", "s_price", "hour"]].dropna()
+    data["e_price"] = pd.to_numeric(data["e_price"], errors="coerce")
+    data = data[["actual_kwh", "e_price", "hour"]].dropna()
     if data.empty:
-        return {"enabled": False, "reason": "no_valid_service_price_training_rows"}
+        return {"enabled": False, "reason": "no_valid_energy_price_training_rows"}
 
     mean_load = float(data["actual_kwh"].clip(lower=0).mean())
-    mean_price = float(data["s_price"].replace(0, np.nan).mean())
+    mean_price = float(data["e_price"].replace(0, np.nan).mean())
     if not np.isfinite(mean_load) or mean_load <= 0 or not np.isfinite(mean_price) or mean_price <= 0:
-        return {"enabled": False, "reason": "invalid_mean_load_or_service_price"}
+        return {"enabled": False, "reason": "invalid_mean_load_or_energy_price"}
 
-    fallback_slope = -SERVICE_PRICE_FALLBACK_ELASTICITY * mean_load / max(mean_price, 1e-9)
-    max_abs_slope = SERVICE_PRICE_ADJUSTMENT_MAX_RATIO * mean_load / max(mean_price, 1e-9)
+    fallback_slope = -ENERGY_PRICE_FALLBACK_ELASTICITY * mean_load / max(mean_price, 1e-9)
+    max_abs_slope = ENERGY_PRICE_ADJUSTMENT_MAX_RATIO * mean_load / max(mean_price, 1e-9)
     source = "fallback_elasticity"
     slope = fallback_slope
 
-    if len(data) >= SERVICE_PRICE_RESPONSE_MIN_OBS and data["s_price"].nunique(dropna=True) >= 2:
+    if len(data) >= ENERGY_PRICE_RESPONSE_MIN_OBS and data["e_price"].nunique(dropna=True) >= 2:
         load_baseline = data.groupby("hour")["actual_kwh"].transform("mean")
-        price_baseline = data.groupby("hour")["s_price"].transform("mean")
+        price_baseline = data.groupby("hour")["e_price"].transform("mean")
         load_residual = data["actual_kwh"].to_numpy(dtype=np.float64) - load_baseline.to_numpy(dtype=np.float64)
-        price_residual = data["s_price"].to_numpy(dtype=np.float64) - price_baseline.to_numpy(dtype=np.float64)
+        price_residual = data["e_price"].to_numpy(dtype=np.float64) - price_baseline.to_numpy(dtype=np.float64)
         if float(np.nanvar(price_residual)) <= 1e-12:
-            price_residual = data["s_price"].to_numpy(dtype=np.float64) - mean_price
+            price_residual = data["e_price"].to_numpy(dtype=np.float64) - mean_price
         denom = float(np.dot(price_residual, price_residual))
         if denom > 1e-12:
             empirical_slope = float(np.dot(price_residual, load_residual) / denom)
@@ -1400,71 +1403,71 @@ def estimate_service_price_response(training_frame: pd.DataFrame) -> dict[str, A
             else:
                 source = "fallback_nonnegative_empirical_response"
     else:
-        source = "fallback_insufficient_service_price_variation"
+        source = "fallback_insufficient_energy_price_variation"
 
     slope = float(np.clip(slope, -max_abs_slope, 0.0))
     return {
         "enabled": True,
         "source": source,
-        "slope_kwh_per_service_price": round(slope, 6),
-        "fallback_elasticity": SERVICE_PRICE_FALLBACK_ELASTICITY,
+        "slope_kwh_per_energy_price": round(slope, 6),
+        "fallback_elasticity": ENERGY_PRICE_FALLBACK_ELASTICITY,
         "mean_training_load_kwh": round(mean_load, 4),
-        "mean_training_service_price": round(mean_price, 6),
-        "max_adjustment_ratio": SERVICE_PRICE_ADJUSTMENT_MAX_RATIO,
+        "mean_training_energy_price": round(mean_price, 6),
+        "max_adjustment_ratio": ENERGY_PRICE_ADJUSTMENT_MAX_RATIO,
         "training_rows": int(len(data)),
     }
 
 
-def service_price_reference_for_times(
+def energy_price_reference_for_times(
     training_frame: pd.DataFrame,
     times: pd.Series | pd.DatetimeIndex,
     fallback_price: float,
 ) -> np.ndarray:
     index = pd.DatetimeIndex(times)
-    if "time" not in training_frame or "s_price" not in training_frame:
+    if "time" not in training_frame or "e_price" not in training_frame:
         return np.full(len(index), fallback_price, dtype=np.float64)
-    data = training_frame[["time", "s_price"]].copy()
+    data = training_frame[["time", "e_price"]].copy()
     data["time"] = pd.to_datetime(data["time"])
-    data["s_price"] = pd.to_numeric(data["s_price"], errors="coerce")
+    data["e_price"] = pd.to_numeric(data["e_price"], errors="coerce")
     data = data.dropna()
     if data.empty:
         return np.full(len(index), fallback_price, dtype=np.float64)
-    by_hour = data.groupby(data["time"].dt.hour)["s_price"].mean()
+    by_hour = data.groupby(data["time"].dt.hour)["e_price"].mean()
     return np.asarray([float(by_hour.get(int(ts.hour), fallback_price)) for ts in index], dtype=np.float64)
 
 
-def apply_service_price_response_adjustment(
+def apply_energy_price_response_adjustment(
     point: np.ndarray,
     horizon_frame: pd.DataFrame | None,
     training_frame: pd.DataFrame,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
     point_arr = np.asarray(point, dtype=np.float64)
     zero_adjustment = np.zeros(len(point_arr), dtype=np.float64)
-    response = estimate_service_price_response(training_frame)
+    response = estimate_energy_price_response(training_frame)
     if not response.get("enabled"):
         return np.clip(point_arr, 0, None), zero_adjustment, response
-    if horizon_frame is None or "s_price" not in horizon_frame or "time" not in horizon_frame:
-        metadata = {**response, "enabled": False, "reason": "missing_horizon_service_price"}
+    if horizon_frame is None or "e_price" not in horizon_frame or "time" not in horizon_frame:
+        metadata = {**response, "enabled": False, "reason": "missing_horizon_energy_price"}
         return np.clip(point_arr, 0, None), zero_adjustment, metadata
 
-    prices = pd.to_numeric(horizon_frame["s_price"], errors="coerce").ffill().bfill()
-    fallback_price = float(response["mean_training_service_price"])
+    prices = pd.to_numeric(horizon_frame["e_price"], errors="coerce").ffill().bfill()
+    fallback_price = float(response["mean_training_energy_price"])
     prices = prices.fillna(fallback_price).to_numpy(dtype=np.float64)
     prices = align_vector(prices, len(point_arr))
-    reference = service_price_reference_for_times(training_frame, horizon_frame["time"], fallback_price)
+    reference = energy_price_reference_for_times(training_frame, horizon_frame["time"], fallback_price)
     reference = align_vector(reference, len(point_arr))
 
-    slope = float(response["slope_kwh_per_service_price"])
+    slope = float(response["slope_kwh_per_energy_price"])
     raw_adjustment = slope * (prices - reference)
     floor = max(float(response["mean_training_load_kwh"]) * 0.05, 1e-9)
-    limit = np.maximum(np.abs(point_arr) * SERVICE_PRICE_ADJUSTMENT_MAX_RATIO, floor)
+    limit = np.maximum(np.abs(point_arr) * ENERGY_PRICE_ADJUSTMENT_MAX_RATIO, floor)
     adjustment = np.clip(raw_adjustment, -limit, limit)
     adjusted = np.clip(point_arr + adjustment, 0, None)
     metadata = {
         **response,
         "enabled": True,
-        "mean_horizon_service_price": round(float(np.nanmean(prices)), 6),
-        "mean_reference_service_price": round(float(np.nanmean(reference)), 6),
+        "mean_horizon_energy_price": round(float(np.nanmean(prices)), 6),
+        "mean_reference_energy_price": round(float(np.nanmean(reference)), 6),
         "mean_adjustment_kwh": round(float(np.nanmean(adjustment)), 6),
         "max_abs_adjustment_kwh": round(float(np.nanmax(np.abs(adjustment))), 6),
     }
@@ -1508,7 +1511,7 @@ def ar_forecast(
     if validation is not None and not validation.empty:
         training_parts.append(validation)
     training_frame = pd.concat(training_parts, ignore_index=True)
-    adjusted, service_price_adjustment, adjustment_meta = apply_service_price_response_adjustment(
+    adjusted, energy_price_adjustment, adjustment_meta = apply_energy_price_response_adjustment(
         predicted,
         horizon_frame,
         training_frame,
@@ -1517,21 +1520,29 @@ def ar_forecast(
         {
             "time": target_index,
             "base_predicted_kwh": predicted,
-            "service_price_adjustment_kwh": service_price_adjustment,
+            "energy_price_adjustment_kwh": energy_price_adjustment,
             "predicted_kwh": adjusted,
         }
     )
-    result.attrs["service_price_adjustment"] = adjustment_meta
+    result.attrs["energy_price_adjustment"] = adjustment_meta
     return result
 
 
-def summarize_price(price: pd.DataFrame, zone_id: str, start: pd.Timestamp, end: pd.Timestamp) -> dict[str, float]:
+def summarize_price(
+    price: pd.DataFrame,
+    zone_id: str,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    price_type: str,
+) -> dict[str, float]:
+    if price_type not in {"service", "energy"}:
+        raise ValueError(f"Unsupported price_type: {price_type}")
     frame = price[(price["time"] >= start) & (price["time"] <= end)]
     values = frame[zone_id].replace(0, np.nan).astype(float)
     return {
-        "mean_service_price": finite_round(values.mean(skipna=True), 4),
-        "min_service_price": finite_round(values.min(skipna=True), 4),
-        "max_service_price": finite_round(values.max(skipna=True), 4),
+        f"mean_{price_type}_price": finite_round(values.mean(skipna=True), 4),
+        f"min_{price_type}_price": finite_round(values.min(skipna=True), 4),
+        f"max_{price_type}_price": finite_round(values.max(skipna=True), 4),
     }
 
 
@@ -1596,6 +1607,7 @@ def compact_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "mean_service_price",
         "historical_min_service_price",
         "historical_max_service_price",
+        "mean_energy_price",
     ]
     return {key: round_float(profile.get(key)) for key in keys}
 

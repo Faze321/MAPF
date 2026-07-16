@@ -15,7 +15,7 @@ from agents import (
     ECONOMIST_AGENT_OUTPUT_KEY,
     AgentChatClient,
     AgentStageError,
-    capacity_limit_kwh,
+    historical_load_bounds_kwh,
     completion_message_content,
     extract_json_object,
     heuristic_behavior,
@@ -33,7 +33,8 @@ from agents import (
 from config import AgentConfig, AppConfig, RunConfig, normalize_agent_mode
 from data_loader import (
     available_zone_ids,
-    build_zone_3h_load_quantiles,
+    build_zone_3h_load_policy_thresholds,
+    build_zone_profiles,
     compute_price_features,
     load_pipeline_data,
 )
@@ -49,14 +50,14 @@ from forecasting import (
 )
 from orchestrator import (
     apply_precomputed_window_data,
-    apply_load_quantile_stress,
+    apply_load_policy_stress,
     apply_price_conditioned_baseline_forecasts,
     build_agent_hourly_data,
     build_hourly_averages,
     build_pricing_windows_3h,
     classify_load_stress,
     attach_price_conditioned_baselines,
-    ensure_service_price_exog_cols,
+    ensure_energy_price_exog_cols,
     format_failure_message,
     forecast_output_dir,
     load_precomputed_window_data,
@@ -67,7 +68,7 @@ from orchestrator import (
     select_agent_config_for_mode,
     select_representative_zone_ids,
     select_requested_zones,
-    service_price_with_predicted_windows,
+    energy_price_with_predicted_windows,
 )
 from main import cli
 from prompts import compact_economist_context, economist_prompt, grid_prompt
@@ -77,7 +78,7 @@ from reporting import (
     split_agent_debug_outputs,
     write_outputs,
 )
-from zone_selection import select_zone_categories
+from zone_selection import CATEGORY_ORDER, optimal_unique_assignment, select_zone_categories
 
 
 class AgentParsingTests(unittest.TestCase):
@@ -217,6 +218,7 @@ class AgentParsingTests(unittest.TestCase):
             "category": "Commercial",
             "grid_stress_level": "High",
             "predicted_change_pct": 5.0,
+            "zone_mean_energy_price": 1.0,
             "hourly_averages": {"mean_predicted_kwh": 10.0, "mean_energy_price": 1.0},
             "pricing_windows_3h": [
                 {
@@ -259,6 +261,7 @@ class AgentParsingTests(unittest.TestCase):
             "forecast_peak_kwh": 20.0,
             "predicted_change_pct": 5.0,
             "grid_stress_level": "High",
+            "zone_mean_energy_price": 1.0,
             "hourly_averages": {"mean_predicted_kwh": 10.0, "mean_energy_price": 1.0},
             "pricing_windows_3h": [
                 {
@@ -266,6 +269,7 @@ class AgentParsingTests(unittest.TestCase):
                     "window_end": "2022-09-09 02:00:00",
                     "sum_predicted_kwh": 100.0,
                     "load_stress_level": "High",
+                    "mean_energy_price": 1.0,
                 }
             ],
         }
@@ -305,10 +309,12 @@ class AgentParsingTests(unittest.TestCase):
                 "hours": 3,
                 "sum_predicted_kwh": 120.0,
                 "mean_service_price": 1.0,
-                "mean_energy_price": 0.8,
+                "mean_energy_price": 1.9,
+                "zone_mean_energy_price": 1.0,
                 "mean_occupancy": 0.9,
                 "total_rain": 1.0,
-                "load_3h_q95_kwh": 90.0,
+                "historical_min_load_3h_kwh": 0.0,
+                "historical_max_load_3h_kwh": 90.0,
                 "suggested_price_shift_pct": 5,
                 "action_label": "Raise price",
                 "price_rationale": "High predicted demand.",
@@ -316,28 +322,30 @@ class AgentParsingTests(unittest.TestCase):
         )
 
         self.assertFalse(window["nash_equilibrium_reached"])
-        self.assertEqual(window["capacity_limit_source"], "load_3h_q95_kwh")
+        self.assertEqual(
+            window["load_range_source"], "zone_historical_3h_load_min_max_range"
+        )
         self.assertAlmostEqual(window["target_peak_reduction_pct"], 40.0)
-        self.assertEqual(window["suggested_price_shift_pct"], 25.0)
+        self.assertAlmostEqual(window["suggested_price_shift_pct"], 5.26, places=2)
         self.assertFalse(window["grid_safe"])
         self.assertTrue(window["user_tolerant"])
         self.assertTrue(window["price_stable"])
 
-    def test_nash_uses_price_conditioned_baseline_and_q95_capacity(self):
+    def test_nash_uses_price_conditioned_baseline_and_historical_load_range(self):
         window = {
             "price_conditioned_baseline_load_kwh": 80.0,
             "sum_predicted_kwh": 120.0,
-            "load_3h_q95_kwh": 90.0,
-            "load_3h_q80_kwh": 40.0,
+            "historical_min_load_3h_kwh": 10.0,
+            "historical_max_load_3h_kwh": 90.0,
         }
 
         self.assertEqual(window_predicted_load(window), 80.0)
         self.assertEqual(
-            capacity_limit_kwh({"capacity_kw_proxy": 10.0}, window),
-            (90.0, "load_3h_q95_kwh"),
+            historical_load_bounds_kwh({"capacity_kw_proxy": 10.0}, window),
+            (10.0, 90.0, "zone_historical_3h_load_min_max_range"),
         )
 
-    def test_nash_does_not_require_service_price_to_cover_energy_price(self):
+    def test_nash_does_not_apply_an_economic_feasibility_constraint(self):
         window = solve_nash_equilibrium_window(
             {"category": "Commercial"},
             {},
@@ -346,9 +354,11 @@ class AgentParsingTests(unittest.TestCase):
                 "window_end": "2022-09-09 02:00:00",
                 "hours": 3,
                 "sum_predicted_kwh": 60.0,
-                "load_3h_q95_kwh": 100.0,
+                "historical_min_load_3h_kwh": 0.0,
+                "historical_max_load_3h_kwh": 100.0,
                 "mean_service_price": 1.0,
                 "mean_energy_price": 2.0,
+                "zone_mean_energy_price": 2.0,
                 "suggested_price_shift_pct": -10.0,
                 "action_label": "Utilization incentive",
                 "price_rationale": "Low stress window.",
@@ -364,8 +374,7 @@ class AgentParsingTests(unittest.TestCase):
     def test_load_policy_moves_each_tier_toward_medium(self):
         context = {
             "profile": {
-                "historical_min_service_price": 0.5,
-                "historical_max_service_price": 3.0,
+                "mean_energy_price": 1.5,
             }
         }
 
@@ -374,8 +383,9 @@ class AgentParsingTests(unittest.TestCase):
                 context,
                 {
                     "sum_predicted_kwh": load,
-                    "load_3h_q95_kwh": 100.0,
-                    "mean_service_price": 1.0,
+                    "historical_min_load_3h_kwh": 0.0,
+                    "historical_max_load_3h_kwh": 100.0,
+                    "mean_energy_price": 1.0,
                     "suggested_price_shift_pct": suggested,
                 },
                 elasticity=0.5,
@@ -396,33 +406,34 @@ class AgentParsingTests(unittest.TestCase):
             {"elasticity_factor": 0.5},
             {
                 "sum_predicted_kwh": 30.0,
-                "load_3h_q95_kwh": 100.0,
-                "mean_service_price": 1.0,
+                "historical_min_load_3h_kwh": 0.0,
+                "historical_max_load_3h_kwh": 100.0,
+                "mean_energy_price": 1.0,
                 "suggested_price_shift_pct": 0.0,
             },
         )
         self.assertTrue(low_window["load_in_medium_band"])
-        self.assertGreaterEqual(low_window["expected_load_pct_of_q95"], 35.0)
+        self.assertGreaterEqual(low_window["expected_load_range_position_pct"], 35.0)
 
-    def test_load_policy_clamps_service_price_to_zone_history(self):
+    def test_load_policy_clamps_energy_price_to_zone_mean_range(self):
         shift = price_shift_to_medium_band(
             {
                 "profile": {
-                    "historical_min_service_price": 0.9,
-                    "historical_max_service_price": 1.1,
+                    "mean_energy_price": 1.0,
                 }
             },
             {
-                "sum_predicted_kwh": 100.0,
-                "load_3h_q95_kwh": 100.0,
-                "mean_service_price": 1.0,
-                "suggested_price_shift_pct": 40.0,
+                "sum_predicted_kwh": 30.0,
+                "historical_min_load_3h_kwh": 0.0,
+                "historical_max_load_3h_kwh": 100.0,
+                "mean_energy_price": 0.5,
+                "suggested_price_shift_pct": -40.0,
             },
             elasticity=0.5,
         )
 
-        self.assertAlmostEqual(shift, 10.0)
-        self.assertAlmostEqual(1.0 * (1 + shift / 100.0), 1.1)
+        self.assertAlmostEqual(shift, -20.0)
+        self.assertAlmostEqual(0.5 * (1 + shift / 100.0), 0.4)
 
     def test_run_zone_chain_repairs_invalid_economist_response(self):
         class FakeClient:
@@ -487,7 +498,7 @@ class AgentParsingTests(unittest.TestCase):
             "grid_stress_level": "High",
             "weather": {"rain_hours": 0},
             "hourly_shape": {"night_20_6": 1.0, "morning_7_10": 0.8, "evening_17_22": 0.7},
-            "profile": {"poi_total": 10},
+            "profile": {"poi_total": 10, "mean_energy_price": 1.0},
             "hourly_averages": {"mean_predicted_kwh": 10.0, "mean_energy_price": 1.0},
             "pricing_windows_3h": [
                 {
@@ -495,16 +506,17 @@ class AgentParsingTests(unittest.TestCase):
                     "window_end": "2022-09-09 02:00:00",
                     "sum_predicted_kwh": 60.0,
                     "mean_predicted_kwh": 20.0,
+                    "mean_energy_price": 1.0,
                     "load_stress_level": "High",
                 }
             ],
         }
         report = asyncio.run(run_zone_chain(context, client=client, temperature=0.2))
         self.assertEqual(len(client.prompts), 4)
-        self.assertEqual(report["action_label"], "Raise price to reduce load toward Medium")
+        self.assertEqual(report["action_label"], "Raise energy price to reduce load toward Medium")
         self.assertEqual(
             report["price_change_windows_3h"][0]["action_label"],
-            "Raise price to reduce load toward Medium",
+            "Raise energy price to reduce load toward Medium",
         )
         self.assertNotIn("MODEL_RESPONSE_FAILED", report["price_rationale"])
         debug = report[ECONOMIST_AGENT_OUTPUT_KEY]
@@ -535,7 +547,7 @@ class AgentParsingTests(unittest.TestCase):
             "grid_stress_level": "High",
             "weather": {"rain_hours": 0},
             "hourly_shape": {"night_20_6": 1.0, "morning_7_10": 0.8, "evening_17_22": 0.7},
-            "profile": {"poi_total": 10},
+            "profile": {"poi_total": 10, "mean_energy_price": 1.0},
             "hourly_averages": {"mean_predicted_kwh": 10.0, "mean_energy_price": 1.0},
             "pricing_windows_3h": [
                 {
@@ -543,8 +555,10 @@ class AgentParsingTests(unittest.TestCase):
                     "window_end": "2022-09-09 02:00:00",
                     "sum_predicted_kwh": 60.0,
                     "mean_predicted_kwh": 20.0,
+                    "mean_energy_price": 1.0,
                     "load_stress_level": "High",
-                    "load_3h_q95_kwh": 40.0,
+                    "historical_min_load_3h_kwh": 0.0,
+                    "historical_max_load_3h_kwh": 40.0,
                 }
             ],
         }
@@ -563,7 +577,8 @@ class AgentParsingTests(unittest.TestCase):
         self.assertEqual(window["nash_status"], "skipped")
         self.assertIsNone(window["nash_equilibrium_reached"])
         self.assertGreater(window["suggested_price_shift_pct"], 0.0)
-        self.assertLessEqual(window["suggested_price_shift_pct"], 25.0)
+        self.assertLessEqual(window["predicted_energy_price"], 2.0)
+        self.assertEqual(window["zone_mean_energy_price"], 1.0)
         self.assertEqual(report["nash_equilibrium_summary"], "Nash equilibrium skipped for 1 pricing windows")
 
     def test_single_model_mode_uses_one_agent_call(self):
@@ -617,7 +632,7 @@ class AgentParsingTests(unittest.TestCase):
             "grid_stress_level": "Medium",
             "weather": {"rain_hours": 0},
             "hourly_shape": {"night_20_6": 1.0, "morning_7_10": 0.8, "evening_17_22": 0.7},
-            "profile": {"poi_total": 10},
+            "profile": {"poi_total": 10, "mean_energy_price": 1.0},
             "hourly_averages": {"mean_predicted_kwh": 10.0, "mean_energy_price": 1.0},
             "pricing_windows_3h": [
                 {
@@ -625,8 +640,10 @@ class AgentParsingTests(unittest.TestCase):
                     "window_end": "2022-09-09 02:00:00",
                     "sum_predicted_kwh": 30.0,
                     "mean_predicted_kwh": 10.0,
+                    "mean_energy_price": 1.0,
                     "load_stress_level": "Medium",
-                    "load_3h_q95_kwh": 100.0,
+                    "historical_min_load_3h_kwh": 0.0,
+                    "historical_max_load_3h_kwh": 100.0,
                 }
             ],
         }
@@ -686,17 +703,28 @@ class AgentParsingTests(unittest.TestCase):
                                 "sum_predicted_kwh": 30.0,
                                 "mean_predicted_kwh": 10.0,
                                 "sum_actual_kwh": 24.0,
-                                "mean_service_price": 1.0,
-                                "mean_energy_price": 0.5,
-                                "load_pct_of_q95": 75.0,
-                                "actual_load_pct_of_q95": 60.0,
-                                "historical_min_service_price": 0.8,
-                                "historical_max_service_price": 1.4,
+                                "mean_service_price": 0.5,
+                                "mean_energy_price": 1.0,
+                                "load_range_position_pct": 75.0,
+                                "actual_load_range_position_pct": 60.0,
+                                "historical_min_load_3h_kwh": 0.0,
+                                "historical_max_load_3h_kwh": 40.0,
+                                "historical_load_range_3h_kwh": 40.0,
+                                "low_medium_threshold_pct": 35.0,
+                                "medium_high_threshold_pct": 80.0,
+                                "high_extremely_high_threshold_pct": 90.0,
+                                "load_3h_low_medium_threshold_kwh": 14.0,
+                                "load_3h_medium_high_threshold_kwh": 32.0,
+                                "load_3h_high_extremely_high_threshold_kwh": 36.0,
+                                "zone_mean_energy_price": 1.1,
+                                "min_allowed_energy_price": 0.44,
+                                "max_allowed_energy_price": 2.2,
+                                "energy_price_bound_source": "zone_mean_energy_price_0.4x_to_2.0x",
                                 "actual_stress_load_3h_kwh": 24.0,
                                 "price_conditioned_baseline_load_kwh": 27.0,
                                 "price_conditioned_mean_predicted_kwh": 9.0,
                                 "price_conditioned_peak_predicted_kwh": 11.0,
-                                "price_conditioned_service_price": 1.08,
+                                "price_conditioned_energy_price": 1.08,
                                 "nash_status": "reached",
                                 "nash_equilibrium_reached": True,
                                 "suggested_price_shift_pct": 10.0,
@@ -722,22 +750,58 @@ class AgentParsingTests(unittest.TestCase):
             price_schedule = pd.read_csv(outputs["price_schedule_3h_csv"])
             self.assertIn("actual_service_price", price_schedule.columns)
             self.assertIn("actual_energy_price", price_schedule.columns)
-            self.assertIn("predicted_service_price", price_schedule.columns)
-            self.assertEqual(price_schedule.loc[0, "load_pct_of_q95"], 75.0)
-            self.assertEqual(price_schedule.loc[0, "actual_load_pct_of_q95"], 60.0)
-            self.assertEqual(price_schedule.loc[0, "historical_min_service_price"], 0.8)
-            self.assertEqual(price_schedule.loc[0, "historical_max_service_price"], 1.4)
+            self.assertIn("predicted_energy_price", price_schedule.columns)
+            self.assertNotIn("predicted_service_price", price_schedule.columns)
+            self.assertEqual(price_schedule.loc[0, "actual_service_price"], 0.5)
+            self.assertEqual(price_schedule.loc[0, "actual_energy_price"], 1.0)
+            self.assertEqual(price_schedule.loc[0, "predicted_energy_price"], 1.1)
+            self.assertEqual(price_schedule.loc[0, "load_range_position_pct"], 75.0)
+            self.assertEqual(price_schedule.loc[0, "actual_load_range_position_pct"], 60.0)
+            self.assertEqual(price_schedule.loc[0, "historical_min_load_3h_kwh"], 0.0)
+            self.assertEqual(price_schedule.loc[0, "historical_max_load_3h_kwh"], 40.0)
+            self.assertEqual(price_schedule.loc[0, "low_medium_threshold_pct"], 35.0)
+            self.assertEqual(price_schedule.loc[0, "medium_high_threshold_pct"], 80.0)
+            self.assertEqual(
+                price_schedule.loc[0, "high_extremely_high_threshold_pct"], 90.0
+            )
+            self.assertEqual(price_schedule.loc[0, "zone_mean_energy_price"], 1.1)
+            self.assertEqual(price_schedule.loc[0, "min_allowed_energy_price"], 0.44)
+            self.assertEqual(price_schedule.loc[0, "max_allowed_energy_price"], 2.2)
+            self.assertEqual(
+                price_schedule.loc[0, "energy_price_bound_source"],
+                "zone_mean_energy_price_0.4x_to_2.0x",
+            )
             self.assertNotIn("mean_predicted_kwh", price_schedule.columns)
             self.assertNotIn("actual_stress_load_3h_kwh", price_schedule.columns)
+            self.assertNotIn("load_3h_q50_kwh", price_schedule.columns)
+            self.assertNotIn("load_3h_q80_kwh", price_schedule.columns)
+            self.assertNotIn("load_low_max_pct", price_schedule.columns)
             window_cache = pd.read_csv(outputs["window_load_price_cache_csv"])
             self.assertEqual(window_cache.loc[0, "forecast_model"], "timesfm")
             self.assertEqual(window_cache.loc[0, "agent_mode"], "agents")
             self.assertEqual(window_cache.loc[0, "forecast_load_kwh"], 30.0)
             self.assertEqual(window_cache.loc[0, "price_conditioned_load_kwh"], 27.0)
-            self.assertEqual(window_cache.loc[0, "predicted_service_price"], 1.1)
-            self.assertEqual(window_cache.loc[0, "actual_load_pct_of_q95"], 60.0)
-            self.assertEqual(window_cache.loc[0, "historical_min_service_price"], 0.8)
-            self.assertEqual(window_cache.loc[0, "historical_max_service_price"], 1.4)
+            self.assertEqual(window_cache.loc[0, "predicted_energy_price"], 1.1)
+            self.assertEqual(window_cache.loc[0, "actual_service_price"], 0.5)
+            self.assertEqual(window_cache.loc[0, "actual_energy_price"], 1.0)
+            self.assertEqual(window_cache.loc[0, "actual_load_range_position_pct"], 60.0)
+            self.assertEqual(window_cache.loc[0, "historical_min_load_3h_kwh"], 0.0)
+            self.assertEqual(window_cache.loc[0, "historical_max_load_3h_kwh"], 40.0)
+            self.assertEqual(window_cache.loc[0, "load_3h_low_medium_threshold_kwh"], 14.0)
+            self.assertEqual(window_cache.loc[0, "load_3h_medium_high_threshold_kwh"], 32.0)
+            self.assertEqual(
+                window_cache.loc[0, "load_3h_high_extremely_high_threshold_kwh"], 36.0
+            )
+            self.assertEqual(window_cache.loc[0, "zone_mean_energy_price"], 1.1)
+            self.assertEqual(window_cache.loc[0, "min_allowed_energy_price"], 0.44)
+            self.assertEqual(window_cache.loc[0, "max_allowed_energy_price"], 2.2)
+            self.assertEqual(
+                window_cache.loc[0, "energy_price_bound_source"],
+                "zone_mean_energy_price_0.4x_to_2.0x",
+            )
+            self.assertNotIn("load_3h_q50_kwh", window_cache.columns)
+            self.assertNotIn("load_3h_q80_kwh", window_cache.columns)
+            self.assertNotIn("load_low_max_pct", window_cache.columns)
 
     def test_reuses_complete_precomputed_window_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -754,9 +818,14 @@ class AgentParsingTests(unittest.TestCase):
                         "price_conditioned_load_kwh": 27.0,
                         "price_conditioned_mean_load_kwh": 9.0,
                         "price_conditioned_peak_load_kwh": 11.0,
-                        "predicted_service_price": 1.1,
-                        "forecaster_input_predicted_service_price": 1.08,
-                        "actual_service_price": 1.0,
+                        "predicted_energy_price": 1.1,
+                        "forecaster_input_predicted_energy_price": 1.08,
+                        "actual_energy_price": 1.0,
+                        "actual_service_price": 0.6,
+                        "zone_mean_energy_price": 1.0,
+                        "min_allowed_energy_price": 0.4,
+                        "max_allowed_energy_price": 2.0,
+                        "energy_price_bound_source": "zone_mean_energy_price_0.4x_to_2.0x",
                         "final_price_shift_pct": 10.0,
                         "nash_status": "reached",
                         "nash_equilibrium_reached": True,
@@ -792,7 +861,8 @@ class AgentParsingTests(unittest.TestCase):
                         {
                             "window_start": "2022-09-09 00:00:00",
                             "window_end": "2022-09-09 02:00:00",
-                            "mean_service_price": 1.0,
+                            "mean_service_price": 0.6,
+                            "mean_energy_price": 1.0,
                         }
                     ],
                 }
@@ -801,8 +871,8 @@ class AgentParsingTests(unittest.TestCase):
             window = replayed["price_change_windows_3h"][0]
             self.assertEqual(window["sum_predicted_kwh"], 30.0)
             self.assertEqual(window["price_conditioned_baseline_load_kwh"], 27.0)
-            self.assertEqual(window["predicted_service_price"], 1.1)
-            self.assertEqual(window["price_conditioned_service_price"], 1.08)
+            self.assertEqual(window["predicted_energy_price"], 1.1)
+            self.assertEqual(window["price_conditioned_energy_price"], 1.08)
             self.assertEqual(replayed["source"], "precomputed_window_data")
             self.assertEqual(replayed["agent_total_tokens"], 0)
             self.assertEqual(replayed["agent_time_cost_seconds"], 0.0)
@@ -877,7 +947,7 @@ class AgentParsingTests(unittest.TestCase):
             "predicted_change_pct": 5.0,
             "weather": {"rain_hours": 0},
             "hourly_shape": {"night_20_6": 1.0, "morning_7_10": 0.8, "evening_17_22": 0.7},
-            "profile": {"poi_total": 10},
+            "profile": {"poi_total": 10, "mean_energy_price": 1.0},
         }
         first = heuristic_behavior(
             {
@@ -1113,12 +1183,12 @@ class ForecastingTests(unittest.TestCase):
         self.assertIn("predicted_kwh", result)
         self.assertGreater(result["predicted_kwh"].sum(), 0)
 
-    def test_ar_forecast_uses_service_price_adjustment(self):
+    def test_ar_forecast_uses_energy_price_adjustment(self):
         history = pd.DataFrame(
             {
                 "time": pd.date_range("2023-01-01", periods=24 * 7, freq="h"),
                 "actual_kwh": [10.0] * (24 * 7),
-                "s_price": [1.0] * (24 * 7),
+                "e_price": [1.0] * (24 * 7),
             }
         )
         forecast_start = pd.Timestamp("2023-01-08")
@@ -1126,7 +1196,7 @@ class ForecastingTests(unittest.TestCase):
             {
                 "time": pd.date_range(forecast_start, periods=6, freq="h"),
                 "actual_kwh": [np.nan] * 6,
-                "s_price": [1.5] * 6,
+                "e_price": [1.5] * 6,
             }
         )
 
@@ -1134,8 +1204,8 @@ class ForecastingTests(unittest.TestCase):
         adjusted = ar_forecast(history, forecast_start, 6, full_frame=full_frame)
 
         self.assertTrue((adjusted["predicted_kwh"] < baseline["predicted_kwh"]).all())
-        self.assertTrue((adjusted["service_price_adjustment_kwh"] < 0).all())
-        self.assertTrue(adjusted.attrs["service_price_adjustment"]["enabled"])
+        self.assertTrue((adjusted["energy_price_adjustment_kwh"] < 0).all())
+        self.assertTrue(adjusted.attrs["energy_price_adjustment"]["enabled"])
 
     def test_forecast_metrics_include_error_standards(self):
         hourly = pd.DataFrame(
@@ -1230,7 +1300,7 @@ class ForecastingTests(unittest.TestCase):
         self.assertEqual(result["q10_kwh"].tolist(), [0.5, 1.5])
         self.assertEqual(result["q90_kwh"].tolist(), [1.5, 2.5])
 
-    def test_chronos_forecast_passes_service_price_covariates(self):
+    def test_chronos_forecast_passes_energy_price_covariates(self):
         test_case = self
 
         class FakeChronos2:
@@ -1241,9 +1311,9 @@ class ForecastingTests(unittest.TestCase):
                 self.inputs.append(inputs)
                 payload = inputs[0]
                 test_case.assertIsInstance(payload, dict)
-                test_case.assertIn("s_price", payload["past_covariates"])
-                test_case.assertIn("s_price", payload["future_covariates"])
-                np.testing.assert_allclose(payload["future_covariates"]["s_price"], [1.5, 1.6])
+                test_case.assertIn("e_price", payload["past_covariates"])
+                test_case.assertIn("e_price", payload["future_covariates"])
+                np.testing.assert_allclose(payload["future_covariates"]["e_price"], [1.5, 1.6])
                 center = torch.arange(1, prediction_length + 1, dtype=torch.float32)
                 quantiles = torch.stack([center - 0.5, center, center + 0.5], dim=-1).unsqueeze(0)
                 return [quantiles], [center.unsqueeze(0)]
@@ -1253,14 +1323,14 @@ class ForecastingTests(unittest.TestCase):
             {
                 "time": pd.date_range("2023-01-01", periods=24, freq="h"),
                 "actual_kwh": [float(hour + 1) for hour in range(24)],
-                "s_price": [1.0] * 24,
+                "e_price": [1.0] * 24,
             }
         )
         full_frame = pd.DataFrame(
             {
                 "time": pd.date_range("2023-01-02", periods=2, freq="h"),
                 "actual_kwh": [np.nan, np.nan],
-                "s_price": [1.5, 1.6],
+                "e_price": [1.5, 1.6],
             }
         )
         with patch("forecasting.load_chronos_model", return_value=fake):
@@ -1273,14 +1343,14 @@ class ForecastingTests(unittest.TestCase):
                 repo="fake",
                 context_hours=24,
                 step_horizon=2,
-                exog_cols=["s_price"],
+                exog_cols=["e_price"],
                 diurnal_blend_alpha=0.0,
                 device="cpu",
                 roll_actuals=False,
             )
 
         self.assertEqual(result["predicted_kwh"].tolist(), [1.0, 2.0])
-        self.assertEqual(result.attrs["chronos_covariates"], ["s_price"])
+        self.assertEqual(result.attrs["chronos_covariates"], ["e_price"])
         self.assertEqual(len(fake.inputs), 1)
 
     def test_lstm_forecast_produces_hourly_predictions(self):
@@ -1321,12 +1391,12 @@ class ForecastingTests(unittest.TestCase):
 class SelectionTests(unittest.TestCase):
     def test_builds_price_comparison_fields_and_summary(self):
         fields = price_comparison_fields(1.0, 10)
-        self.assertEqual(fields["predicted_service_price"], 1.1)
-        self.assertEqual(fields["predicted_minus_actual_service_price"], 0.1)
+        self.assertEqual(fields["predicted_energy_price"], 1.1)
+        self.assertEqual(fields["predicted_minus_actual_energy_price"], 0.1)
         self.assertEqual(fields["predicted_vs_actual_pct"], 10.0)
-        self.assertNotIn("abs_predicted_minus_actual_service_price", fields)
+        self.assertNotIn("abs_predicted_minus_actual_energy_price", fields)
         explicit_price = price_comparison_fields(1.0, 99.0, 1.05)
-        self.assertEqual(explicit_price["predicted_service_price"], 1.05)
+        self.assertEqual(explicit_price["predicted_energy_price"], 1.05)
         self.assertEqual(explicit_price["predicted_vs_actual_pct"], 5.0)
 
         summary = build_price_comparison_summary(
@@ -1335,32 +1405,32 @@ class SelectionTests(unittest.TestCase):
                     {
                         "zone_id": "102",
                         "category": "User-selected",
-                        "actual_service_price": 1.0,
-                        "predicted_service_price": 1.05,
-                        "predicted_minus_actual_service_price": 0.05,
+                        "actual_energy_price": 1.0,
+                        "predicted_energy_price": 1.05,
+                        "predicted_minus_actual_energy_price": 0.05,
                         "predicted_vs_actual_pct": 5.0,
                     },
                     {
                         "zone_id": "102",
                         "category": "User-selected",
-                        "actual_service_price": 2.0,
-                        "predicted_service_price": 1.8,
-                        "predicted_minus_actual_service_price": -0.2,
+                        "actual_energy_price": 2.0,
+                        "predicted_energy_price": 1.8,
+                        "predicted_minus_actual_energy_price": -0.2,
                         "predicted_vs_actual_pct": -10.0,
                     },
                 ]
             )
         )
         self.assertNotIn("ALL", summary["zone_id"].tolist())
-        self.assertNotIn("avg_abs_predicted_minus_actual_service_price", summary.columns)
+        self.assertNotIn("avg_abs_predicted_minus_actual_energy_price", summary.columns)
         zone_summary = summary[summary["zone_id"] == "102"].iloc[0]
         self.assertEqual(zone_summary["price_windows"], 2)
         self.assertEqual(zone_summary["price_error_threshold_pct"], 8.0)
         self.assertEqual(zone_summary["price_pass_windows"], 1)
         self.assertAlmostEqual(zone_summary["price_accuracy"], 0.5)
-        self.assertAlmostEqual(zone_summary["avg_actual_service_price"], 1.5)
-        self.assertAlmostEqual(zone_summary["avg_predicted_service_price"], 1.425)
-        self.assertAlmostEqual(zone_summary["avg_predicted_minus_actual_service_price"], -0.075)
+        self.assertAlmostEqual(zone_summary["avg_actual_energy_price"], 1.5)
+        self.assertAlmostEqual(zone_summary["avg_predicted_energy_price"], 1.425)
+        self.assertAlmostEqual(zone_summary["avg_predicted_minus_actual_energy_price"], -0.075)
         self.assertAlmostEqual(zone_summary["avg_predicted_vs_actual_pct"], -2.5)
 
     def test_builds_hourly_agent_context_and_three_hour_windows(self):
@@ -1383,7 +1453,11 @@ class SelectionTests(unittest.TestCase):
         averages = build_hourly_averages(hourly)
         windows = build_pricing_windows_3h(
             hourly,
-            stress_thresholds={"available": True, "q50": 25.0, "q80": 35.0, "q95": 40.0},
+            stress_thresholds={
+                "available": True,
+                "historical_min_load_kwh": 0.0,
+                "historical_max_load_kwh": 40.0,
+            },
         )
         self.assertEqual(len(hourly_context), 6)
         self.assertEqual(hourly_context[0]["time"], "2022-09-09 00:00:00")
@@ -1395,9 +1469,13 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(windows[0]["actual_load_stress_level"], "Extremely High")
         self.assertTrue(windows[0]["stress_correct"])
         self.assertFalse(windows[0]["stress_missed"])
-        summary = apply_load_quantile_stress(
+        summary = apply_load_policy_stress(
             {"forecast_peak_kwh": 14.0},
-            {"available": True, "q50": 25.0, "q80": 35.0, "q95": 40.0},
+            {
+                "available": True,
+                "historical_min_load_kwh": 0.0,
+                "historical_max_load_kwh": 40.0,
+            },
             windows,
         )
         self.assertEqual(summary["grid_stress_level"], "Extremely High")
@@ -1407,18 +1485,18 @@ class SelectionTests(unittest.TestCase):
         self.assertAlmostEqual(summary["stress_accuracy"], 1.0)
         self.assertAlmostEqual(summary["miss_stress_rate"], 0.0)
 
-    def test_price_conditioned_service_price_uses_final_shift(self):
+    def test_price_conditioned_energy_price_uses_final_shift(self):
         times = pd.date_range("2022-09-09", periods=4, freq="h")
-        service_price = pd.DataFrame({"time": times, "102": [1.0, 1.0, 1.0, 1.0]})
+        energy_price = pd.DataFrame({"time": times, "102": [1.0, 1.0, 1.0, 1.0]})
 
-        adjusted = service_price_with_predicted_windows(
-            service_price,
+        adjusted = energy_price_with_predicted_windows(
+            energy_price,
             "102",
             [
                 {
                     "window_start": "2022-09-09 00:00:00",
                     "window_end": "2022-09-09 02:00:00",
-                    "mean_service_price": 1.0,
+                    "mean_energy_price": 1.0,
                     "pre_nash_suggested_price_shift_pct": 10.0,
                     "suggested_price_shift_pct": 20.0,
                 }
@@ -1426,9 +1504,12 @@ class SelectionTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["102"].tolist(), [1.2, 1.2, 1.2, 1.0])
-        self.assertEqual(ensure_service_price_exog_cols(["T", "e_price", "U"]), ["T", "e_price", "s_price", "U"])
+        self.assertEqual(
+            ensure_energy_price_exog_cols(["T", "s_price", "U"]),
+            ["T", "e_price", "s_price", "U"],
+        )
 
-    def test_service_price_history_bounds_ignore_zero_fill_values(self):
+    def test_zone_mean_energy_price_cache_ignores_zero_fill_values(self):
         price = pd.DataFrame(
             {
                 "time": pd.date_range("2022-09-09", periods=4, freq="h"),
@@ -1436,10 +1517,35 @@ class SelectionTests(unittest.TestCase):
             }
         )
 
-        features = compute_price_features(price, ["102"]).iloc[0]
+        features = compute_price_features(price, ["102"], price_type="energy").iloc[0]
 
-        self.assertAlmostEqual(features["historical_min_service_price"], 0.8)
-        self.assertAlmostEqual(features["historical_max_service_price"], 1.2)
+        self.assertAlmostEqual(features["mean_energy_price"], 1.0)
+
+    def test_existing_zone_profile_cache_adds_mean_energy_price(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            data_dir = root / "data"
+            cache_dir = root / "cache"
+            data_dir.mkdir()
+            cache_dir.mkdir()
+            times = pd.date_range("2022-09-09", periods=3, freq="h")
+            pd.DataFrame(
+                [{"zone_id": "102", "load_source_file": "volume.csv"}]
+            ).to_csv(cache_dir / "zone_profiles.csv", index=False)
+            pd.DataFrame({"time": times, "102": [0.5, 0.6, 0.7]}).to_csv(
+                data_dir / "s_price.csv", index=False
+            )
+            pd.DataFrame({"time": times, "102": [0.0, 0.8, 1.2]}).to_csv(
+                data_dir / "e_price.csv", index=False
+            )
+
+            profiles = build_zone_profiles(data_dir, cache_dir)
+            persisted = pd.read_csv(cache_dir / "zone_profiles.csv")
+
+            self.assertAlmostEqual(profiles.loc[0, "mean_energy_price"], 1.0)
+            self.assertAlmostEqual(persisted.loc[0, "mean_energy_price"], 1.0)
+            self.assertNotIn("historical_min_energy_price", persisted.columns)
+            self.assertNotIn("historical_max_energy_price", persisted.columns)
 
     def test_attaches_price_conditioned_baseline_to_report_windows(self):
         report = {
@@ -1461,7 +1567,7 @@ class SelectionTests(unittest.TestCase):
                     "mean_predicted_kwh": 18.0,
                     "peak_predicted_kwh": 20.0,
                     "load_stress_level": "Medium",
-                    "mean_service_price": 1.1,
+                    "mean_energy_price": 1.1,
                 }
             ],
             forecast_model="timesfm",
@@ -1471,7 +1577,7 @@ class SelectionTests(unittest.TestCase):
         self.assertEqual(window["price_conditioned_baseline_load_kwh"], 54.0)
         self.assertEqual(window["price_conditioned_mean_predicted_kwh"], 18.0)
         self.assertEqual(window["price_conditioned_load_stress_level"], "Medium")
-        self.assertIn("predicted_service_price", window["price_conditioned_baseline_source"])
+        self.assertIn("predicted_energy_price", window["price_conditioned_baseline_source"])
 
     def test_price_conditioned_baseline_runs_for_ar(self):
         class PipelineData:
@@ -1480,7 +1586,14 @@ class SelectionTests(unittest.TestCase):
         times = pd.date_range("2022-09-09", periods=3, freq="h")
         pipeline_data = PipelineData()
         pipeline_data.profiles = pd.DataFrame(
-            [{"zone_id": "102", "category": "User-selected", "capacity_kw_proxy": 100.0}]
+            [
+                {
+                    "zone_id": "102",
+                    "category": "User-selected",
+                    "capacity_kw_proxy": 100.0,
+                    "mean_energy_price": 0.5,
+                }
+            ]
         )
         pipeline_data.load = pd.DataFrame({"time": times, "102": [10.0, 10.0, 10.0]})
         pipeline_data.service_price = pd.DataFrame({"time": times, "102": [1.0, 1.0, 1.0]})
@@ -1496,6 +1609,10 @@ class SelectionTests(unittest.TestCase):
                         "window_start": "2022-09-09 00:00:00",
                         "window_end": "2022-09-09 02:00:00",
                         "mean_service_price": 1.0,
+                        "mean_energy_price": 0.5,
+                        "zone_mean_energy_price": 0.5,
+                        "min_allowed_energy_price": 0.2,
+                        "max_allowed_energy_price": 1.0,
                         "pre_nash_suggested_price_shift_pct": 10.0,
                         "suggested_price_shift_pct": 10.0,
                     }
@@ -1516,24 +1633,31 @@ class SelectionTests(unittest.TestCase):
                     "zone_id": "102",
                     "stress_source_file": "volume.csv",
                     "stress_window_hours": 3,
-                    "historical_windows": 10,
-                    "load_3h_q50_kwh": 20.0,
-                    "load_3h_q80_kwh": 35.0,
-                    "load_3h_q95_kwh": 40.0,
+                    "historical_3h_windows": 10,
+                    "historical_min_load_3h_kwh": 0.0,
+                    "historical_max_load_3h_kwh": 40.0,
+                    "historical_load_range_3h_kwh": 40.0,
+                    "low_medium_threshold_pct": 35.0,
+                    "medium_high_threshold_pct": 80.0,
+                    "high_extremely_high_threshold_pct": 90.0,
+                    "load_3h_low_medium_threshold_kwh": 14.0,
+                    "load_3h_medium_high_threshold_kwh": 32.0,
+                    "load_3h_high_extremely_high_threshold_kwh": 36.0,
                 }
             ]
         )
 
         def fake_forecast_zone(**kwargs):
             self.assertEqual(kwargs["forecast_model"], "AR")
-            self.assertEqual(kwargs["service_price"]["102"].tolist(), [1.1, 1.1, 1.1])
+            self.assertEqual(kwargs["service_price"]["102"].tolist(), [1.0, 1.0, 1.0])
+            self.assertEqual(kwargs["energy_price"]["102"].tolist(), [0.55, 0.55, 0.55])
             hourly = pd.DataFrame(
                 {
                     "time": times,
                     "predicted_kwh": [18.0, 18.0, 18.0],
                     "actual_kwh": [np.nan, np.nan, np.nan],
-                    "s_price": [1.1, 1.1, 1.1],
-                    "e_price": [0.5, 0.5, 0.5],
+                    "s_price": [1.0, 1.0, 1.0],
+                    "e_price": [0.55, 0.55, 0.55],
                 }
             )
             return ForecastResult(hourly=hourly, summary={})
@@ -1543,7 +1667,7 @@ class SelectionTests(unittest.TestCase):
                 reports=reports,
                 contexts=contexts,
                 pipeline_data=pipeline_data,
-                zone_load_quantiles=quantiles,
+                zone_load_thresholds=quantiles,
                 forecast_start="2022-09-09 00:00:00",
                 horizon_days=1,
                 history_days=7,
@@ -1575,9 +1699,9 @@ class SelectionTests(unittest.TestCase):
 
         window = updated[0]["price_change_windows_3h"][0]
         self.assertEqual(window["price_conditioned_baseline_load_kwh"], 54.0)
-        self.assertIn("AR_forecast_with_predicted_service_price", window["price_conditioned_baseline_source"])
+        self.assertIn("AR_forecast_with_predicted_energy_price", window["price_conditioned_baseline_source"])
 
-    def test_caches_zone_three_hour_load_quantiles_from_volume_csv(self):
+    def test_caches_zone_three_hour_load_range_thresholds_from_volume_csv(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             data_dir = root / "data"
@@ -1591,14 +1715,43 @@ class SelectionTests(unittest.TestCase):
                     "104": [2.0] * 12,
                 }
             ).to_csv(data_dir / "volume.csv", index=False)
+            cache_dir.mkdir()
+            pd.DataFrame(
+                [
+                    {
+                        "zone_id": "102",
+                        "stress_source_file": "volume.csv",
+                        "stress_window_hours": 3,
+                        "historical_3h_windows": 4,
+                        "load_3h_q50_kwh": 19.5,
+                        "load_3h_q80_kwh": 27.6,
+                        "load_3h_q95_kwh": 31.65,
+                    }
+                ]
+            ).to_csv(cache_dir / "zone_3h_load_quantiles.csv", index=False)
 
-            quantiles = build_zone_3h_load_quantiles(data_dir, cache_dir)
-            row = quantiles.set_index("zone_id").loc["102"]
+            thresholds = build_zone_3h_load_policy_thresholds(data_dir, cache_dir)
+            row = thresholds.set_index("zone_id").loc["102"]
             self.assertTrue((cache_dir / "zone_3h_load_quantiles.csv").exists())
             self.assertEqual(row["stress_source_file"], "volume.csv")
             self.assertEqual(row["stress_window_hours"], 3)
-            self.assertAlmostEqual(row["load_3h_q50_kwh"], 19.5)
-            self.assertAlmostEqual(row["load_3h_q80_kwh"], 27.6)
+            self.assertEqual(
+                row["load_policy_id"], "historical_3h_min_max_range_35_80_90"
+            )
+            self.assertNotIn("load_3h_q50_kwh", thresholds.columns)
+            self.assertNotIn("load_3h_q80_kwh", thresholds.columns)
+            self.assertNotIn("load_3h_q95_kwh", thresholds.columns)
+            self.assertAlmostEqual(row["historical_min_load_3h_kwh"], 6.0)
+            self.assertAlmostEqual(row["historical_max_load_3h_kwh"], 33.0)
+            self.assertAlmostEqual(row["historical_load_range_3h_kwh"], 27.0)
+            self.assertAlmostEqual(row["low_medium_threshold_pct"], 35.0)
+            self.assertAlmostEqual(row["medium_high_threshold_pct"], 80.0)
+            self.assertAlmostEqual(row["high_extremely_high_threshold_pct"], 90.0)
+            self.assertAlmostEqual(row["load_3h_low_medium_threshold_kwh"], 15.45)
+            self.assertAlmostEqual(row["load_3h_medium_high_threshold_kwh"], 27.6)
+            self.assertAlmostEqual(
+                row["load_3h_high_extremely_high_threshold_kwh"], 30.3
+            )
 
     def test_pipeline_load_source_uses_volume_csv(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1622,14 +1775,18 @@ class SelectionTests(unittest.TestCase):
             pipeline_data = load_pipeline_data(data_dir, profiles, ["102"])
             self.assertEqual(pipeline_data.load["102"].tolist(), [10.0, 11.0])
 
-    def test_classifies_grid_stress_from_percentage_of_zone_q95(self):
-        thresholds = {"available": True, "q95": 100.0, "reference_load_kwh": 100.0}
-        self.assertEqual(classify_load_stress(34.99, thresholds), "Low")
-        self.assertEqual(classify_load_stress(35.0, thresholds), "Medium")
-        self.assertEqual(classify_load_stress(79.99, thresholds), "Medium")
-        self.assertEqual(classify_load_stress(80.0, thresholds), "High")
-        self.assertEqual(classify_load_stress(89.99, thresholds), "High")
-        self.assertEqual(classify_load_stress(90.0, thresholds), "Extremely High")
+    def test_classifies_grid_stress_from_historical_load_range_position(self):
+        thresholds = {
+            "available": True,
+            "historical_min_load_kwh": 10.0,
+            "historical_max_load_kwh": 110.0,
+        }
+        self.assertEqual(classify_load_stress(44.99, thresholds), "Low")
+        self.assertEqual(classify_load_stress(45.0, thresholds), "Medium")
+        self.assertEqual(classify_load_stress(89.99, thresholds), "Medium")
+        self.assertEqual(classify_load_stress(90.0, thresholds), "High")
+        self.assertEqual(classify_load_stress(99.99, thresholds), "High")
+        self.assertEqual(classify_load_stress(100.0, thresholds), "Extremely High")
 
     def test_forecast_output_dir_uses_model_subfolder(self):
         self.assertEqual(forecast_output_dir(Path("output"), "chronos"), Path("output") / "chronos")
@@ -1755,7 +1912,7 @@ class SelectionTests(unittest.TestCase):
                             "zone_id": "102",
                             "category": "User-selected",
                             "price_accuracy": 0.5 if kwargs["agent_mode"] == "rules" else 0.75,
-                            "avg_predicted_minus_actual_service_price": 0.1,
+                            "avg_predicted_minus_actual_energy_price": 0.1,
                             "avg_predicted_vs_actual_pct": 5.0,
                         }
                     ]
@@ -1956,6 +2113,37 @@ class SelectionTests(unittest.TestCase):
         selected = select_zone_categories(profiles)
         self.assertEqual(len(selected), 5)
         self.assertEqual(selected["zone_id"].nunique(), 5)
+        self.assertEqual(
+            dict(zip(selected["category"], selected["zone_id"])),
+            {
+                "CBD / Office": "1",
+                "Residential": "2",
+                "Transport Hub": "3",
+                "Commercial / Mall": "4",
+                "Industrial": "5",
+            },
+        )
+
+    def test_zone_selection_uses_global_unique_assignment(self):
+        scores = pd.DataFrame({"zone_id": ["a", "b", "c", "d", "e"]})
+        for category in CATEGORY_ORDER:
+            scores[category] = -100.0
+        scores.loc[0, "CBD / Office"] = 10.0
+        scores.loc[1, "CBD / Office"] = 8.0
+        scores.loc[0, "Residential"] = 9.0
+        scores.loc[1, "Residential"] = 0.0
+        scores.loc[2, "Transport Hub"] = 10.0
+        scores.loc[3, "Commercial / Mall"] = 10.0
+        scores.loc[4, "Industrial"] = 10.0
+
+        assignments = optimal_unique_assignment(scores)
+
+        self.assertEqual(assignments[0], 1)
+        self.assertEqual(assignments[1], 0)
+
+    def test_zone_selection_rejects_too_few_zones(self):
+        with self.assertRaisesRegex(ValueError, "At least 5 zones"):
+            select_zone_categories(pd.DataFrame({"zone_id": ["1", "2", "3", "4"]}))
 
 
 if __name__ == "__main__":

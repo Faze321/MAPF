@@ -66,6 +66,25 @@ class AgentStageError(RuntimeError):
         super().__init__(message)
 
 
+class ProviderResponseDecodeError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        model: str,
+        attempts: int,
+        original: json.JSONDecodeError,
+    ) -> None:
+        self.model = model
+        self.attempts = attempts
+        self.original = original
+        super().__init__(
+            f"Provider returned malformed or truncated HTTP JSON for model {model} "
+            f"after {attempts} attempts. This occurred before model completion content "
+            f"parsing; last_decode_error={original.msg} at line {original.lineno}, "
+            f"column {original.colno}, char {original.pos}"
+        )
+
+
 class ChatClient(Protocol):
     async def complete_json(self, prompt: str, *, temperature: float) -> dict[str, Any]:
         ...
@@ -84,6 +103,12 @@ class AgentChatClient:
     def __post_init__(self) -> None:
         if not self.config.api_key:
             raise ValueError("agent.api_key is required when dry-run is disabled")
+        if self.config.max_concurrent_requests < 1:
+            raise ValueError("agent.max_concurrent_requests must be at least 1")
+        if self.config.provider_json_retries < 0:
+            raise ValueError("agent.provider_json_retries cannot be negative")
+        if self.config.provider_json_retry_backoff_seconds < 0:
+            raise ValueError("agent.provider_json_retry_backoff_seconds cannot be negative")
         from openai import AsyncOpenAI
 
         headers = {}
@@ -98,6 +123,7 @@ class AgentChatClient:
             default_headers=headers or None,
             timeout=self.config.timeout_seconds,
         )
+        self._request_semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
 
     async def complete_json(self, prompt: str, *, temperature: float) -> dict[str, Any]:
         request: dict[str, Any] = {
@@ -112,11 +138,35 @@ class AgentChatClient:
         extra_body = reasoning_extra_body(self.config)
         if extra_body is not None:
             request["extra_body"] = extra_body
-        response = await self._client.chat.completions.create(**request)
+        response = await self._create_completion_with_retry(request)
         content = completion_message_content(response, requested_model=self.config.model)
         payload = extract_json_object(content)
         payload[AGENT_COMPLETION_USAGE_KEY] = response_token_usage(response)
         return payload
+
+    async def _create_completion_with_retry(self, request: dict[str, Any]) -> Any:
+        retry_count = self.config.provider_json_retries
+        semaphore = getattr(self, "_request_semaphore", None)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
+            self._request_semaphore = semaphore
+
+        for attempt_index in range(retry_count + 1):
+            try:
+                async with semaphore:
+                    return await self._client.chat.completions.create(**request)
+            except json.JSONDecodeError as exc:
+                if attempt_index >= retry_count:
+                    raise ProviderResponseDecodeError(
+                        model=self.config.model,
+                        attempts=attempt_index + 1,
+                        original=exc,
+                    ) from exc
+                delay = self.config.provider_json_retry_backoff_seconds * (2**attempt_index)
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        raise AssertionError("provider response retry loop exited unexpectedly")
 
 
 @dataclass

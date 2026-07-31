@@ -59,8 +59,50 @@ python main.py --forecast-starts "2022-09-09 00:00:00" "2022-10-14 00:00:00" --f
 python main.py --forecast-starts "2022-09-09 00:00:00" --forecast-models chronos lstm --agent-modes agents rules --diurnal-blend-alphas 0.0 0.3 0.6
 python main.py --config config.yaml --model anthropic/claude-sonnet-4.5 --forecast-start "2023-02-25 00:00:00"
 python main.py --force-cache
-python main.py --precomputed-window-data "output/timesfm/window_load_price_cache.csv"
+python main.py --precomputed-window-data "output/timesfm/agent/window_load_price_cache.csv"
 ```
+
+## Separate Forecaster And Agent Runs
+
+The default `--stage full` runs both stages. To calculate and save only the initial load forecast:
+
+```powershell
+python main.py --stage forecaster --forecast-model AR --forecast-start "2022-09-09 00:00:00" --zones 115 --diurnal-blend-alpha 0.7
+```
+
+This writes the complete handoff under `output/<model>/forecaster/`, including `forecaster_manifest.json`, `selected_zones.csv`, `context_snippets.json`, forecast metrics, hourly forecast CSV files, and plots. Run the agent later with that output:
+
+```powershell
+python main.py --stage agent --forecaster-output-dir "output/AR/forecaster"
+```
+
+The agent validates and consumes the manifest instead of recomputing the initial forecast. Zone ids, forecast time, horizon, model, covariates, blend settings, and model hyperparameters come from the manifest, so changes to the current YAML do not alter the saved forecast. Agent reports are written to the sibling `output/<model>/agent/` directory. The price-conditioned load forecast still runs during the agent stage because its energy-price input is produced by the agent.
+
+```text
+output/<model>/
+  forecaster/
+    forecaster_manifest.json
+    selected_zones.csv
+    context_snippets.json
+    forecast_metrics.csv
+    forecast_details/
+  agent/
+    agent_manifest.json
+    rationale_trace.csv
+    price_schedule_3h.csv
+    window_load_price_cache.csv
+```
+
+The same settings can be stored as `run.pipeline_stage` and `run.forecaster_output_dir` in `config.yaml`. `precomputed_window_data` remains a separate post-agent window cache interface; it is not the forecaster-to-agent handoff.
+
+For an experiment matrix, run the same matrix configuration twice and change only the stage:
+
+```powershell
+python main.py --stage forecaster
+python main.py --stage agent
+```
+
+Keep the same output directory, forecast starts, models, seeds, agent-mode list, and blend list for both commands. The forecaster command keeps the mode count in the experiment folder name but computes one shared forecast per time/model/seed/blend combination. The agent command automatically finds that shared forecast and writes a separate `agent/` directory under each agent-mode run. `run.agent_output_dir` / `--agent-output-dir` is available for a custom single-run destination; matrix runs assign isolated destinations automatically.
 
 Runtime defaults can be stored under `run:` in `config.yaml`, so common settings do not need to be typed each time. Command-line options override YAML values only for that run. When `run.zones` / `--zones` is omitted, the pipeline keeps the original five-category automatic zone selection. When zones are provided, the pipeline skips category selection and validates only the specified zone ids.
 
@@ -77,9 +119,14 @@ agent:
   model: "meta-llama/llama-3.1-8b-instruct"
   single_model_model: "meta-llama/llama-3.3-70b-instruct"
   reasoning_effort: "none"
+  max_concurrent_requests: 4
+  provider_json_retries: 2
+  provider_json_retry_backoff_seconds: 1.0
 ```
 
 `agent.reasoning_effort: "none"` disables model thinking for JSON-mode requests. This is required by Qwen3 providers that reject `response_format: json_object` while thinking is enabled. The client omits this parameter automatically for `meta-llama/*` models, which do not use Qwen3-style switchable thinking.
+
+`agent.max_concurrent_requests` limits simultaneous provider calls across zone chains. `agent.provider_json_retries` controls additional attempts made only when the provider HTTP response itself is malformed or truncated; retries use exponential backoff starting at `agent.provider_json_retry_backoff_seconds`. A persistent failure still stops the run and is recorded with the original agent stage and zone.
 
 ## Load And Pricing Policy
 

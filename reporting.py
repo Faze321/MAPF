@@ -135,15 +135,84 @@ def write_outputs(
     forecast_model: str | None = None,
     agent_mode: str | None = None,
 ) -> dict[str, Path]:
+    outputs = write_forecaster_outputs(
+        output_dir=output_dir,
+        selected_zones=selected_zones,
+        contexts=contexts,
+        forecast_results=forecast_results,
+    )
+    outputs.update(
+        write_agent_outputs(
+            output_dir=output_dir,
+            reports=reports,
+            forecast_model=forecast_model,
+            agent_mode=agent_mode,
+        )
+    )
+    return outputs
+
+
+def write_forecaster_outputs(
+    *,
+    output_dir: Path,
+    selected_zones: pd.DataFrame,
+    contexts: list[dict[str, Any]],
+    forecast_results: dict[str, Any],
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_path = output_dir / "selected_zones.csv"
     contexts_path = output_dir / "context_snippets.json"
+    metrics_csv = output_dir / "forecast_metrics.csv"
+    metrics_md = output_dir / "forecast_metrics.md"
+    details_dir = output_dir / "forecast_details"
+    manifest_path = output_dir / "forecaster_manifest.json"
+
+    selected_zones.to_csv(selected_path, index=False)
+    contexts_path.write_text(json.dumps(contexts, indent=2, ensure_ascii=False), encoding="utf-8")
+    metrics = write_forecast_outputs(details_dir, metrics_csv, metrics_md, forecast_results)
+
+    outputs = {
+        "forecaster_output_dir": output_dir,
+        "selected_zones": selected_path,
+        "context_snippets": contexts_path,
+        "forecast_metrics_csv": metrics_csv,
+        "forecast_metrics_md": metrics_md,
+        "forecast_details_dir": details_dir,
+    }
+    outputs.update(metrics)
+    if manifest is not None:
+        manifest_payload = {
+            **manifest,
+            "artifacts": {
+                "selected_zones": selected_path.name,
+                "context_snippets": contexts_path.name,
+                "forecast_metrics_csv": metrics_csv.name,
+                "forecast_metrics_md": metrics_md.name,
+                "forecast_details_dir": details_dir.name,
+            },
+        }
+        manifest_path.write_text(
+            json.dumps(manifest_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        outputs["forecaster_manifest_json"] = manifest_path
+    return outputs
+
+
+def write_agent_outputs(
+    *,
+    output_dir: Path,
+    reports: list[dict[str, Any]],
+    forecast_model: str | None = None,
+    agent_mode: str | None = None,
+    manifest: dict[str, Any] | None = None,
+) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
     trace_csv = output_dir / "rationale_trace.csv"
     trace_md = output_dir / "rationale_trace.md"
     trace_json = output_dir / "rationale_trace.json"
     agent_debug_outputs_json = output_dir / "agent_debug_outputs.json"
-    metrics_csv = output_dir / "forecast_metrics.csv"
-    metrics_md = output_dir / "forecast_metrics.md"
     price_schedule_csv = output_dir / "price_schedule_3h.csv"
     price_schedule_md = output_dir / "price_schedule_3h.md"
     price_comparison_csv = output_dir / "price_comparison_summary.csv"
@@ -151,10 +220,8 @@ def write_outputs(
     window_load_price_cache_csv = output_dir / "window_load_price_cache.csv"
     explainability_rubric_md = output_dir / "explainability_rubric.md"
     explainability_review_packet_csv = output_dir / "explainability_review_packet.csv"
-    details_dir = output_dir / "forecast_details"
+    manifest_path = output_dir / "agent_manifest.json"
 
-    selected_zones.to_csv(selected_path, index=False)
-    contexts_path.write_text(json.dumps(contexts, indent=2, ensure_ascii=False), encoding="utf-8")
     trace_reports, agent_debug_outputs = split_agent_debug_outputs(reports)
     agent_debug_outputs_json.write_text(json.dumps(agent_debug_outputs, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -176,17 +243,13 @@ def write_outputs(
         explainability_review_packet_csv,
         trace_reports,
     )
-    metrics = write_forecast_outputs(details_dir, metrics_csv, metrics_md, forecast_results)
 
     outputs = {
-        "selected_zones": selected_path,
-        "context_snippets": contexts_path,
+        "agent_output_dir": output_dir,
         "rationale_trace_csv": trace_csv,
         "rationale_trace_md": trace_md,
         "rationale_trace_json": trace_json,
         "agent_debug_outputs_json": agent_debug_outputs_json,
-        "forecast_metrics_csv": metrics_csv,
-        "forecast_metrics_md": metrics_md,
         "price_schedule_3h_csv": price_schedule_csv,
         "price_schedule_3h_md": price_schedule_md,
         "price_comparison_summary_csv": price_comparison_csv,
@@ -194,9 +257,17 @@ def write_outputs(
         "window_load_price_cache_csv": window_load_price_cache_csv,
         "explainability_rubric_md": explainability_rubric_md,
         "explainability_review_packet_csv": explainability_review_packet_csv,
-        "forecast_details_dir": details_dir,
     }
-    outputs.update(metrics)
+    if manifest is not None:
+        manifest_payload = {
+            **manifest,
+            "artifacts": {name: path.name for name, path in outputs.items() if name != "agent_output_dir"},
+        }
+        manifest_path.write_text(
+            json.dumps(manifest_payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        outputs["agent_manifest_json"] = manifest_path
     return outputs
 
 

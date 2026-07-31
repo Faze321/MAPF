@@ -11,6 +11,7 @@ from config import (
     normalize_float_list,
     normalize_forecast_model_list,
     normalize_int_list,
+    normalize_pipeline_stage,
     normalize_string_list,
 )
 from orchestrator import format_failure_message, run_experiment_matrix, run_pipeline
@@ -42,6 +43,26 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=None,
         help="Rebuild cached zone profiles and POI assignment.",
+    )
+    parser.add_argument(
+        "--pipeline-stage",
+        "--stage",
+        dest="pipeline_stage",
+        default=None,
+        help="Execution stage: full, forecaster, or agent.",
+    )
+    parser.add_argument(
+        "--forecaster-output-dir",
+        default=None,
+        help=(
+            "Forecaster output directory (or forecaster_manifest.json) consumed by an "
+            "agent-only run. Defaults to <output-dir>/<forecast-model>/forecaster."
+        ),
+    )
+    parser.add_argument(
+        "--agent-output-dir",
+        default=None,
+        help="Optional agent-stage output directory. Defaults to a sibling of forecaster/.",
     )
     parser.add_argument(
         "--precomputed-window-data",
@@ -118,8 +139,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None):
     args = build_parser().parse_args(argv)
     config_path = Path(args.config)
-    app_config = AppConfig.from_file(config_path, required=False)
+    app_config = AppConfig.from_file(config_path, required=False, load_agent=False)
     run_config = app_config.run
+    pipeline_stage = normalize_pipeline_stage(
+        args.pipeline_stage if args.pipeline_stage is not None else run_config.pipeline_stage
+    )
+    forecaster_output_dir = (
+        args.forecaster_output_dir
+        if args.forecaster_output_dir is not None
+        else run_config.forecaster_output_dir
+    )
+    agent_output_dir = (
+        args.agent_output_dir
+        if args.agent_output_dir is not None
+        else run_config.agent_output_dir
+    )
 
     cli_starts = normalize_string_list(args.forecast_starts)
     if cli_starts:
@@ -145,11 +179,22 @@ def main(argv: list[str] | None = None):
     experiment_seeds = cli_seeds if cli_seeds else run_config.experiment_seeds
 
     cli_modes = normalize_agent_mode_list(args.agent_modes)
-    agent_modes = cli_modes if cli_modes else run_config.agent_modes
+    if cli_modes:
+        agent_modes = cli_modes
+    elif args.agent_mode:
+        agent_modes = [normalize_agent_mode(args.agent_mode)]
+    else:
+        agent_modes = run_config.agent_modes
 
     cli_alphas = normalize_float_list(args.diurnal_blend_alphas)
-    diurnal_blend_alphas = cli_alphas if cli_alphas else run_config.diurnal_blend_alphas
-    run_matrix = (
+    if cli_alphas:
+        diurnal_blend_alphas = cli_alphas
+    elif args.diurnal_blend_alpha is not None:
+        diurnal_blend_alphas = [float(args.diurnal_blend_alpha)]
+    else:
+        diurnal_blend_alphas = run_config.diurnal_blend_alphas
+    run_matrix = pipeline_stage != "agent" or not forecaster_output_dir
+    run_matrix = run_matrix and (
         len(forecast_starts) > 1
         or len(forecast_models) > 1
         or bool(experiment_seeds and len(experiment_seeds) > 1)
@@ -157,10 +202,17 @@ def main(argv: list[str] | None = None):
         or bool(diurnal_blend_alphas and len(diurnal_blend_alphas) > 1)
     )
 
-    agent_mode = normalize_agent_mode(args.agent_mode) if args.agent_mode else run_config.agent_mode
+    if args.agent_mode:
+        agent_mode = normalize_agent_mode(args.agent_mode)
+    elif agent_modes and len(agent_modes) == 1:
+        agent_mode = agent_modes[0]
+    else:
+        agent_mode = run_config.agent_mode
     diurnal_blend_alpha = (
         args.diurnal_blend_alpha
         if args.diurnal_blend_alpha is not None
+        else diurnal_blend_alphas[0]
+        if diurnal_blend_alphas and len(diurnal_blend_alphas) == 1
         else run_config.diurnal_blend_alpha
     )
 
@@ -172,6 +224,9 @@ def main(argv: list[str] | None = None):
         "weather_file": args.weather_file or run_config.weather_file,
         "dry_run": args.dry_run if args.dry_run is not None else run_config.dry_run,
         "force_cache": args.force_cache if args.force_cache is not None else run_config.force_cache,
+        "pipeline_stage": pipeline_stage,
+        "forecaster_output_dir": forecaster_output_dir,
+        "agent_output_dir": agent_output_dir,
         "precomputed_window_data": (
             args.precomputed_window_data
             if args.precomputed_window_data is not None

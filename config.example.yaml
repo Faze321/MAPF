@@ -5,6 +5,9 @@ agent:
   single_model_model: "meta-llama/llama-3.3-70b-instruct"
   reasoning_effort: "none" # required for JSON mode with Qwen3 thinking models
   timeout_seconds: 90
+  max_concurrent_requests: 4
+  provider_json_retries: 2 # additional attempts for malformed/truncated provider HTTP JSON
+  provider_json_retry_backoff_seconds: 1.0
 
 run:
   data_dir: "data"
@@ -12,6 +15,9 @@ run:
   weather_file: "weather_central.csv"
   dry_run: false
   force_cache: false
+  pipeline_stage: "full" # options: "full", "forecaster", "agent"
+  forecaster_output_dir: null # required only to override the default agent-stage input folder
+  agent_output_dir: null # optional override; normally written beside forecaster/
   precomputed_window_data: null # path to a previous window_load_price_cache.csv
   max_poi_rows: null
   forecast_start: "2022-09-09 00:00:00"

@@ -7,6 +7,8 @@ import re
 import os
 import yaml
 
+PIPELINE_STAGES = {"full", "forecaster", "agent"}
+
 _ENV_REF_RE = re.compile(r"""
                          \$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\} 
                          |\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*) 
@@ -19,6 +21,9 @@ class RunConfig:
     weather_file: str = "weather_airport.csv"
     dry_run: bool = False
     force_cache: bool = False
+    pipeline_stage: str = "full"
+    forecaster_output_dir: str | None = None
+    agent_output_dir: str | None = None
     precomputed_window_data: str | None = None
     max_poi_rows: int | None = None
     forecast_start: str | None = None
@@ -101,6 +106,9 @@ class RunConfig:
             weather_file=optional_str(settings.get("weather_file")) or "weather_airport.csv",
             dry_run=optional_bool(settings.get("dry_run"), False),
             force_cache=optional_bool(settings.get("force_cache"), False),
+            pipeline_stage=normalize_pipeline_stage(settings.get("pipeline_stage")),
+            forecaster_output_dir=optional_str(settings.get("forecaster_output_dir")),
+            agent_output_dir=optional_str(settings.get("agent_output_dir")),
             precomputed_window_data=optional_str(settings.get("precomputed_window_data")),
             max_poi_rows=optional_int(settings.get("max_poi_rows")),
             forecast_start=optional_str(settings.get("forecast_start")),
@@ -161,6 +169,9 @@ class AgentConfig:
     http_referer: str | None = None
     title: str | None = None
     timeout_seconds: float = 90.0
+    max_concurrent_requests: int = 4
+    provider_json_retries: int = 2
+    provider_json_retry_backoff_seconds: float = 1.0
 
     @classmethod
     def from_file(
@@ -197,6 +208,11 @@ class AgentConfig:
             http_referer=optional_str(settings.get("http_referer")),
             title=optional_str(settings.get("title")) or "MAPF UrbanEV",
             timeout_seconds=float(settings.get("timeout_seconds", 90)),
+            max_concurrent_requests=int(settings.get("max_concurrent_requests", 4)),
+            provider_json_retries=int(settings.get("provider_json_retries", 2)),
+            provider_json_retry_backoff_seconds=float(
+                settings.get("provider_json_retry_backoff_seconds", 1.0)
+            ),
         )
 
     @classmethod
@@ -209,13 +225,35 @@ class AgentConfig:
         )
 
 
+def normalize_pipeline_stage(value: Any) -> str:
+    stage = str(value or "full").strip().lower().replace("-", "_")
+    aliases = {
+        "forecast": "forecaster",
+        "forecast_only": "forecaster",
+        "forecaster_only": "forecaster",
+        "agent_only": "agent",
+        "all": "full",
+    }
+    stage = aliases.get(stage, stage)
+    if stage not in PIPELINE_STAGES:
+        raise ValueError(
+            f"Unsupported pipeline stage: {value}. Expected one of: agent, forecaster, full."
+        )
+    return stage
+
 @dataclass(frozen=True)
 class AppConfig:
     agent: AgentConfig
     run: RunConfig
 
     @classmethod
-    def from_file(cls, path: Path, *, required: bool = False) -> "AppConfig":
+    def from_file(
+        cls,
+        path: Path,
+        *,
+        required: bool = False,
+        load_agent: bool = True,
+    ) -> "AppConfig":
         if not path.exists():
             if required:
                 raise FileNotFoundError(
@@ -223,7 +261,7 @@ class AppConfig:
                 )
             return cls(agent=AgentConfig.default(), run=RunConfig())
 
-        raw = read_config_mapping(path)
+        raw = read_config_mapping(path, expand_env=False)
         agent_settings = raw.get("agent")
         if not isinstance(agent_settings, dict):
             raise ValueError('Config key "agent" must contain a mapping')
@@ -232,8 +270,13 @@ class AppConfig:
             run_settings = {}
         if not isinstance(run_settings, dict):
             raise ValueError('Config key "run" must contain a mapping')
+        run_settings = _expand_env_vars(run_settings)
         return cls(
-            agent=AgentConfig.from_file(path, required=required),
+            agent=(
+                AgentConfig.from_file(path, required=required)
+                if load_agent
+                else AgentConfig.default()
+            ),
             run=RunConfig.from_mapping(run_settings),
         )
 
@@ -254,13 +297,12 @@ def _expand_env_vars(obj: Any) -> Any:
     else:
         return obj
 
-def read_config_mapping(path: Path) -> dict[str, Any]:
+def read_config_mapping(path: Path, *, expand_env: bool = True) -> dict[str, Any]:
     text = path.read_text(encoding="utf-8")
     value = yaml.safe_load(text)
-    value = _expand_env_vars(value)
     if not isinstance(value, dict):
         raise ValueError(f"Config file must contain a mapping: {path}")
-    return value
+    return _expand_env_vars(value) if expand_env else value
 
 
 def optional_str(value: Any) -> str | None:

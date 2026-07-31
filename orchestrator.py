@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import traceback
 from collections.abc import Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,12 @@ from agents import (
     run_all_zone_chains,
     summarize_nash_equilibrium,
 )
-from config import AgentConfig, normalize_agent_mode, normalize_forecast_model_name
+from config import (
+    AgentConfig,
+    normalize_agent_mode,
+    normalize_forecast_model_name,
+    normalize_pipeline_stage,
+)
 from data_loader import build_zone_3h_load_policy_thresholds, build_zone_profiles, load_pipeline_data
 from forecasting import DEFAULT_TIMESFM_EXOG_COLS, ForecastResult, forecast_zone
 from load_policy import (
@@ -30,7 +36,7 @@ from load_policy import (
     classify_load_percentage,
     load_range_position_pct,
 )
-from reporting import safe_filename, write_outputs
+from reporting import safe_filename, write_agent_outputs, write_forecaster_outputs
 from zone_selection import select_zone_categories
 
 
@@ -45,6 +51,7 @@ ERROR_CODE_BY_STAGE = {
     "load_data": "MAPF-E020",
     "forecast": "MAPF-E100",
     "build_contexts": "MAPF-E110",
+    "load_forecaster_output": "MAPF-E115",
     "precomputed_window_data": "MAPF-E120",
     "agent_chain": "MAPF-E200",
     "agent.grid": "MAPF-E210",
@@ -55,6 +62,44 @@ ERROR_CODE_BY_STAGE = {
     "write_outputs": "MAPF-E300",
     "unexpected": "MAPF-E900",
 }
+FORECASTER_MANIFEST_SCHEMA_VERSION = 1
+FORECAST_PARAMETER_NAMES = (
+    "forecast_start",
+    "horizon_days",
+    "history_days",
+    "validation_days",
+    "forecast_model",
+    "timesfm_repo",
+    "timesfm_context_hours",
+    "timesfm_step_horizon",
+    "timesfm_exog_cols",
+    "timesfm_diurnal_blend_alpha",
+    "timesfm_roll_actuals",
+    "ar_diurnal_blend_alpha",
+    "chronos_repo",
+    "chronos_context_hours",
+    "chronos_step_horizon",
+    "chronos_diurnal_blend_alpha",
+    "chronos_device",
+    "chronos_roll_actuals",
+    "lstm_context_hours",
+    "lstm_step_horizon",
+    "lstm_exog_cols",
+    "lstm_hidden_size",
+    "lstm_num_layers",
+    "lstm_epochs",
+    "lstm_learning_rate",
+    "lstm_batch_size",
+    "lstm_diurnal_blend_alpha",
+    "lstm_device",
+    "lstm_roll_actuals",
+    "lstm_seed",
+)
+PRICE_CONDITIONED_PARAMETER_NAMES = tuple(
+    name
+    for name in FORECAST_PARAMETER_NAMES
+    if name not in {"timesfm_roll_actuals", "chronos_roll_actuals", "lstm_roll_actuals"}
+)
 
 
 class PipelineStageError(RuntimeError):
@@ -75,6 +120,17 @@ class PipelineStageError(RuntimeError):
         super().__init__(
             f"{stage}{location}{agent_text}: {type(original).__name__}: {original}"
         )
+
+
+@dataclass(frozen=True)
+class ForecasterBundle:
+    output_dir: Path
+    manifest_path: Path
+    manifest: dict[str, Any]
+    selected_zones: pd.DataFrame
+    contexts: list[dict[str, Any]]
+    forecast_parameters: dict[str, Any]
+    outputs: dict[str, Path]
 
 
 def run_pipeline(
@@ -123,14 +179,78 @@ def run_pipeline(
     lstm_seed: int = 42,
     temperature: float = 0.2,
     precomputed_window_data: Path | str | None = None,
+    pipeline_stage: str = "full",
+    forecaster_output_dir: Path | str | None = None,
+    agent_output_dir: Path | str | None = None,
 ) -> dict[str, Path]:
     forecast_model = normalize_forecast_model_name(forecast_model)
+    pipeline_stage = normalize_pipeline_stage(pipeline_stage)
     agent_mode = normalize_agent_mode(agent_mode)
     apply_nash = agent_mode != "agents_no_nash"
     chain_mode = "single_model" if agent_mode == "single_model" else "agents"
     output_dir.mkdir(parents=True, exist_ok=True)
     shared_cache_dir = cache_dir or output_dir / "cache"
     run_output_dir = forecast_output_dir(output_dir, forecast_model)
+    forecaster_dir = resolve_forecaster_output_dir(
+        run_output_dir,
+        forecaster_output_dir if pipeline_stage == "agent" else None,
+    )
+    resolved_agent_output_dir = (
+        Path(agent_output_dir)
+        if agent_output_dir not in (None, "")
+        else forecaster_dir.parent / "agent"
+    )
+    forecaster_outputs: dict[str, Path] = {}
+    bundle: ForecasterBundle | None = None
+    forecast_parameters = make_forecast_parameters(
+        forecast_start=forecast_start,
+        horizon_days=horizon_days,
+        history_days=history_days,
+        validation_days=validation_days,
+        forecast_model=forecast_model,
+        timesfm_repo=timesfm_repo,
+        timesfm_context_hours=timesfm_context_hours,
+        timesfm_step_horizon=timesfm_step_horizon,
+        timesfm_exog_cols=timesfm_exog_cols,
+        timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
+        timesfm_roll_actuals=timesfm_roll_actuals,
+        ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
+        chronos_repo=chronos_repo,
+        chronos_context_hours=chronos_context_hours,
+        chronos_step_horizon=chronos_step_horizon,
+        chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
+        chronos_device=chronos_device,
+        chronos_roll_actuals=chronos_roll_actuals,
+        lstm_context_hours=lstm_context_hours,
+        lstm_step_horizon=lstm_step_horizon,
+        lstm_exog_cols=lstm_exog_cols,
+        lstm_hidden_size=lstm_hidden_size,
+        lstm_num_layers=lstm_num_layers,
+        lstm_epochs=lstm_epochs,
+        lstm_learning_rate=lstm_learning_rate,
+        lstm_batch_size=lstm_batch_size,
+        lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
+        lstm_device=lstm_device,
+        lstm_roll_actuals=lstm_roll_actuals,
+        lstm_seed=lstm_seed,
+    )
+
+    if pipeline_stage == "agent":
+        try:
+            bundle = load_forecaster_bundle(forecaster_dir)
+        except Exception as exc:
+            raise PipelineStageError(stage="load_forecaster_output", original=exc) from exc
+        selected_zones = bundle.selected_zones
+        contexts = bundle.contexts
+        forecast_parameters = bundle.forecast_parameters
+        forecast_model = str(forecast_parameters["forecast_model"])
+        source = bundle.manifest.get("data_source") or {}
+        recorded_data_dir = source.get("data_dir")
+        if recorded_data_dir:
+            data_dir = Path(str(recorded_data_dir))
+        weather_file = str(source.get("weather_file") or weather_file)
+        forecaster_outputs = bundle.outputs
+
     profiles = build_zone_profiles(
         data_dir,
         shared_cache_dir,
@@ -142,15 +262,16 @@ def run_pipeline(
         shared_cache_dir,
         force_cache=force_cache,
     )
-    requested_zone_ids = normalize_zone_ids(zone_ids)
-    try:
-        selected_zones = (
-            select_requested_zones(profiles, requested_zone_ids)
-            if requested_zone_ids
-            else select_zone_categories(profiles)
-        )
-    except Exception as exc:
-        raise PipelineStageError(stage="zone_selection", original=exc) from exc
+    if pipeline_stage != "agent":
+        requested_zone_ids = normalize_zone_ids(zone_ids)
+        try:
+            selected_zones = (
+                select_requested_zones(profiles, requested_zone_ids)
+                if requested_zone_ids
+                else select_zone_categories(profiles)
+            )
+        except Exception as exc:
+            raise PipelineStageError(stage="zone_selection", original=exc) from exc
     selected_zone_ids = selected_zones["zone_id"].astype(str).tolist()
     try:
         pipeline_data = load_pipeline_data(
@@ -161,46 +282,35 @@ def run_pipeline(
         )
     except Exception as exc:
         raise PipelineStageError(stage="load_data", original=exc) from exc
-    try:
-        contexts, forecast_results = build_contexts(
-            pipeline_data=pipeline_data,
-            selected_zones=selected_zones,
-            forecast_start=forecast_start,
-            horizon_days=horizon_days,
-            history_days=history_days,
-            validation_days=validation_days,
-            forecast_model=forecast_model,
-            zone_load_thresholds=zone_load_thresholds,
-            timesfm_repo=timesfm_repo,
-            timesfm_context_hours=timesfm_context_hours,
-            timesfm_step_horizon=timesfm_step_horizon,
-            timesfm_exog_cols=timesfm_exog_cols,
-            timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-            timesfm_roll_actuals=timesfm_roll_actuals,
-            ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
-            chronos_repo=chronos_repo,
-            chronos_context_hours=chronos_context_hours,
-            chronos_step_horizon=chronos_step_horizon,
-            chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
-            chronos_device=chronos_device,
-            chronos_roll_actuals=chronos_roll_actuals,
-            lstm_context_hours=lstm_context_hours,
-            lstm_step_horizon=lstm_step_horizon,
-            lstm_exog_cols=lstm_exog_cols,
-            lstm_hidden_size=lstm_hidden_size,
-            lstm_num_layers=lstm_num_layers,
-            lstm_epochs=lstm_epochs,
-            lstm_learning_rate=lstm_learning_rate,
-            lstm_batch_size=lstm_batch_size,
-            lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
-            lstm_device=lstm_device,
-            lstm_roll_actuals=lstm_roll_actuals,
-            lstm_seed=lstm_seed,
-        )
-    except PipelineStageError:
-        raise
-    except Exception as exc:
-        raise PipelineStageError(stage="build_contexts", original=exc) from exc
+    if pipeline_stage != "agent":
+        try:
+            contexts, forecast_results = build_contexts(
+                pipeline_data=pipeline_data,
+                selected_zones=selected_zones,
+                zone_load_thresholds=zone_load_thresholds,
+                **forecast_parameters,
+            )
+        except PipelineStageError:
+            raise
+        except Exception as exc:
+            raise PipelineStageError(stage="build_contexts", original=exc) from exc
+        try:
+            forecaster_outputs = write_forecaster_outputs(
+                output_dir=forecaster_dir,
+                selected_zones=selected_zones,
+                contexts=contexts,
+                forecast_results=forecast_results,
+                manifest=build_forecaster_manifest(
+                    data_dir=data_dir,
+                    weather_file=weather_file,
+                    selected_zone_ids=selected_zone_ids,
+                    forecast_parameters=forecast_parameters,
+                ),
+            )
+        except Exception as exc:
+            raise PipelineStageError(stage="write_outputs", original=exc) from exc
+        if pipeline_stage == "forecaster":
+            return forecaster_outputs
 
     try:
         precomputed_frame = load_precomputed_window_data(precomputed_window_data)
@@ -271,51 +381,187 @@ def run_pipeline(
             contexts=live_contexts,
             pipeline_data=pipeline_data,
             zone_load_thresholds=zone_load_thresholds,
-            forecast_start=forecast_start,
-            horizon_days=horizon_days,
-            history_days=history_days,
-            validation_days=validation_days,
-            forecast_model=forecast_model,
-            timesfm_repo=timesfm_repo,
-            timesfm_context_hours=timesfm_context_hours,
-            timesfm_step_horizon=timesfm_step_horizon,
-            timesfm_exog_cols=timesfm_exog_cols,
-            timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-            ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
-            chronos_repo=chronos_repo,
-            chronos_context_hours=chronos_context_hours,
-            chronos_step_horizon=chronos_step_horizon,
-            chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
-            chronos_device=chronos_device,
-            lstm_context_hours=lstm_context_hours,
-            lstm_step_horizon=lstm_step_horizon,
-            lstm_exog_cols=lstm_exog_cols,
-            lstm_hidden_size=lstm_hidden_size,
-            lstm_num_layers=lstm_num_layers,
-            lstm_epochs=lstm_epochs,
-            lstm_learning_rate=lstm_learning_rate,
-            lstm_batch_size=lstm_batch_size,
-            lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
-            lstm_device=lstm_device,
-            lstm_seed=lstm_seed,
             apply_nash=apply_nash,
+            **price_conditioned_parameters(forecast_parameters),
         )
         reports_by_zone.update({str(report.get("zone_id")): report for report in live_reports})
         reports = [reports_by_zone[str(context.get("zone_id"))] for context in contexts]
     except Exception as exc:
         raise PipelineStageError(stage="price_conditioned_forecast", original=exc) from exc
     try:
-        return write_outputs(
-            output_dir=run_output_dir,
-            selected_zones=selected_zones,
-            contexts=contexts,
+        agent_outputs = write_agent_outputs(
+            output_dir=resolved_agent_output_dir,
             reports=reports,
-            forecast_results=forecast_results,
             forecast_model=forecast_model,
             agent_mode=agent_mode,
+            manifest=build_agent_manifest(
+                agent_mode=agent_mode,
+                forecast_model=forecast_model,
+                forecaster_dir=forecaster_dir,
+                selected_zone_ids=selected_zone_ids,
+            ),
         )
+        return {**forecaster_outputs, **agent_outputs}
     except Exception as exc:
         raise PipelineStageError(stage="write_outputs", original=exc) from exc
+
+
+def make_forecast_parameters(**values: Any) -> dict[str, Any]:
+    missing = [name for name in FORECAST_PARAMETER_NAMES if name not in values]
+    if missing:
+        raise ValueError("Missing forecast parameter(s): " + ", ".join(missing))
+    parameters = {name: values[name] for name in FORECAST_PARAMETER_NAMES}
+    parameters["forecast_model"] = normalize_forecast_model_name(
+        str(parameters["forecast_model"])
+    )
+    return parameters
+
+
+def price_conditioned_parameters(forecast_parameters: dict[str, Any]) -> dict[str, Any]:
+    missing = [
+        name for name in PRICE_CONDITIONED_PARAMETER_NAMES if name not in forecast_parameters
+    ]
+    if missing:
+        raise ValueError(
+            "Forecaster output is missing price-conditioned forecast parameter(s): "
+            + ", ".join(missing)
+        )
+    return {name: forecast_parameters[name] for name in PRICE_CONDITIONED_PARAMETER_NAMES}
+
+
+def resolve_forecaster_output_dir(
+    run_output_dir: Path,
+    value: Path | str | None,
+) -> Path:
+    if value in (None, ""):
+        return run_output_dir / "forecaster"
+    path = Path(value)
+    if path.name.lower() == "forecaster_manifest.json":
+        return path.parent
+    return path
+
+
+def build_forecaster_manifest(
+    *,
+    data_dir: Path,
+    weather_file: str,
+    selected_zone_ids: list[str],
+    forecast_parameters: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": FORECASTER_MANIFEST_SCHEMA_VERSION,
+        "stage": "forecaster",
+        "created_at": pd.Timestamp.now().isoformat(),
+        "data_source": {
+            "data_dir": str(data_dir.resolve()),
+            "weather_file": weather_file,
+        },
+        "zone_ids": list(selected_zone_ids),
+        "forecast_parameters": dict(forecast_parameters),
+    }
+
+
+def build_agent_manifest(
+    *,
+    agent_mode: str,
+    forecast_model: str,
+    forecaster_dir: Path,
+    selected_zone_ids: list[str],
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "stage": "agent",
+        "completed_at": pd.Timestamp.now().isoformat(),
+        "agent_mode": agent_mode,
+        "forecast_model": forecast_model,
+        "forecaster_output_dir": str(forecaster_dir.resolve()),
+        "zone_ids": list(selected_zone_ids),
+    }
+
+
+def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
+    output_dir = resolve_forecaster_output_dir(Path("."), path)
+    manifest_path = output_dir / "forecaster_manifest.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Forecaster manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Forecaster manifest must contain a JSON object: {manifest_path}")
+    if manifest.get("schema_version") != FORECASTER_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(
+            "Unsupported forecaster manifest schema_version: "
+            f"{manifest.get('schema_version')}; expected {FORECASTER_MANIFEST_SCHEMA_VERSION}"
+        )
+    if manifest.get("stage") != "forecaster":
+        raise ValueError(f"Invalid forecaster manifest stage: {manifest.get('stage')}")
+
+    raw_parameters = manifest.get("forecast_parameters")
+    if not isinstance(raw_parameters, dict):
+        raise ValueError("Forecaster manifest is missing forecast_parameters")
+    forecast_parameters = make_forecast_parameters(**raw_parameters)
+
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("Forecaster manifest is missing artifacts")
+    selected_path = forecaster_artifact_path(
+        output_dir,
+        artifacts.get("selected_zones"),
+        "selected_zones",
+    )
+    contexts_path = forecaster_artifact_path(
+        output_dir,
+        artifacts.get("context_snippets"),
+        "context_snippets",
+    )
+    selected_zones = pd.read_csv(selected_path, dtype={"zone_id": "string"})
+    if "zone_id" not in selected_zones:
+        raise ValueError(f"Forecaster selected_zones is missing zone_id: {selected_path}")
+    selected_zones["zone_id"] = selected_zones["zone_id"].astype("string").str.strip()
+    contexts = json.loads(contexts_path.read_text(encoding="utf-8"))
+    if not isinstance(contexts, list) or not all(isinstance(item, dict) for item in contexts):
+        raise ValueError(f"Forecaster context_snippets must contain a JSON list: {contexts_path}")
+
+    selected_ids = selected_zones["zone_id"].astype(str).tolist()
+    context_ids = [str(context.get("zone_id")) for context in contexts]
+    manifest_ids = [str(value) for value in manifest.get("zone_ids") or []]
+    if selected_ids != context_ids or selected_ids != manifest_ids:
+        raise ValueError(
+            "Forecaster output zone order mismatch between manifest, selected_zones, "
+            "and context_snippets"
+        )
+
+    outputs = {
+        "forecaster_output_dir": output_dir,
+        "forecaster_manifest_json": manifest_path,
+        "selected_zones": selected_path,
+        "context_snippets": contexts_path,
+    }
+    for name in (
+        "forecast_metrics_csv",
+        "forecast_metrics_md",
+        "forecast_details_dir",
+    ):
+        value = artifacts.get(name)
+        if value:
+            outputs[name] = output_dir / str(value)
+    return ForecasterBundle(
+        output_dir=output_dir,
+        manifest_path=manifest_path,
+        manifest=manifest,
+        selected_zones=selected_zones,
+        contexts=contexts,
+        forecast_parameters=forecast_parameters,
+        outputs=outputs,
+    )
+
+
+def forecaster_artifact_path(output_dir: Path, value: Any, name: str) -> Path:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Forecaster manifest is missing artifact path: {name}")
+    path = output_dir / value
+    if not path.is_file():
+        raise FileNotFoundError(f"Forecaster artifact not found: {path}")
+    return path
 
 
 def select_agent_config_for_mode(
@@ -346,7 +592,14 @@ def run_experiment_matrix(
     starts = normalize_forecast_starts(forecast_starts)
     models = normalize_forecast_models(forecast_models)
     seeds = normalize_experiment_seeds(experiment_seeds)
-    modes = normalize_agent_modes(agent_modes, pipeline_kwargs.get("agent_mode", "agents"))
+    matrix_stage = normalize_pipeline_stage(pipeline_kwargs.get("pipeline_stage", "full"))
+    requested_modes = normalize_agent_modes(
+        agent_modes,
+        pipeline_kwargs.get("agent_mode", "agents"),
+    )
+    modes = requested_modes
+    if matrix_stage == "forecaster":
+        modes = modes[:1]
     blend_alphas = normalize_blend_alphas(diurnal_blend_alphas)
     selected_zone_ids = normalize_zone_ids(zone_ids)
     shared_cache_dir = output_dir / "cache"
@@ -368,7 +621,7 @@ def run_experiment_matrix(
         or experiment_slug(
             zone_count=len(selected_zone_ids),
             time_count=len(starts),
-            mode_count=len(modes),
+            mode_count=len(requested_modes),
             blend_count=len(blend_alphas),
         )
     )
@@ -419,6 +672,19 @@ def run_experiment_matrix(
                             run_kwargs["ar_diurnal_blend_alpha"] = alpha_value
                             run_kwargs["chronos_diurnal_blend_alpha"] = alpha_value
                             run_kwargs["lstm_diurnal_blend_alpha"] = alpha_value
+                        if matrix_stage == "agent":
+                            shared_run_base_dir = time_output_dir
+                            if add_seed_folder and seed is not None:
+                                shared_run_base_dir = shared_run_base_dir / f"seed_{seed}"
+                            if add_blend_folder and blend_alpha is not None:
+                                shared_run_base_dir = shared_run_base_dir / f"blend_{alpha_text}"
+                            if not run_kwargs.get("forecaster_output_dir"):
+                                run_kwargs["forecaster_output_dir"] = (
+                                    forecast_output_dir(shared_run_base_dir, forecast_model)
+                                    / "forecaster"
+                                )
+                            if not run_kwargs.get("agent_output_dir"):
+                                run_kwargs["agent_output_dir"] = run_output_dir / "agent"
                         record: dict[str, Any] = {
                             "forecast_start": forecast_start,
                             "forecast_model": forecast_model,
@@ -482,6 +748,7 @@ def run_experiment_matrix(
                             )
                         except Exception as exc:
                             record["status"] = "failed"
+                            record["completed_at"] = pd.Timestamp.now().isoformat()
                             record.update(
                                 experiment_error_record(
                                     exc,
@@ -490,7 +757,6 @@ def run_experiment_matrix(
                                     run_index=len(run_records) + 1,
                                 )
                             )
-                            record["completed_at"] = pd.Timestamp.now().isoformat()
                             raise
                         finally:
                             cache_attempted = True
@@ -655,18 +921,11 @@ def experiment_error_record(
     run_index: int,
 ) -> dict[str, Any]:
     details = classify_experiment_error(exc)
-    traceback_path = write_error_traceback(
-        exc,
-        experiment_dir=experiment_dir,
-        record=record,
-        run_index=run_index,
-        error_code=details["error_code"],
-    )
     error = (
         f"{details['error_code']} {details['error_stage']}: "
         f"{details['error_type']}: {details['error_message']}"
     )
-    return {
+    failure_record = {
         "error": error,
         "error_code": details["error_code"],
         "error_stage": details["error_stage"],
@@ -674,6 +933,16 @@ def experiment_error_record(
         "error_agent": details["error_agent"],
         "error_type": details["error_type"],
         "error_message": details["error_message"],
+    }
+    traceback_path = write_error_traceback(
+        exc,
+        experiment_dir=experiment_dir,
+        record={**record, **failure_record},
+        run_index=run_index,
+        error_code=details["error_code"],
+    )
+    return {
+        **failure_record,
         "traceback_file": str(traceback_path),
     }
 
@@ -751,7 +1020,8 @@ def write_error_traceback(
         safe_filename(blend_text),
     ]
     path = errors_dir / ("_".join(name_parts) + ".txt")
-    metadata = "\n".join(f"{key}: {value}" for key, value in record.items())
+    traceback_record = {**record, "traceback_file": str(path)}
+    metadata = "\n".join(f"{key}: {value}" for key, value in traceback_record.items())
     trace = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     path.write_text(f"{metadata}\n\nTRACEBACK:\n{trace}", encoding="utf-8")
     return path

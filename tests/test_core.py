@@ -9,12 +9,14 @@ from unittest.mock import patch
 import numpy as np
 import pandas as pd
 import torch
+import main as main_module
 
 from agents import (
     AGENT_COMPLETION_USAGE_KEY,
     ECONOMIST_AGENT_OUTPUT_KEY,
     AgentChatClient,
     AgentStageError,
+    ProviderResponseDecodeError,
     historical_load_bounds_kwh,
     completion_message_content,
     extract_json_object,
@@ -30,7 +32,13 @@ from agents import (
     validate_economist_report,
     window_predicted_load,
 )
-from config import AgentConfig, AppConfig, RunConfig, normalize_agent_mode
+from config import (
+    AgentConfig,
+    AppConfig,
+    RunConfig,
+    normalize_agent_mode,
+    normalize_pipeline_stage,
+)
 from data_loader import (
     available_zone_ids,
     build_zone_3h_load_policy_thresholds,
@@ -49,18 +57,21 @@ from forecasting import (
     rebuild_quantile_interval,
 )
 from orchestrator import (
+    FORECAST_PARAMETER_NAMES,
     apply_precomputed_window_data,
     apply_load_policy_stress,
     apply_price_conditioned_baseline_forecasts,
     build_agent_hourly_data,
     build_hourly_averages,
     build_pricing_windows_3h,
+    build_forecaster_manifest,
     classify_load_stress,
     attach_price_conditioned_baselines,
     ensure_energy_price_exog_cols,
     format_failure_message,
     forecast_output_dir,
     load_precomputed_window_data,
+    load_forecaster_bundle,
     normalize_zone_ids,
     partition_precomputed_contexts,
     PipelineStageError,
@@ -76,6 +87,8 @@ from reporting import (
     build_price_comparison_summary,
     price_comparison_fields,
     split_agent_debug_outputs,
+    write_agent_outputs,
+    write_forecaster_outputs,
     write_outputs,
 )
 from zone_selection import CATEGORY_ORDER, optimal_unique_assignment, select_zone_categories
@@ -152,6 +165,107 @@ class AgentParsingTests(unittest.TestCase):
         self.assertIn("model qwen/qwen3-14b", message)
         self.assertIn("provider_error_code=503", message)
         self.assertIn("No available provider", message)
+
+    def test_agent_client_retries_malformed_provider_http_json(self):
+        class FakeCompletions:
+            def __init__(self):
+                self.call_count = 0
+
+            async def create(self, **kwargs):
+                self.call_count += 1
+                if self.call_count < 3:
+                    raise json.JSONDecodeError("Expecting value", "", 0)
+                return {
+                    "choices": [{"message": {"content": '{"ok": true}'}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+
+        class FakeClient:
+            def __init__(self):
+                self.chat = type("FakeChat", (), {"completions": FakeCompletions()})()
+
+        client = object.__new__(AgentChatClient)
+        client.config = AgentConfig(
+            api_key="sk-test",
+            base_url="https://example.test",
+            model="fake-model",
+            provider_json_retries=2,
+            provider_json_retry_backoff_seconds=0,
+        )
+        client._client = FakeClient()
+
+        result = asyncio.run(client.complete_json("Return JSON.", temperature=0.2))
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(client._client.chat.completions.call_count, 3)
+
+    def test_agent_client_stops_after_provider_json_retries(self):
+        class FakeCompletions:
+            def __init__(self):
+                self.call_count = 0
+
+            async def create(self, **kwargs):
+                self.call_count += 1
+                raise json.JSONDecodeError("Expecting value", "\n", 1)
+
+        class FakeClient:
+            def __init__(self):
+                self.chat = type("FakeChat", (), {"completions": FakeCompletions()})()
+
+        client = object.__new__(AgentChatClient)
+        client.config = AgentConfig(
+            api_key="sk-test",
+            base_url="https://example.test",
+            model="fake-model",
+            provider_json_retries=1,
+            provider_json_retry_backoff_seconds=0,
+        )
+        client._client = FakeClient()
+
+        with self.assertRaises(ProviderResponseDecodeError) as raised:
+            asyncio.run(client.complete_json("Return JSON.", temperature=0.2))
+
+        self.assertEqual(client._client.chat.completions.call_count, 2)
+        self.assertIn("after 2 attempts", str(raised.exception))
+        self.assertIn("before model completion content parsing", str(raised.exception))
+
+    def test_agent_client_limits_concurrent_provider_requests(self):
+        class FakeCompletions:
+            def __init__(self):
+                self.active_calls = 0
+                self.max_active_calls = 0
+
+            async def create(self, **kwargs):
+                self.active_calls += 1
+                self.max_active_calls = max(self.max_active_calls, self.active_calls)
+                try:
+                    await asyncio.sleep(0.01)
+                    return {"choices": [{"message": {"content": '{"ok": true}'}}]}
+                finally:
+                    self.active_calls -= 1
+
+        class FakeClient:
+            def __init__(self):
+                self.chat = type("FakeChat", (), {"completions": FakeCompletions()})()
+
+        client = object.__new__(AgentChatClient)
+        client.config = AgentConfig(
+            api_key="sk-test",
+            base_url="https://example.test",
+            model="fake-model",
+            max_concurrent_requests=2,
+            provider_json_retries=0,
+        )
+        client._client = FakeClient()
+
+        async def run_requests():
+            await asyncio.gather(
+                *(client.complete_json("Return JSON.", temperature=0.2) for _ in range(6))
+            )
+
+        asyncio.run(run_requests())
+
+        self.assertEqual(client._client.chat.completions.max_active_calls, 2)
 
     def test_reasoning_parameter_is_omitted_for_meta_llama(self):
         qwen_config = AgentConfig(
@@ -803,6 +917,101 @@ class AgentParsingTests(unittest.TestCase):
             self.assertNotIn("load_3h_q80_kwh", window_cache.columns)
             self.assertNotIn("load_low_max_pct", window_cache.columns)
 
+    def test_forecaster_bundle_round_trip_and_separate_agent_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            run_dir = Path(temp_dir) / "AR"
+            forecaster_dir = run_dir / "forecaster"
+            agent_dir = run_dir / "agent"
+            selected_zones = pd.DataFrame(
+                [
+                    {
+                        "zone_id": "102",
+                        "category": "User-selected",
+                        "selection_reason": "Explicitly selected",
+                    }
+                ]
+            )
+            contexts = [
+                {
+                    "zone_id": "102",
+                    "category": "User-selected",
+                    "forecast_start": "2022-09-09T00:00:00",
+                    "forecast_end": "2022-09-10T23:00:00",
+                    "pricing_windows_3h": [],
+                }
+            ]
+            parameters = {name: None for name in FORECAST_PARAMETER_NAMES}
+            parameters.update(
+                {
+                    "forecast_start": "2022-09-09 00:00:00",
+                    "horizon_days": 2,
+                    "history_days": 7,
+                    "validation_days": 1,
+                    "forecast_model": "AR",
+                }
+            )
+            manifest = build_forecaster_manifest(
+                data_dir=Path(temp_dir) / "data",
+                weather_file="weather_central.csv",
+                selected_zone_ids=["102"],
+                forecast_parameters=parameters,
+            )
+
+            forecaster_outputs = write_forecaster_outputs(
+                output_dir=forecaster_dir,
+                selected_zones=selected_zones,
+                contexts=contexts,
+                forecast_results={},
+                manifest=manifest,
+            )
+            bundle = load_forecaster_bundle(forecaster_outputs["forecaster_manifest_json"])
+
+            self.assertEqual(bundle.output_dir, forecaster_dir)
+            self.assertEqual(bundle.selected_zones["zone_id"].astype(str).tolist(), ["102"])
+            self.assertEqual(bundle.contexts, contexts)
+            self.assertEqual(bundle.forecast_parameters["forecast_model"], "AR")
+
+            agent_outputs = write_agent_outputs(
+                output_dir=agent_dir,
+                reports=[],
+                forecast_model="AR",
+                agent_mode="rules",
+                manifest={
+                    "schema_version": 1,
+                    "stage": "agent",
+                    "forecaster_output_dir": str(forecaster_dir),
+                },
+            )
+            self.assertEqual(forecaster_outputs["forecaster_output_dir"].parent, run_dir)
+            self.assertEqual(agent_outputs["agent_output_dir"].parent, run_dir)
+            self.assertTrue(agent_outputs["agent_manifest_json"].is_file())
+
+    def test_forecaster_bundle_rejects_zone_order_mismatch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            forecaster_dir = Path(temp_dir) / "forecaster"
+            parameters = {name: None for name in FORECAST_PARAMETER_NAMES}
+            parameters["forecast_model"] = "AR"
+            manifest = build_forecaster_manifest(
+                data_dir=Path(temp_dir) / "data",
+                weather_file="weather_central.csv",
+                selected_zone_ids=["102"],
+                forecast_parameters=parameters,
+            )
+            outputs = write_forecaster_outputs(
+                output_dir=forecaster_dir,
+                selected_zones=pd.DataFrame(
+                    [{"zone_id": "102", "category": "User-selected"}]
+                ),
+                contexts=[{"zone_id": "999", "pricing_windows_3h": []}],
+                forecast_results={},
+                manifest=manifest,
+            )
+
+            with self.assertRaises(ValueError) as raised:
+                load_forecaster_bundle(outputs["forecaster_manifest_json"])
+
+            self.assertIn("zone order mismatch", str(raised.exception))
+
     def test_reuses_complete_precomputed_window_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "window_load_price_cache.csv"
@@ -983,6 +1192,86 @@ class AgentParsingTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_normalizes_pipeline_stage_aliases(self):
+        self.assertEqual(normalize_pipeline_stage("full"), "full")
+        self.assertEqual(normalize_pipeline_stage("forecast-only"), "forecaster")
+        self.assertEqual(normalize_pipeline_stage("agent_only"), "agent")
+        with self.assertRaises(ValueError):
+            normalize_pipeline_stage("invalid")
+
+    def test_single_stage_cli_options_override_matrix_config_lists(self):
+        app_config = AppConfig(
+            agent=AgentConfig.default(),
+            run=RunConfig(
+                forecast_start="2022-09-09 00:00:00",
+                forecast_model="AR",
+                agent_modes=["agents", "rules"],
+                diurnal_blend_alphas=[0.0, 0.7],
+            ),
+        )
+        with patch("main.AppConfig.from_file", return_value=app_config), patch(
+            "main.run_pipeline",
+            return_value={},
+        ) as run_pipeline_mock, patch("builtins.print"):
+            main_module.main(
+                [
+                    "--stage",
+                    "forecaster",
+                    "--agent-mode",
+                    "rules",
+                    "--diurnal-blend-alpha",
+                    "0.7",
+                ]
+            )
+
+        kwargs = run_pipeline_mock.call_args.kwargs
+        self.assertEqual(kwargs["pipeline_stage"], "forecaster")
+        self.assertEqual(kwargs["agent_mode"], "rules")
+        self.assertEqual(kwargs["ar_diurnal_blend_alpha"], 0.7)
+
+        with patch("main.AppConfig.from_file", return_value=app_config), patch(
+            "main.run_pipeline",
+            return_value={},
+        ) as agent_run_mock, patch("builtins.print"):
+            main_module.main(
+                [
+                    "--stage",
+                    "agent",
+                    "--forecaster-output-dir",
+                    "output/AR/forecaster",
+                ]
+            )
+
+        agent_kwargs = agent_run_mock.call_args.kwargs
+        self.assertEqual(agent_kwargs["pipeline_stage"], "agent")
+        self.assertEqual(
+            agent_kwargs["forecaster_output_dir"],
+            "output/AR/forecaster",
+        )
+
+    def test_run_config_can_load_without_agent_api_environment(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "config.yaml"
+            config_path.write_text(
+                """
+agent:
+  api_key: "${MAPF_TEST_MISSING_API_KEY}"
+  base_url: "https://example.test"
+  model: "fake-model"
+run:
+  pipeline_stage: "forecaster"
+  forecast_model: "AR"
+""".strip(),
+                encoding="utf-8",
+            )
+            with patch.dict("os.environ", {}, clear=True):
+                app_config = AppConfig.from_file(config_path, load_agent=False)
+                with self.assertRaises(ValueError):
+                    AppConfig.from_file(config_path, load_agent=True)
+
+            self.assertEqual(app_config.run.pipeline_stage, "forecaster")
+            self.assertEqual(app_config.run.forecast_model, "AR")
+
     def test_cli_stops_and_prints_failure_reason(self):
         failure = PipelineStageError(
             stage="forecast",
@@ -1013,6 +1302,12 @@ agent:
   single_model_model: "meta-llama/llama-3.3-70b-instruct"
   reasoning_effort: "none"
   timeout_seconds: 90
+  max_concurrent_requests: 3
+  provider_json_retries: 4
+  provider_json_retry_backoff_seconds: 0.25
+run:
+  pipeline_stage: "agent"
+  forecaster_output_dir: "output/AR/forecaster"
 """.strip(),
                 encoding="utf-8",
             )
@@ -1022,6 +1317,15 @@ agent:
             self.assertEqual(config.single_model_model, "meta-llama/llama-3.3-70b-instruct")
             self.assertEqual(config.reasoning_effort, "none")
             self.assertEqual(config.timeout_seconds, 90)
+            self.assertEqual(config.max_concurrent_requests, 3)
+            self.assertEqual(config.provider_json_retries, 4)
+            self.assertEqual(config.provider_json_retry_backoff_seconds, 0.25)
+            app_config = AppConfig.from_file(config_path)
+            self.assertEqual(app_config.run.pipeline_stage, "agent")
+            self.assertEqual(
+                app_config.run.forecaster_output_dir,
+                "output/AR/forecaster",
+            )
 
     def test_reads_run_yaml_config(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1965,6 +2269,59 @@ class SelectionTests(unittest.TestCase):
             decision_summary = pd.read_csv(outputs["experiment_decision_quality_summary_csv"])
             self.assertIn("price_accuracy", set(decision_summary["metric"]))
 
+    def test_split_matrix_shares_forecaster_output_across_agent_modes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            calls = []
+
+            def fake_run_pipeline(**kwargs):
+                calls.append(kwargs)
+                return {}
+
+            common = {
+                "data_dir": root / "data",
+                "output_dir": root / "output",
+                "forecast_starts": ["2022-09-09 00:00:00"],
+                "forecast_models": ["AR"],
+                "zone_ids": ["102"],
+                "agent_modes": ["rules", "agents_no_nash"],
+                "diurnal_blend_alphas": [0.7],
+                "dry_run": True,
+            }
+            with patch("orchestrator.run_pipeline", side_effect=fake_run_pipeline):
+                forecaster_outputs = run_experiment_matrix(
+                    pipeline_stage="forecaster",
+                    **common,
+                )
+
+            self.assertEqual(len(calls), 1)
+            experiment_dir = forecaster_outputs["experiment_dir"]
+            self.assertEqual(experiment_dir.name, "1zonesx1timesx2modes_1blends")
+            self.assertNotIn("agent_", str(calls[0]["output_dir"]))
+
+            calls.clear()
+            with patch("orchestrator.run_pipeline", side_effect=fake_run_pipeline):
+                run_experiment_matrix(
+                    pipeline_stage="agent",
+                    **common,
+                )
+
+            self.assertEqual(len(calls), 2)
+            expected_forecaster_dir = (
+                experiment_dir
+                / "2022-09-09_000000"
+                / "AR"
+                / "forecaster"
+            )
+            self.assertEqual(
+                {Path(call["forecaster_output_dir"]) for call in calls},
+                {expected_forecaster_dir},
+            )
+            self.assertEqual(
+                {Path(call["agent_output_dir"]).parent.parent.name for call in calls},
+                {"agent_rules", "agent_agents_no_nash"},
+            )
+
     def test_experiment_matrix_writes_detailed_error_records(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -2004,7 +2361,13 @@ class SelectionTests(unittest.TestCase):
             self.assertEqual(runs.loc[0, "error_type"], "TypeError")
             traceback_file = Path(runs.loc[0, "traceback_file"])
             self.assertTrue(traceback_file.exists())
-            self.assertIn("TRACEBACK", traceback_file.read_text(encoding="utf-8"))
+            traceback_text = traceback_file.read_text(encoding="utf-8")
+            self.assertIn("error_code: MAPF-E210", traceback_text)
+            self.assertIn("error_stage: agent.grid", traceback_text)
+            self.assertIn("error_zone_id: 102", traceback_text)
+            self.assertIn("error_type: TypeError", traceback_text)
+            self.assertIn("completed_at: ", traceback_text)
+            self.assertIn("TRACEBACK", traceback_text)
             message = format_failure_message(raised.exception)
             self.assertIn("Execution stopped because an error occurred.", message)
             self.assertIn("error_code: MAPF-E210", message)

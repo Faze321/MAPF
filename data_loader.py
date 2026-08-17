@@ -7,6 +7,16 @@ from typing import Iterable
 import numpy as np
 import pandas as pd
 
+from dataset_adapter import (
+    CANONICAL_ENERGY_PRICE_COLUMN,
+    CANONICAL_LOAD_COLUMN,
+    CANONICAL_TIME_COLUMN,
+    CANONICAL_ZONE_COLUMN,
+    CanonicalDataset,
+    PriceChangeReference,
+    atomic_write_dataframe,
+)
+
 from load_policy import (
     HIGH_MAX_LOAD_PCT,
     LOAD_POLICY_ID,
@@ -32,6 +42,11 @@ class PipelineData:
     occupancy: pd.DataFrame
     weather: pd.DataFrame
     profiles: pd.DataFrame
+    feature_manifest: dict | None = None
+    dataset_fingerprint: str | None = None
+    cache_keys: dict[str, str] | None = None
+    price_change_reference: PriceChangeReference | None = None
+    canonical_dataset: CanonicalDataset | None = None
 
 
 def read_time_matrix(path: Path, zones: Iterable[str] | None = None) -> pd.DataFrame:
@@ -60,9 +75,12 @@ def build_zone_profiles(
     *,
     force_cache: bool = False,
     max_poi_rows: int | None = None,
+    forecast_start: pd.Timestamp | str | None = None,
 ) -> pd.DataFrame:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    profile_cache = cache_dir / "zone_profiles.csv"
+    profile_cache = cache_dir / (
+        "training_zone_profiles.csv" if forecast_start is not None else "zone_profiles.csv"
+    )
     if profile_cache.exists() and not force_cache and max_poi_rows is None:
         cached = pd.read_csv(profile_cache, dtype={"zone_id": str})
         if "load_source_file" in cached.columns and (cached["load_source_file"] == LOAD_FILE).all():
@@ -98,13 +116,18 @@ def build_zone_profiles(
                 cached = cached.merge(service_price_features, on="zone_id", how="left")
                 cached = cached.merge(energy_price_features, on="zone_id", how="left")
             if deprecated_present or price_features_missing:
-                cached.to_csv(profile_cache, index=False)
+                atomic_write_dataframe(cached, profile_cache)
             return cached
 
     zone_ids = available_zone_ids(data_dir)
     load = read_time_matrix(data_dir / LOAD_FILE)
     service_price = read_time_matrix(data_dir / "s_price.csv")
     energy_price = read_time_matrix(data_dir / "e_price.csv")
+    if forecast_start is not None:
+        cutoff = pd.Timestamp(forecast_start)
+        load = load[load["time"] < cutoff].copy()
+        service_price = service_price[service_price["time"] < cutoff].copy()
+        energy_price = energy_price[energy_price["time"] < cutoff].copy()
     station_profiles = build_station_profiles(data_dir)
     poi_counts = build_poi_zone_counts(
         data_dir,
@@ -145,7 +168,111 @@ def build_zone_profiles(
     profiles["load_source_file"] = LOAD_FILE
 
     if max_poi_rows is None:
-        profiles.to_csv(profile_cache, index=False)
+        atomic_write_dataframe(profiles, profile_cache)
+    return profiles
+
+
+def build_zone_profiles_from_canonical(
+    dataset: CanonicalDataset,
+    cache_dir: Path,
+    *,
+    forecast_start: pd.Timestamp | str,
+    force_cache: bool = False,
+) -> pd.DataFrame:
+    """Build forecast-origin-safe zone profiles from canonical data."""
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dir / "training_zone_profiles.csv"
+    if cache_file.is_file() and not force_cache:
+        try:
+            cached = pd.read_csv(cache_file, dtype={"zone_id": str})
+            if "profile_cutoff" in cached and (
+                cached["profile_cutoff"] == pd.Timestamp(forecast_start).isoformat()
+            ).all():
+                return cached
+        except (OSError, pd.errors.ParserError, ValueError):
+            pass
+
+    cutoff = pd.Timestamp(forecast_start)
+    history = dataset.timeseries[
+        dataset.timeseries[CANONICAL_TIME_COLUMN] < cutoff
+    ].copy()
+    if history.empty:
+        raise ValueError(f"No historical observations exist before forecast_start={cutoff}")
+    load = history.pivot(
+        index=CANONICAL_TIME_COLUMN,
+        columns=CANONICAL_ZONE_COLUMN,
+        values=CANONICAL_LOAD_COLUMN,
+    ).reset_index().rename(columns={CANONICAL_TIME_COLUMN: "time"})
+    load.columns.name = None
+    zone_ids = [str(column) for column in load.columns if column != "time"]
+    load_features = compute_load_features(load, zone_ids)
+
+    price = history.pivot(
+        index=CANONICAL_TIME_COLUMN,
+        columns=CANONICAL_ZONE_COLUMN,
+        values=CANONICAL_ENERGY_PRICE_COLUMN,
+    ).reset_index().rename(columns={CANONICAL_TIME_COLUMN: "time"})
+    price.columns.name = None
+    energy_features = compute_price_features(price, zone_ids, price_type="energy")
+
+    profiles = pd.DataFrame({"zone_id": zone_ids})
+    static = dataset.static_zone_features.rename(columns={CANONICAL_ZONE_COLUMN: "zone_id"}).copy()
+    static["zone_id"] = static["zone_id"].astype(str)
+    profiles = profiles.merge(static, on="zone_id", how="left")
+    profiles = profiles.merge(load_features, on="zone_id", how="left")
+    profiles = profiles.merge(energy_features, on="zone_id", how="left")
+
+    if "service_price" in history:
+        service = history.pivot(
+            index=CANONICAL_TIME_COLUMN,
+            columns=CANONICAL_ZONE_COLUMN,
+            values="service_price",
+        ).reset_index().rename(columns={CANONICAL_TIME_COLUMN: "time"})
+        service.columns.name = None
+        profiles = profiles.merge(
+            compute_price_features(service, zone_ids, price_type="service"),
+            on="zone_id",
+            how="left",
+        )
+
+    profile_defaults = {
+        "station_count": 0,
+        "charge_count": 0,
+        "capacity_kw_proxy": 0.0,
+        "area": 0.0,
+        "longitude": 0.0,
+        "latitude": 0.0,
+        "poi_food": 0,
+        "poi_business": 0,
+        "poi_lifestyle": 0,
+        "poi_total": 0,
+        "mean_service_price": 0.0,
+        "service_price_std": 0.0,
+        "historical_min_service_price": 0.0,
+        "historical_max_service_price": 0.0,
+    }
+    for column, default in profile_defaults.items():
+        if column not in profiles:
+            profiles[column] = default
+        else:
+            profiles[column] = profiles[column].fillna(default)
+    area_sq_km = (pd.to_numeric(profiles["area"], errors="coerce").fillna(0) / 1_000_000).replace(0, np.nan)
+    for column in ("poi_food", "poi_business", "poi_lifestyle"):
+        profiles[f"{column}_density"] = pd.to_numeric(
+            profiles[column], errors="coerce"
+        ).fillna(0) / area_sq_km
+    profiles["poi_total_density"] = pd.to_numeric(
+        profiles["poi_total"], errors="coerce"
+    ).fillna(0) / area_sq_km
+    profiles["peak_capacity_ratio"] = safe_divide(
+        profiles["peak_load_kwh"].to_numpy(),
+        pd.to_numeric(profiles["capacity_kw_proxy"], errors="coerce").fillna(0).to_numpy(),
+    )
+    profiles = profiles.replace([np.inf, -np.inf], np.nan).fillna(0)
+    profiles["load_source_file"] = "canonical_dataset"
+    profiles["profile_cutoff"] = cutoff.isoformat()
+    atomic_write_dataframe(profiles, cache_file)
     return profiles
 
 
@@ -156,11 +283,20 @@ def build_zone_3h_load_policy_thresholds(
     force_cache: bool = False,
     source_file: str = LOAD_FILE,
     window_hours: int = 3,
+    forecast_start: pd.Timestamp | str | None = None,
+    load_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / "zone_3h_load_quantiles.csv"
+    cache_file = cache_dir / (
+        "historical_3h_load_policy.csv"
+        if forecast_start is not None
+        else "zone_3h_load_quantiles.csv"
+    )
     if cache_file.exists() and not force_cache:
-        cached = pd.read_csv(cache_file, dtype={"zone_id": str})
+        try:
+            cached = pd.read_csv(cache_file, dtype={"zone_id": str})
+        except (OSError, pd.errors.ParserError, ValueError):
+            cached = pd.DataFrame()
         required_columns = {
             "load_policy_id",
             "historical_min_load_3h_kwh",
@@ -187,10 +323,17 @@ def build_zone_3h_load_policy_thresholds(
                 cached["high_extremely_high_threshold_pct"], HIGH_MAX_LOAD_PCT
             ).all()
         )
-        if source_ok and window_ok and policy_ok:
+        cutoff_ok = True
+        if forecast_start is not None:
+            cutoff_ok = "forecast_start_cutoff" in cached.columns and (
+                cached["forecast_start_cutoff"] == pd.Timestamp(forecast_start).isoformat()
+            ).all()
+        if source_ok and window_ok and policy_ok and cutoff_ok:
             return cached
 
-    load = read_time_matrix(data_dir / source_file)
+    load = load_frame.copy() if load_frame is not None else read_time_matrix(data_dir / source_file)
+    if forecast_start is not None:
+        load = load[load["time"] < pd.Timestamp(forecast_start)].copy()
     zone_ids = [str(col) for col in load.columns if col != "time"]
     values = load.set_index("time")[zone_ids].apply(pd.to_numeric, errors="coerce").sort_index()
     grouped = values.resample(f"{int(window_hours)}h", origin="start_day").sum(min_count=1)
@@ -205,6 +348,11 @@ def build_zone_3h_load_policy_thresholds(
                 "zone_id": zone_id,
                 "stress_source_file": source_file,
                 "stress_window_hours": int(window_hours),
+                "forecast_start_cutoff": (
+                    pd.Timestamp(forecast_start).isoformat()
+                    if forecast_start is not None
+                    else None
+                ),
                 "historical_3h_windows": int(len(zone_values)),
                 "load_policy_id": LOAD_POLICY_ID,
                 "historical_min_load_3h_kwh": historical_min,
@@ -227,7 +375,7 @@ def build_zone_3h_load_policy_thresholds(
             }
         )
     thresholds = pd.DataFrame(rows)
-    thresholds.to_csv(cache_file, index=False)
+    atomic_write_dataframe(thresholds, cache_file)
     return thresholds
 
 
@@ -294,7 +442,7 @@ def build_poi_zone_counts(
             counts[col] = 0
     counts = counts[["zone_id", *POI_COLUMNS.values()]]
     if max_poi_rows is None:
-        counts.to_csv(cache_file, index=False)
+        atomic_write_dataframe(counts, cache_file)
     return counts
 
 
@@ -349,7 +497,34 @@ def load_pipeline_data(
     selected_zone_ids: list[str],
     *,
     weather_file: str = "weather_airport.csv",
+    canonical_dataset: CanonicalDataset | None = None,
 ) -> PipelineData:
+    if canonical_dataset is not None:
+        selected = canonical_dataset.select_zones(selected_zone_ids)
+        load = selected.wide_frame(CANONICAL_LOAD_COLUMN, selected_zone_ids)
+        energy_price = selected.wide_frame(CANONICAL_ENERGY_PRICE_COLUMN, selected_zone_ids)
+        service_price = selected.wide_frame("service_price", selected_zone_ids)
+        occupancy = selected.wide_frame("occupancy", selected_zone_ids)
+        weather = selected.weather_frame().rename(
+            columns={
+                "temperature": "T",
+                "humidity": "U",
+                "rain": "nRAIN",
+            }
+        )
+        return PipelineData(
+            load=load,
+            service_price=service_price,
+            energy_price=energy_price,
+            occupancy=occupancy,
+            weather=weather,
+            profiles=profiles,
+            feature_manifest=selected.feature_manifest,
+            dataset_fingerprint=selected.dataset_fingerprint,
+            cache_keys=selected.cache_keys,
+            price_change_reference=selected.price_change_reference,
+            canonical_dataset=selected,
+        )
     load = read_time_matrix(data_dir / LOAD_FILE, selected_zone_ids)
     service_price = read_time_matrix(data_dir / "s_price.csv", selected_zone_ids)
     energy_price = read_time_matrix(data_dir / "e_price.csv", selected_zone_ids)

@@ -11,3 +11,12 @@ test/
 test.py
 test.ipynb
 config.yaml
+
+/.tmp_tests/
+tmp/
+.agents/
+.codex/
+
+# Dataset-derived, reproducible feature caches.
+/data/cache/
+/data/**/cache/

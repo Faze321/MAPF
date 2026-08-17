@@ -14,6 +14,7 @@ from config import (
     normalize_pipeline_stage,
     normalize_string_list,
 )
+from dataset_adapter import DatasetSpec
 from orchestrator import format_failure_message, run_experiment_matrix, run_pipeline
 
 
@@ -24,7 +25,36 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", default="config.yaml", help="YAML config file for run and model settings.")
     parser.add_argument("--data-dir", default=None, help="Directory containing UrbanEV CSV files.")
-    parser.add_argument("--output-dir", default=None, help="Directory for generated reports.")
+    parser.add_argument(
+        "--dataset-adapter",
+        default=None,
+        help="Dataset adapter: urbanev or long_format.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Dataset feature cache directory. Defaults to <data-dir>/cache.",
+    )
+    parser.add_argument(
+        "--timeseries-file",
+        default=None,
+        help="Long-format time-series CSV relative to data-dir.",
+    )
+    parser.add_argument(
+        "--output-folder",
+        "--output-dir",
+        dest="output_folder",
+        default=None,
+        help="Root folder for generated outputs. Defaults to run.output_folder or output.",
+    )
+    parser.add_argument(
+        "--experiment-name",
+        default=None,
+        help=(
+            "Name of this experiment under <output-folder>. If omitted, "
+            "the existing automatic matrix name is used."
+        ),
+    )
     parser.add_argument("--weather-file", default=None, help="Weather CSV file under data-dir.")
     parser.add_argument(
         "--forecast-model",
@@ -56,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Forecaster output directory (or forecaster_manifest.json) consumed by an "
-            "agent-only run. Defaults to <output-dir>/<forecast-model>/forecaster."
+            "agent-only run. Defaults to <output-folder>/<forecast-model>/forecaster."
         ),
     )
     parser.add_argument(
@@ -112,13 +142,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--agent-mode",
         default=None,
-        help="Agent mode for a single run: agents, agents_no_nash, single_model, or rules.",
+        help=(
+            "Agent mode: multi_agent_economist_retry, multi_agent_full_retry, "
+            "single_agent_price_retry, or single_agent_full_retry."
+        ),
     )
     parser.add_argument(
         "--agent-modes",
         nargs="+",
         default=None,
-        help="Agent modes for ablation matrices: agents, agents_no_nash, single_model, and/or rules.",
+        help="One or more of the four control-loop agent modes.",
     )
     parser.add_argument(
         "--diurnal-blend-alpha",
@@ -141,6 +174,7 @@ def main(argv: list[str] | None = None):
     config_path = Path(args.config)
     app_config = AppConfig.from_file(config_path, required=False, load_agent=False)
     run_config = app_config.run
+    data_config = app_config.data
     pipeline_stage = normalize_pipeline_stage(
         args.pipeline_stage if args.pipeline_stage is not None else run_config.pipeline_stage
     )
@@ -153,6 +187,11 @@ def main(argv: list[str] | None = None):
         args.agent_output_dir
         if args.agent_output_dir is not None
         else run_config.agent_output_dir
+    )
+    experiment_name = (
+        args.experiment_name
+        if args.experiment_name is not None
+        else run_config.experiment_name
     )
 
     cli_starts = normalize_string_list(args.forecast_starts)
@@ -200,6 +239,7 @@ def main(argv: list[str] | None = None):
         or bool(experiment_seeds and len(experiment_seeds) > 1)
         or bool(agent_modes and len(agent_modes) > 1)
         or bool(diurnal_blend_alphas and len(diurnal_blend_alphas) > 1)
+        or bool(experiment_name)
     )
 
     if args.agent_mode:
@@ -216,9 +256,25 @@ def main(argv: list[str] | None = None):
         else run_config.diurnal_blend_alpha
     )
 
+    resolved_data_dir = Path(args.data_dir or run_config.data_dir)
+    dataset_spec = DatasetSpec(
+        path=resolved_data_dir,
+        adapter=args.dataset_adapter or data_config.adapter,
+        weather_file=args.weather_file or run_config.weather_file,
+        cache_dir=Path(args.cache_dir or data_config.cache_dir)
+        if (args.cache_dir or data_config.cache_dir)
+        else None,
+        timeseries_file=args.timeseries_file or data_config.timeseries_file,
+        column_mapping=data_config.column_mapping,
+        static_file=data_config.static_file,
+        static_mapping=data_config.static_mapping,
+        unit_conversions=data_config.unit_conversions,
+    )
     common_kwargs = {
-        "data_dir": Path(args.data_dir or run_config.data_dir),
-        "output_dir": Path(args.output_dir or run_config.output_dir),
+        "data_dir": resolved_data_dir,
+        "dataset_spec": dataset_spec,
+        "cache_dir": dataset_spec.resolved_cache_dir,
+        "output_dir": Path(args.output_folder or run_config.output_folder),
         "config_path": config_path,
         "model": args.model,
         "weather_file": args.weather_file or run_config.weather_file,
@@ -280,6 +336,7 @@ def main(argv: list[str] | None = None):
         if not forecast_starts:
             raise ValueError("Experiment matrix requires at least one forecast start.")
         outputs = run_experiment_matrix(
+            experiment_name=experiment_name,
             forecast_starts=forecast_starts,
             forecast_models=forecast_models,
             experiment_seeds=experiment_seeds,

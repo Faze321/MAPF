@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
+import math
+import time
 import traceback
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -13,9 +16,10 @@ import pandas as pd
 from agents import (
     AgentChatClient,
     AgentStageError,
-    recompute_report_nash,
+    retry_zone_prices,
+    run_zone_chain,
     run_all_zone_chains,
-    summarize_nash_equilibrium,
+    summarize_agent_call_usage,
 )
 from config import (
     AgentConfig,
@@ -23,8 +27,14 @@ from config import (
     normalize_forecast_model_name,
     normalize_pipeline_stage,
 )
-from data_loader import build_zone_3h_load_policy_thresholds, build_zone_profiles, load_pipeline_data
-from forecasting import DEFAULT_TIMESFM_EXOG_COLS, ForecastResult, forecast_zone
+from data_loader import (
+    build_zone_3h_load_policy_thresholds,
+    build_zone_profiles_from_canonical,
+    load_pipeline_data,
+)
+from dataset_adapter import DatasetSpec, load_canonical_dataset, split_cache_key
+from forecasting import ForecastResult, forecast_zone
+from global_forecaster import NATIVE_ARTIFACT_SCHEMA_VERSION, NativeForecasterArtifact
 from load_policy import (
     EXTREMELY_HIGH_STRESS,
     HIGH_MAX_LOAD_PCT,
@@ -46,6 +56,50 @@ STRESS_LEVEL_ORDER = {
     HIGH_STRESS: 2,
     EXTREMELY_HIGH_STRESS: 3,
 }
+DECISION_SUMMARY_KEYS = {
+    "zone_id",
+    "category",
+    "history_start",
+    "history_end",
+    "validation_start",
+    "validation_end",
+    "forecast_start",
+    "forecast_end",
+    "forecast_horizon_days",
+    "forecast_horizon_hours",
+    "forecast_model",
+    "diurnal_blend_alpha",
+    "forecast_total_kwh",
+    "forecast_peak_kwh",
+    "predicted_change_pct",
+    "capacity_kw_proxy",
+    "peak_capacity_ratio",
+    "grid_stress_level",
+    "grid_stress_basis",
+    "grid_stress_load_kwh",
+    "grid_stress_load_range_position_pct",
+    "grid_stress_source_file",
+    "grid_stress_window_hours",
+    "grid_stress_historical_windows",
+    "historical_min_load_3h_kwh",
+    "historical_max_load_3h_kwh",
+    "historical_load_range_3h_kwh",
+    "low_medium_threshold_pct",
+    "medium_high_threshold_pct",
+    "high_extremely_high_threshold_pct",
+    "load_3h_low_medium_threshold_kwh",
+    "load_3h_medium_high_threshold_kwh",
+    "load_3h_high_extremely_high_threshold_kwh",
+    "zone_mean_energy_price",
+    "calibration",
+    "price",
+    "weather",
+    "occupancy",
+    "profile",
+    "daily_history_kwh",
+    "daily_forecast_kwh",
+    "hourly_shape",
+}
 ERROR_CODE_BY_STAGE = {
     "zone_selection": "MAPF-E010",
     "load_data": "MAPF-E020",
@@ -62,7 +116,9 @@ ERROR_CODE_BY_STAGE = {
     "write_outputs": "MAPF-E300",
     "unexpected": "MAPF-E900",
 }
-FORECASTER_MANIFEST_SCHEMA_VERSION = 1
+MAX_CONTROL_ATTEMPTS = 3
+CONTROL_AGENT_USAGE_KEY = "_control_agent_usage"
+FORECASTER_MANIFEST_SCHEMA_VERSION = 3
 FORECAST_PARAMETER_NAMES = (
     "forecast_start",
     "horizon_days",
@@ -131,6 +187,7 @@ class ForecasterBundle:
     contexts: list[dict[str, Any]]
     forecast_parameters: dict[str, Any]
     outputs: dict[str, Path]
+    scenario_artifacts: dict[str, NativeForecasterArtifact]
 
 
 def run_pipeline(
@@ -150,21 +207,21 @@ def run_pipeline(
     validation_days: int = 1,
     zone_ids: str | Iterable[str] | None = None,
     experiment_zone_count: int = 12,
-    agent_mode: str = "agents",
+    agent_mode: str = "multi_agent_economist_retry",
     forecast_model: str = "timesfm",
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch",
     timesfm_context_hours: int = 168,
     timesfm_step_horizon: int = 24,
     timesfm_exog_cols: list[str] | None = None,
     timesfm_diurnal_blend_alpha: float = 1.0,
-    timesfm_roll_actuals: bool = True,
+    timesfm_roll_actuals: bool = False,
     ar_diurnal_blend_alpha: float = 0.0,
     chronos_repo: str = "amazon/chronos-2",
     chronos_context_hours: int = 512,
     chronos_step_horizon: int = 24,
     chronos_diurnal_blend_alpha: float = 0.0,
     chronos_device: str = "auto",
-    chronos_roll_actuals: bool = True,
+    chronos_roll_actuals: bool = False,
     lstm_context_hours: int = 24,
     lstm_step_horizon: int = 24,
     lstm_exog_cols: list[str] | None = None,
@@ -175,21 +232,26 @@ def run_pipeline(
     lstm_batch_size: int = 32,
     lstm_diurnal_blend_alpha: float = 0.0,
     lstm_device: str = "auto",
-    lstm_roll_actuals: bool = True,
+    lstm_roll_actuals: bool = False,
     lstm_seed: int = 42,
     temperature: float = 0.2,
     precomputed_window_data: Path | str | None = None,
     pipeline_stage: str = "full",
     forecaster_output_dir: Path | str | None = None,
     agent_output_dir: Path | str | None = None,
+    dataset_spec: DatasetSpec | None = None,
 ) -> dict[str, Path]:
     forecast_model = normalize_forecast_model_name(forecast_model)
     pipeline_stage = normalize_pipeline_stage(pipeline_stage)
     agent_mode = normalize_agent_mode(agent_mode)
-    apply_nash = agent_mode != "agents_no_nash"
-    chain_mode = "single_model" if agent_mode == "single_model" else "agents"
+    chain_mode = "single_agent" if agent_mode.startswith("single_agent") else "multi_agent"
     output_dir.mkdir(parents=True, exist_ok=True)
-    shared_cache_dir = cache_dir or output_dir / "cache"
+    dataset_spec = dataset_spec or DatasetSpec(
+        path=data_dir,
+        weather_file=weather_file,
+        cache_dir=cache_dir,
+    )
+    shared_cache_dir = cache_dir or dataset_spec.resolved_cache_dir
     run_output_dir = forecast_output_dir(output_dir, forecast_model)
     forecaster_dir = resolve_forecaster_output_dir(
         run_output_dir,
@@ -249,18 +311,64 @@ def run_pipeline(
         if recorded_data_dir:
             data_dir = Path(str(recorded_data_dir))
         weather_file = str(source.get("weather_file") or weather_file)
+        dataset_spec = replace(
+            dataset_spec,
+            path=data_dir,
+            weather_file=weather_file,
+        )
+        if cache_dir is None and dataset_spec.cache_dir is None:
+            shared_cache_dir = dataset_spec.resolved_cache_dir
         forecaster_outputs = bundle.outputs
+        scenario_artifacts = bundle.scenario_artifacts
 
-    profiles = build_zone_profiles(
-        data_dir,
-        shared_cache_dir,
+    canonical_dataset = load_canonical_dataset(dataset_spec, force_cache=force_cache)
+    if bundle is not None:
+        recorded_fingerprint = (bundle.manifest.get("data_source") or {}).get(
+            "dataset_fingerprint"
+        )
+        if recorded_fingerprint and recorded_fingerprint != canonical_dataset.dataset_fingerprint:
+            raise PipelineStageError(
+                stage="load_forecaster_output",
+                original=ValueError(
+                    "Dataset fingerprint changed after the forecaster artifact was created; "
+                    "rerun the forecaster stage before running the control stage."
+                ),
+            )
+    effective_forecast_start = (
+        pd.Timestamp(forecast_parameters.get("forecast_start"))
+        if forecast_parameters.get("forecast_start")
+        else pd.Timestamp(canonical_dataset.timeseries["timestamp"].max())
+        - pd.Timedelta(hours=int(forecast_parameters["horizon_days"]) * 24 - 1)
+    )
+    split_key = split_cache_key(
+        canonical_dataset.dataset_fingerprint,
+        effective_forecast_start,
+        window_hours=3,
+        policy_id="historical_3h_min_max_range_35_80_90",
+    )
+    split_cache_dir = (
+        shared_cache_dir
+        / "datasets"
+        / canonical_dataset.dataset_fingerprint
+        / "splits"
+        / split_key
+    )
+    profiles = build_zone_profiles_from_canonical(
+        canonical_dataset,
+        split_cache_dir,
+        forecast_start=effective_forecast_start,
         force_cache=force_cache,
-        max_poi_rows=max_poi_rows,
     )
     zone_load_thresholds = build_zone_3h_load_policy_thresholds(
         data_dir,
-        shared_cache_dir,
+        split_cache_dir,
         force_cache=force_cache,
+        source_file="canonical_dataset",
+        forecast_start=effective_forecast_start,
+        load_frame=canonical_dataset.wide_frame(
+            "load_kwh",
+            profiles["zone_id"].astype(str).tolist(),
+        ),
     )
     if pipeline_stage != "agent":
         requested_zone_ids = normalize_zone_ids(zone_ids)
@@ -279,6 +387,14 @@ def run_pipeline(
             profiles,
             selected_zone_ids,
             weather_file=weather_file,
+            canonical_dataset=canonical_dataset,
+        )
+        pipeline_data = replace(
+            pipeline_data,
+            cache_keys={
+                "dataset": canonical_dataset.dataset_fingerprint,
+                "split": split_key,
+            },
         )
     except Exception as exc:
         raise PipelineStageError(stage="load_data", original=exc) from exc
@@ -290,6 +406,10 @@ def run_pipeline(
                 zone_load_thresholds=zone_load_thresholds,
                 **forecast_parameters,
             )
+            scenario_artifacts = {
+                str(zone_id): NativeForecasterArtifact.from_forecast_result(result)
+                for zone_id, result in forecast_results.items()
+            }
         except PipelineStageError:
             raise
         except Exception as exc:
@@ -305,6 +425,10 @@ def run_pipeline(
                     weather_file=weather_file,
                     selected_zone_ids=selected_zone_ids,
                     forecast_parameters=forecast_parameters,
+                    dataset_fingerprint=canonical_dataset.dataset_fingerprint,
+                    cache_keys=pipeline_data.cache_keys or {},
+                    feature_manifest=pipeline_data.feature_manifest or {},
+                    dataset_adapter=dataset_spec.adapter,
                 ),
             )
         except Exception as exc:
@@ -323,71 +447,110 @@ def run_pipeline(
     except Exception as exc:
         raise PipelineStageError(stage="precomputed_window_data", original=exc) from exc
 
-    reports_by_zone: dict[str, dict[str, Any]] = {}
-    try:
-        if cached_contexts:
-            cached_reports = asyncio.run(
-                run_all_zone_chains(
-                    cached_contexts,
-                    client=None,
-                    temperature=temperature,
-                    heuristic_source="precomputed_window_data",
-                    chain_mode=chain_mode,
-                    apply_nash=False,
-                )
-            )
-            cached_reports = apply_precomputed_window_data(
-                cached_reports,
-                cached_windows_by_zone,
-                source_path=precomputed_window_data,
-            )
-            reports_by_zone.update({str(report.get("zone_id")): report for report in cached_reports})
+    async def execute_agent_control_stage() -> list[dict[str, Any]]:
+        reports_by_zone: dict[str, dict[str, Any]] = {}
+        client: AgentChatClient | None = None
+        heuristic_source = "dry-run"
+        initial_agent_batch_elapsed_seconds = 0.0
+        try:
+            try:
+                if cached_contexts:
+                    cached_reports = await run_all_zone_chains(
+                        cached_contexts,
+                        client=None,
+                        temperature=temperature,
+                        heuristic_source="precomputed_window_data",
+                        chain_mode=chain_mode,
+                    )
+                    cached_reports = apply_precomputed_window_data(
+                        cached_reports,
+                        cached_windows_by_zone,
+                        source_path=precomputed_window_data,
+                    )
+                    reports_by_zone.update(
+                        {str(report.get("zone_id")): report for report in cached_reports}
+                    )
 
-        if live_contexts:
-            if agent_mode == "rules":
-                client = None
-                heuristic_source = "rules"
-            elif dry_run:
-                client = None
-                heuristic_source = f"dry-run_{agent_mode}" if agent_mode != "agents" else "dry-run"
-            else:
-                config = AgentConfig.from_file(config_path, model=model, required=True)
-                if not config.api_key:
-                    raise RuntimeError("agent.api_key is required in config.yaml, or pass --dry-run")
-                config = select_agent_config_for_mode(config, agent_mode=agent_mode, cli_model=model)
-                client = AgentChatClient(config)
-                heuristic_source = "dry-run"
-            live_reports = asyncio.run(
-                run_all_zone_chains(
-                    live_contexts,
+                if live_contexts:
+                    if dry_run:
+                        heuristic_source = f"dry-run_{agent_mode}"
+                    else:
+                        config = AgentConfig.from_file(config_path, model=model, required=True)
+                        if not config.api_key:
+                            raise RuntimeError(
+                                "agent.api_key is required in config.yaml, or pass --dry-run"
+                            )
+                        config = select_agent_config_for_mode(
+                            config,
+                            agent_mode=agent_mode,
+                            cli_model=model,
+                        )
+                        client = AgentChatClient(config)
+                    initial_batch_started = time.perf_counter() if client is not None else None
+                    live_reports = await run_all_zone_chains(
+                        live_contexts,
+                        client=client,
+                        temperature=temperature,
+                        heuristic_source=heuristic_source,
+                        chain_mode=chain_mode,
+                    )
+                    if initial_batch_started is not None:
+                        initial_agent_batch_elapsed_seconds = round(
+                            time.perf_counter() - initial_batch_started,
+                            4,
+                        )
+                    reports_by_zone.update(
+                        {str(report.get("zone_id")): report for report in live_reports}
+                    )
+                reports = [
+                    reports_by_zone[str(context.get("zone_id"))] for context in contexts
+                ]
+            except AgentStageError:
+                raise
+            except Exception as exc:
+                raise PipelineStageError(stage="agent_chain", original=exc) from exc
+
+            try:
+                live_zone_ids = {str(context.get("zone_id")) for context in live_contexts}
+                live_reports = [
+                    report
+                    for report in reports
+                    if str(report.get("zone_id")) in live_zone_ids
+                ]
+                live_reports = await run_control_loop(
+                    reports=live_reports,
+                    contexts=live_contexts,
                     client=client,
-                    temperature=temperature,
                     heuristic_source=heuristic_source,
-                    chain_mode=chain_mode,
-                    apply_nash=apply_nash,
+                    agent_mode=agent_mode,
+                    temperature=temperature,
+                    pipeline_data=pipeline_data,
+                    zone_load_thresholds=zone_load_thresholds,
+                    price_change_reference=pipeline_data.price_change_reference,
+                    forecast_parameters=forecast_parameters,
+                    scenario_artifacts=scenario_artifacts,
+                    initial_agent_batch_elapsed_seconds=(
+                        initial_agent_batch_elapsed_seconds
+                    ),
                 )
-            )
-            reports_by_zone.update({str(report.get("zone_id")): report for report in live_reports})
-        reports = [reports_by_zone[str(context.get("zone_id"))] for context in contexts]
-    except AgentStageError:
-        raise
-    except Exception as exc:
-        raise PipelineStageError(stage="agent_chain", original=exc) from exc
-    try:
-        live_zone_ids = {str(context.get("zone_id")) for context in live_contexts}
-        live_reports = [report for report in reports if str(report.get("zone_id")) in live_zone_ids]
-        live_reports = apply_price_conditioned_baseline_forecasts(
-            reports=live_reports,
-            contexts=live_contexts,
-            pipeline_data=pipeline_data,
-            zone_load_thresholds=zone_load_thresholds,
-            apply_nash=apply_nash,
-            **price_conditioned_parameters(forecast_parameters),
-        )
-        reports_by_zone.update({str(report.get("zone_id")): report for report in live_reports})
-        reports = [reports_by_zone[str(context.get("zone_id"))] for context in contexts]
-    except Exception as exc:
-        raise PipelineStageError(stage="price_conditioned_forecast", original=exc) from exc
+                reports_by_zone.update(
+                    {str(report.get("zone_id")): report for report in live_reports}
+                )
+                return [
+                    reports_by_zone[str(context.get("zone_id"))] for context in contexts
+                ]
+            except Exception as exc:
+                if isinstance(exc, PipelineStageError):
+                    raise
+                raise PipelineStageError(
+                    stage="price_conditioned_forecast",
+                    original=exc,
+                ) from exc
+        finally:
+            if client is not None:
+                await client.aclose()
+
+    reports = asyncio.run(execute_agent_control_stage())
     try:
         agent_outputs = write_agent_outputs(
             output_dir=resolved_agent_output_dir,
@@ -399,6 +562,10 @@ def run_pipeline(
                 forecast_model=forecast_model,
                 forecaster_dir=forecaster_dir,
                 selected_zone_ids=selected_zone_ids,
+                forecast_origin=forecast_parameters.get("forecast_start"),
+                dataset_fingerprint=canonical_dataset.dataset_fingerprint,
+                cache_keys=pipeline_data.cache_keys or {},
+                feature_manifest=pipeline_data.feature_manifest or {},
             ),
         )
         return {**forecaster_outputs, **agent_outputs}
@@ -447,6 +614,10 @@ def build_forecaster_manifest(
     weather_file: str,
     selected_zone_ids: list[str],
     forecast_parameters: dict[str, Any],
+    dataset_fingerprint: str | None = None,
+    cache_keys: dict[str, str] | None = None,
+    feature_manifest: dict[str, Any] | None = None,
+    dataset_adapter: str = "urbanev",
 ) -> dict[str, Any]:
     return {
         "schema_version": FORECASTER_MANIFEST_SCHEMA_VERSION,
@@ -455,7 +626,11 @@ def build_forecaster_manifest(
         "data_source": {
             "data_dir": str(data_dir.resolve()),
             "weather_file": weather_file,
+            "adapter": dataset_adapter,
+            "dataset_fingerprint": dataset_fingerprint,
+            "cache_keys": cache_keys or {},
         },
+        "feature_manifest": feature_manifest or {},
         "zone_ids": list(selected_zone_ids),
         "forecast_parameters": dict(forecast_parameters),
     }
@@ -467,6 +642,10 @@ def build_agent_manifest(
     forecast_model: str,
     forecaster_dir: Path,
     selected_zone_ids: list[str],
+    forecast_origin: Any = None,
+    dataset_fingerprint: str | None = None,
+    cache_keys: dict[str, str] | None = None,
+    feature_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "schema_version": 1,
@@ -474,6 +653,12 @@ def build_agent_manifest(
         "completed_at": pd.Timestamp.now().isoformat(),
         "agent_mode": agent_mode,
         "forecast_model": forecast_model,
+        "forecast_origin": pd.Timestamp(forecast_origin).isoformat()
+        if forecast_origin is not None
+        else None,
+        "dataset_fingerprint": dataset_fingerprint,
+        "cache_keys": cache_keys or {},
+        "feature_manifest": feature_manifest or {},
         "forecaster_output_dir": str(forecaster_dir.resolve()),
         "zone_ids": list(selected_zone_ids),
     }
@@ -490,7 +675,9 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
     if manifest.get("schema_version") != FORECASTER_MANIFEST_SCHEMA_VERSION:
         raise ValueError(
             "Unsupported forecaster manifest schema_version: "
-            f"{manifest.get('schema_version')}; expected {FORECASTER_MANIFEST_SCHEMA_VERSION}"
+            f"{manifest.get('schema_version')}; expected {FORECASTER_MANIFEST_SCHEMA_VERSION}. "
+            "Run the forecaster stage again so closed-loop validation can reuse "
+            "the original backend instead of a legacy approximation artifact."
         )
     if manifest.get("stage") != "forecaster":
         raise ValueError(f"Invalid forecaster manifest stage: {manifest.get('stage')}")
@@ -513,6 +700,11 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
         artifacts.get("context_snippets"),
         "context_snippets",
     )
+    model_artifact_path = forecaster_artifact_path(
+        output_dir,
+        artifacts.get("forecaster_artifact_json"),
+        "forecaster_artifact_json",
+    )
     selected_zones = pd.read_csv(selected_path, dtype={"zone_id": "string"})
     if "zone_id" not in selected_zones:
         raise ValueError(f"Forecaster selected_zones is missing zone_id: {selected_path}")
@@ -520,6 +712,24 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
     contexts = json.loads(contexts_path.read_text(encoding="utf-8"))
     if not isinstance(contexts, list) or not all(isinstance(item, dict) for item in contexts):
         raise ValueError(f"Forecaster context_snippets must contain a JSON list: {contexts_path}")
+    model_payload = json.loads(model_artifact_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(model_payload, dict)
+        or model_payload.get("schema_version") != NATIVE_ARTIFACT_SCHEMA_VERSION
+        or model_payload.get("artifact_type") != "native_backend_reforecast"
+    ):
+        raise ValueError(
+            "Forecaster output uses a legacy approximation artifact. Run the "
+            "forecaster stage again to create native backend reforecast state."
+        )
+    raw_scenario_artifacts = model_payload.get("artifacts") if isinstance(model_payload, dict) else None
+    if not isinstance(raw_scenario_artifacts, dict):
+        raise ValueError("Forecaster artifact is missing per-zone artifacts")
+    scenario_artifacts = {
+        str(zone_id): NativeForecasterArtifact.from_dict(payload)
+        for zone_id, payload in raw_scenario_artifacts.items()
+        if isinstance(payload, dict)
+    }
 
     selected_ids = selected_zones["zone_id"].astype(str).tolist()
     context_ids = [str(context.get("zone_id")) for context in contexts]
@@ -529,12 +739,17 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
             "Forecaster output zone order mismatch between manifest, selected_zones, "
             "and context_snippets"
         )
+    if set(scenario_artifacts) != set(selected_ids):
+        raise ValueError(
+            "Forecaster artifact Zone set does not match the no-leakage handoff."
+        )
 
     outputs = {
         "forecaster_output_dir": output_dir,
         "forecaster_manifest_json": manifest_path,
         "selected_zones": selected_path,
         "context_snippets": contexts_path,
+        "forecaster_artifact_json": model_artifact_path,
     }
     for name in (
         "forecast_metrics_csv",
@@ -552,6 +767,7 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
         contexts=contexts,
         forecast_parameters=forecast_parameters,
         outputs=outputs,
+        scenario_artifacts=scenario_artifacts,
     )
 
 
@@ -570,8 +786,8 @@ def select_agent_config_for_mode(
     agent_mode: str,
     cli_model: str | None,
 ) -> AgentConfig:
-    if agent_mode == "single_model" and cli_model is None and config.single_model_model:
-        return replace(config, model=config.single_model_model)
+    if agent_mode.startswith("single_agent") and cli_model is None and config.single_agent_model:
+        return replace(config, model=config.single_agent_model)
     return config
 
 
@@ -595,36 +811,57 @@ def run_experiment_matrix(
     matrix_stage = normalize_pipeline_stage(pipeline_kwargs.get("pipeline_stage", "full"))
     requested_modes = normalize_agent_modes(
         agent_modes,
-        pipeline_kwargs.get("agent_mode", "agents"),
+        pipeline_kwargs.get("agent_mode", "multi_agent_economist_retry"),
     )
     modes = requested_modes
     if matrix_stage == "forecaster":
         modes = modes[:1]
     blend_alphas = normalize_blend_alphas(diurnal_blend_alphas)
     selected_zone_ids = normalize_zone_ids(zone_ids)
-    shared_cache_dir = output_dir / "cache"
+    shared_cache_dir = Path(pipeline_kwargs.pop("cache_dir", data_dir / "cache"))
     shared_cache_dir.mkdir(parents=True, exist_ok=True)
     base_force_cache = bool(pipeline_kwargs.pop("force_cache", False))
     if not selected_zone_ids:
-        profiles = build_zone_profiles(
-            data_dir,
-            shared_cache_dir,
+        matrix_dataset_spec = pipeline_kwargs.get("dataset_spec") or DatasetSpec(
+            path=data_dir,
+            cache_dir=shared_cache_dir,
+            weather_file=str(pipeline_kwargs.get("weather_file") or "weather_airport.csv"),
+        )
+        canonical_dataset = load_canonical_dataset(
+            matrix_dataset_spec,
             force_cache=base_force_cache,
-            max_poi_rows=pipeline_kwargs.get("max_poi_rows"),
+        )
+        selection_start = pd.Timestamp(min(starts))
+        selection_split_key = split_cache_key(
+            canonical_dataset.dataset_fingerprint,
+            selection_start,
+            window_hours=3,
+            policy_id="historical_3h_min_max_range_35_80_90",
+        )
+        profiles = build_zone_profiles_from_canonical(
+            canonical_dataset,
+            shared_cache_dir
+            / "datasets"
+            / canonical_dataset.dataset_fingerprint
+            / "splits"
+            / selection_split_key,
+            forecast_start=selection_start,
+            force_cache=base_force_cache,
         )
         selected_zone_ids = select_representative_zone_ids(
             profiles,
             count=experiment_zone_count,
         )
-    experiment_dir = output_dir / "experiments" / (
-        experiment_name
-        or experiment_slug(
+    resolved_experiment_name = normalize_experiment_name(
+        experiment_name,
+        default=experiment_slug(
             zone_count=len(selected_zone_ids),
             time_count=len(starts),
             mode_count=len(requested_modes),
             blend_count=len(blend_alphas),
-        )
+        ),
     )
+    experiment_dir = output_dir / resolved_experiment_name
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     runs_path = experiment_dir / "experiment_runs.csv"
@@ -632,6 +869,8 @@ def run_experiment_matrix(
     price_path = experiment_dir / "experiment_price_comparison_summary.csv"
     rationale_path = experiment_dir / "experiment_rationale_trace.csv"
     explainability_path = experiment_dir / "experiment_explainability_review_packet.csv"
+    agent_attempt_usage_path = experiment_dir / "experiment_agent_attempt_usage.csv"
+    control_attempt_trace_path = experiment_dir / "experiment_control_attempt_trace.csv"
     forecast_summary_path = experiment_dir / "experiment_forecast_summary.csv"
     price_summary_path = experiment_dir / "experiment_price_summary.csv"
     rationale_summary_path = experiment_dir / "experiment_rationale_summary.csv"
@@ -642,6 +881,8 @@ def run_experiment_matrix(
     price_frames: list[pd.DataFrame] = []
     rationale_frames: list[pd.DataFrame] = []
     explainability_frames: list[pd.DataFrame] = []
+    agent_attempt_usage_frames: list[pd.DataFrame] = []
+    control_attempt_trace_frames: list[pd.DataFrame] = []
     cache_attempted = False
     add_seed_folder = len(seeds) > 1
     add_mode_folder = len(modes) > 1
@@ -746,6 +987,16 @@ def run_experiment_matrix(
                                 outputs.get("explainability_review_packet_csv"),
                                 metadata,
                             )
+                            append_experiment_frame(
+                                agent_attempt_usage_frames,
+                                outputs.get("agent_attempt_usage_csv"),
+                                metadata,
+                            )
+                            append_experiment_frame(
+                                control_attempt_trace_frames,
+                                outputs.get("control_attempt_trace_csv"),
+                                metadata,
+                            )
                         except Exception as exc:
                             record["status"] = "failed"
                             record["completed_at"] = pd.Timestamp.now().isoformat()
@@ -767,6 +1018,8 @@ def run_experiment_matrix(
     prices = write_experiment_summary(price_frames, price_path)
     rationales = write_experiment_summary(rationale_frames, rationale_path)
     write_experiment_summary(explainability_frames, explainability_path)
+    write_experiment_summary(agent_attempt_usage_frames, agent_attempt_usage_path)
+    write_experiment_summary(control_attempt_trace_frames, control_attempt_trace_path)
     write_numeric_summary(
         metrics,
         forecast_summary_path,
@@ -777,8 +1030,8 @@ def run_experiment_matrix(
         price_summary_path,
         metric_columns=[
             "price_accuracy",
-            "avg_predicted_minus_actual_energy_price",
-            "avg_predicted_vs_actual_pct",
+            "avg_predicted_minus_baseline_energy_price",
+            "avg_predicted_vs_baseline_pct",
         ],
     )
     write_numeric_summary(
@@ -794,6 +1047,8 @@ def run_experiment_matrix(
         "experiment_price_comparison_summary_csv": price_path,
         "experiment_rationale_trace_csv": rationale_path,
         "experiment_explainability_review_packet_csv": explainability_path,
+        "experiment_agent_attempt_usage_csv": agent_attempt_usage_path,
+        "experiment_control_attempt_trace_csv": control_attempt_trace_path,
         "experiment_forecast_summary_csv": forecast_summary_path,
         "experiment_price_summary_csv": price_summary_path,
         "experiment_rationale_summary_csv": rationale_summary_path,
@@ -1094,8 +1349,8 @@ def write_decision_quality_summary(
                 prices,
                 metrics=[
                     "price_accuracy",
-                    "avg_predicted_minus_actual_energy_price",
-                    "avg_predicted_vs_actual_pct",
+                    "avg_predicted_minus_baseline_energy_price",
+                    "avg_predicted_vs_baseline_pct",
                 ],
                 metric_family="price_decision",
             )
@@ -1225,6 +1480,14 @@ def forecast_output_dir(output_dir: Path, forecast_model: str) -> Path:
     return output_dir / safe_filename(normalized or "forecast")
 
 
+def normalize_experiment_name(value: Any, *, default: str) -> str:
+    raw = str(value).strip() if value not in (None, "") else str(default).strip()
+    name = safe_filename(raw)
+    if not name or name in {".", ".."}:
+        raise ValueError("experiment_name must contain at least one letter or number.")
+    return name
+
+
 def load_precomputed_window_data(path: Path | str | None) -> pd.DataFrame:
     if path in (None, ""):
         return pd.DataFrame()
@@ -1243,9 +1506,6 @@ def load_precomputed_window_data(path: Path | str | None) -> pd.DataFrame:
         "predicted_energy_price",
         "price_conditioned_load_kwh",
         "zone_mean_energy_price",
-        "min_allowed_energy_price",
-        "max_allowed_energy_price",
-        "energy_price_bound_source",
     }
     missing = sorted(required.difference(frame.columns))
     if missing:
@@ -1343,8 +1603,8 @@ def apply_precomputed_window_data(
     passthrough_fields = (
         "load_stress_level",
         "load_range_position_pct",
-        "actual_load_range_position_pct",
         "price_conditioned_load_stress_level",
+        "price_conditioned_load_range_position_pct",
         "historical_min_load_3h_kwh",
         "historical_max_load_3h_kwh",
         "historical_load_range_3h_kwh",
@@ -1355,12 +1615,6 @@ def apply_precomputed_window_data(
         "load_3h_medium_high_threshold_kwh",
         "load_3h_high_extremely_high_threshold_kwh",
         "zone_mean_energy_price",
-        "min_allowed_energy_price",
-        "max_allowed_energy_price",
-        "energy_price_bound_source",
-        "nash_equilibrium_reached",
-        "nash_status",
-        "nash_iterations",
         "target_peak_reduction_pct",
         "baseline_load_range_position_pct",
         "target_load_kwh",
@@ -1372,23 +1626,11 @@ def apply_precomputed_window_data(
         "expected_load_kwh",
         "expected_load_range_position_pct",
         "load_in_medium_band",
-        "price_within_allowed_bounds",
-        "grid_safe",
-        "user_tolerant",
-        "price_stable",
-        "discomfort_score",
-        "max_discomfort_score",
-        "price_stability_epsilon_pct",
         "action_label",
         "price_rationale",
     )
     boolean_fields = {
-        "nash_equilibrium_reached",
-        "grid_safe",
-        "user_tolerant",
-        "price_stable",
         "load_in_medium_band",
-        "price_within_allowed_bounds",
     }
 
     for report in reports:
@@ -1403,22 +1645,17 @@ def apply_precomputed_window_data(
             updated = dict(window)
             predicted_price = optional_number(row.get("predicted_energy_price"))
             conditioned_load = optional_number(row.get("price_conditioned_load_kwh"))
-            actual_price = optional_number(updated.get("mean_energy_price"))
+            baseline_price = optional_number(updated.get("mean_energy_price"))
             final_shift = optional_number(row.get("final_price_shift_pct"))
-            if final_shift is None and actual_price not in (None, 0) and predicted_price is not None:
-                final_shift = ((predicted_price / actual_price) - 1) * 100
-            pre_nash_shift = optional_number(row.get("pre_nash_price_shift_pct"))
-            if pre_nash_shift is None:
-                pre_nash_shift = final_shift
-
+            if final_shift is None and baseline_price not in (None, 0) and predicted_price is not None:
+                final_shift = ((predicted_price / baseline_price) - 1) * 100
             forecast_load = optional_number(row.get("forecast_load_kwh"))
             if forecast_load is not None:
                 updated["sum_predicted_kwh"] = forecast_load
             updated["predicted_energy_price"] = predicted_price
+            updated["proposed_energy_price"] = predicted_price
+            updated["price_valid"] = predicted_price is not None and predicted_price >= 0
             updated["suggested_price_shift_pct"] = round(final_shift, 4) if final_shift is not None else None
-            updated["pre_nash_suggested_price_shift_pct"] = (
-                round(pre_nash_shift, 4) if pre_nash_shift is not None else None
-            )
             updated["price_conditioned_baseline_load_kwh"] = conditioned_load
             updated["price_conditioned_mean_predicted_kwh"] = optional_number(
                 row.get("price_conditioned_mean_load_kwh")
@@ -1440,10 +1677,6 @@ def apply_precomputed_window_data(
                 value = row.get(field)
                 if value is not None:
                     updated[field] = normalize_precomputed_bool(value) if field in boolean_fields else value
-            if row.get("nash_status") is None:
-                updated["nash_equilibrium_reached"] = None
-                updated["nash_status"] = "precomputed"
-                updated["nash_iterations"] = 0
             updated_windows.append(updated)
 
         updated_report = dict(report)
@@ -1455,24 +1688,16 @@ def apply_precomputed_window_data(
             updated_report["predicted_load_kwh"] = round(sum(value for value in forecast_loads if value is not None), 4)
         if shifts:
             updated_report["suggested_price_shift_pct"] = round(sum(shifts) / len(shifts), 2)
-        if updated_windows and all(window.get("nash_status") == "precomputed" for window in updated_windows):
-            nash_summary = {
-                "nash_equilibrium_reached": None,
-                "nash_equilibrium_windows": len(updated_windows),
-                "nash_equilibrium_reached_windows": 0,
-                "nash_equilibrium_rounds": 0,
-                "nash_equilibrium_summary": f"Reused precomputed results for {len(updated_windows)} pricing windows",
-            }
-        else:
-            nash_summary = summarize_nash_equilibrium(updated_windows)
-        updated_report.update(nash_summary)
         updated_report["agent_reasoning"] = f"Reused window load and energy-price predictions from {source_name}."
         updated_report["action_label"] = "Reuse precomputed window predictions"
         updated_report["price_rationale"] = f"Loaded complete 3-hour window predictions from {source_name}."
         updated_report["agent_time_cost_seconds"] = 0.0
+        updated_report["agent_invoked"] = False
+        updated_report["agent_call_count"] = 0
         updated_report["agent_prompt_tokens"] = 0
         updated_report["agent_completion_tokens"] = 0
         updated_report["agent_total_tokens"] = 0
+        updated_report["agent_token_usage_complete"] = True
         updated_report["agent_call_usage"] = []
         updated_report["source"] = "precomputed_window_data"
         updated_report["precomputed_window_data_source"] = str(source_path)
@@ -1516,6 +1741,7 @@ def apply_price_conditioned_baseline_forecasts(
     contexts: list[dict[str, Any]],
     pipeline_data,
     zone_load_thresholds: pd.DataFrame,
+    scenario_artifacts: dict[str, NativeForecasterArtifact],
     forecast_start: str | None,
     horizon_days: int,
     history_days: int,
@@ -1543,7 +1769,6 @@ def apply_price_conditioned_baseline_forecasts(
     lstm_diurnal_blend_alpha: float,
     lstm_device: str,
     lstm_seed: int,
-    apply_nash: bool = True,
 ) -> list[dict[str, Any]]:
     normalized_model = normalize_forecast_model_name(forecast_model)
     if normalized_model not in {"timesfm", "lstm", "chronos", "AR"}:
@@ -1563,6 +1788,15 @@ def apply_price_conditioned_baseline_forecasts(
     thresholds_by_zone["zone_id"] = thresholds_by_zone["zone_id"].astype(str)
     thresholds_by_zone = thresholds_by_zone.set_index("zone_id", drop=False)
 
+    price_conditioned_energy_price = pipeline_data.energy_price.copy()
+    for report in reports:
+        report_zone = str(report.get("zone_id"))
+        price_conditioned_energy_price = energy_price_with_predicted_windows(
+            price_conditioned_energy_price,
+            report_zone,
+            report.get("price_change_windows_3h") or [],
+        )
+
     updated_reports: list[dict[str, Any]] = []
     for report in reports:
         zone_id = str(report.get("zone_id"))
@@ -1576,79 +1810,801 @@ def apply_price_conditioned_baseline_forecasts(
             )
             continue
 
-        price_conditioned_energy_price = energy_price_with_predicted_windows(
-            pipeline_data.energy_price,
-            zone_id,
-            report.get("price_change_windows_3h") or [],
+        artifact = scenario_artifacts.get(zone_id)
+        if artifact is None:
+            updated_reports.append(
+                mark_price_conditioned_baseline_unavailable(
+                    report,
+                    "missing_reusable_forecaster_artifact",
+                )
+            )
+            continue
+        batch = artifact.predict(price_conditioned_energy_price)
+        conditioned_hourly = batch.hourly.rename(
+            columns={
+                "timestamp": "time",
+                "predicted_load": "predicted_kwh",
+                "energy_price": "e_price",
+            }
         )
-        conditioned_result = forecast_zone(
-            zone_id=zone_id,
-            category=str(report.get("category") or context.get("category") or "User-selected"),
-            load=pipeline_data.load,
-            service_price=pipeline_data.service_price,
-            energy_price=price_conditioned_energy_price,
-            occupancy=pipeline_data.occupancy,
-            weather=pipeline_data.weather,
-            profile=profiles_by_zone.loc[zone_id].to_dict(),
-            forecast_start=context.get("forecast_start") or forecast_start,
-            horizon_days=int(context.get("forecast_horizon_days") or horizon_days),
-            history_days=history_days,
-            validation_days=validation_days,
-            forecast_model=normalized_model,
-            timesfm_repo=timesfm_repo,
-            timesfm_context_hours=timesfm_context_hours,
-            timesfm_step_horizon=timesfm_step_horizon,
-            timesfm_exog_cols=ensure_energy_price_exog_cols(timesfm_exog_cols),
-            timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-            timesfm_roll_actuals=False,
-            ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
-            chronos_repo=chronos_repo,
-            chronos_context_hours=chronos_context_hours,
-            chronos_step_horizon=chronos_step_horizon,
-            chronos_exog_cols=ensure_energy_price_exog_cols(DEFAULT_TIMESFM_EXOG_COLS),
-            chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
-            chronos_device=chronos_device,
-            chronos_roll_actuals=False,
-            lstm_context_hours=lstm_context_hours,
-            lstm_step_horizon=lstm_step_horizon,
-            lstm_exog_cols=ensure_energy_price_exog_cols(lstm_exog_cols),
-            lstm_hidden_size=lstm_hidden_size,
-            lstm_num_layers=lstm_num_layers,
-            lstm_epochs=lstm_epochs,
-            lstm_learning_rate=lstm_learning_rate,
-            lstm_batch_size=lstm_batch_size,
-            lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
-            lstm_device=lstm_device,
-            lstm_roll_actuals=False,
-            lstm_seed=lstm_seed,
-        )
+        for source, column in (
+            (pipeline_data.service_price, "s_price"),
+            (pipeline_data.occupancy, "occupancy"),
+        ):
+            if zone_id in source:
+                conditioned_hourly = conditioned_hourly.merge(
+                    source[["time", zone_id]].rename(columns={zone_id: column}),
+                    on="time",
+                    how="left",
+                )
+        weather_columns = [
+            column for column in ("T", "U", "nRAIN") if column in pipeline_data.weather
+        ]
+        if weather_columns:
+            conditioned_hourly = conditioned_hourly.merge(
+                pipeline_data.weather[["time", *weather_columns]],
+                on="time",
+                how="left",
+            )
         thresholds = load_stress_thresholds(
             thresholds_by_zone,
             zone_id,
             profile=profiles_by_zone.loc[zone_id].to_dict(),
         )
         conditioned_windows = build_pricing_windows_3h(
-            conditioned_result.hourly,
+            conditioned_hourly,
             stress_thresholds=thresholds,
         )
         updated_report = attach_price_conditioned_baselines(
             report,
             conditioned_windows,
             forecast_model=normalized_model,
+            forecast_metadata=batch.metadata,
         )
-        updated_reports.append(recompute_report_nash(context, updated_report, apply_nash=apply_nash))
+        updated_reports.append(updated_report)
     return updated_reports
 
 
-def ensure_energy_price_exog_cols(values: list[str] | None) -> list[str]:
-    cols = list(values) if values else list(DEFAULT_TIMESFM_EXOG_COLS)
-    if "e_price" in cols:
-        return cols
-    if "s_price" in cols:
-        cols.insert(cols.index("s_price"), "e_price")
-    else:
-        cols.append("e_price")
-    return cols
+async def run_control_loop(
+    *,
+    reports: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+    client: Any,
+    heuristic_source: str,
+    agent_mode: str,
+    temperature: float,
+    pipeline_data: Any,
+    zone_load_thresholds: pd.DataFrame,
+    price_change_reference: Any,
+    forecast_parameters: dict[str, Any],
+    scenario_artifacts: dict[str, NativeForecasterArtifact],
+    initial_agent_batch_elapsed_seconds: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Run at most three forecast-validated price proposals."""
+
+    current = [copy.deepcopy(report) for report in reports]
+    contexts_by_zone = {str(context.get("zone_id")): context for context in contexts}
+    traces: dict[str, list[dict[str, Any]]] = {
+        str(report.get("zone_id")): [] for report in current
+    }
+    pending_usage_by_zone: dict[str, list[dict[str, Any]]] = {
+        str(report.get("zone_id")): copy.deepcopy(
+            report.get("agent_call_usage")
+            if isinstance(report.get("agent_call_usage"), list)
+            else []
+        )
+        for report in current
+    }
+    pending_revised_keys_by_zone: dict[str, set[tuple[str, str]]] = {
+        str(report.get("zone_id")): set() for report in current
+    }
+    pending_phase_by_zone: dict[str, str] = {
+        str(report.get("zone_id")): "initial" for report in current
+    }
+    pending_batch_elapsed_seconds = round(
+        max(float(initial_agent_batch_elapsed_seconds or 0.0), 0.0),
+        4,
+    )
+    agent_round_usage: list[dict[str, Any]] = []
+
+    for attempt in range(1, MAX_CONTROL_ATTEMPTS + 1):
+        current = [
+            attach_price_change_diagnostics(report, price_change_reference)
+            for report in current
+        ]
+        conditioned = apply_price_conditioned_baseline_forecasts(
+            reports=current,
+            contexts=[contexts_by_zone[str(report.get("zone_id"))] for report in current],
+            pipeline_data=pipeline_data,
+            zone_load_thresholds=zone_load_thresholds,
+            scenario_artifacts=scenario_artifacts,
+            **price_conditioned_parameters(forecast_parameters),
+        )
+        conditioned_by_zone = {
+            str(report.get("zone_id")): report for report in conditioned
+        }
+        current = [
+            assess_control_report(
+                conditioned_by_zone[str(report.get("zone_id"))],
+                attempt=attempt,
+            )
+            for report in current
+        ]
+
+        zone_usage_for_round: list[dict[str, Any]] = []
+        for report in current:
+            zone_id = str(report.get("zone_id"))
+            previous_snapshot = traces[zone_id][-1] if traces[zone_id] else None
+            snapshot = control_attempt_snapshot(
+                report,
+                attempt,
+                previous_snapshot=previous_snapshot,
+                revised_keys=pending_revised_keys_by_zone.get(zone_id, set()),
+                agent_call_usage=pending_usage_by_zone.get(zone_id, []),
+                proposal_phase=pending_phase_by_zone.get(zone_id, "frozen"),
+                triggered_by_attempt=attempt - 1 if attempt > 1 else None,
+            )
+            traces[zone_id].append(snapshot)
+            zone_usage_for_round.append(
+                {
+                    "zone_id": zone_id,
+                    **snapshot["agent_usage"],
+                }
+            )
+
+        agent_round_usage.append(
+            build_global_agent_round_usage(
+                attempt=attempt,
+                zone_usage=zone_usage_for_round,
+                batch_elapsed_seconds=pending_batch_elapsed_seconds,
+                proposal_phase=(
+                    "initial" if attempt == 1 else retry_proposal_phase(agent_mode)
+                ),
+                triggered_by_attempt=attempt - 1 if attempt > 1 else None,
+            )
+        )
+
+        if all(report.get("control_status") == "success" for report in current):
+            break
+        if attempt >= MAX_CONTROL_ATTEMPTS:
+            break
+
+        retry_jobs: list[tuple[dict[str, Any], dict[str, Any], set[tuple[str, str]]]] = []
+        for report in current:
+            if report.get("control_status") == "success":
+                continue
+            zone_id = str(report.get("zone_id"))
+            failed_keys = {
+                window_key(window)
+                for window in report.get("price_change_windows_3h") or []
+                if not window.get("control_success")
+            }
+            retry_context = build_retry_context(
+                contexts_by_zone[zone_id],
+                report,
+                attempt=attempt,
+                replace_forecast=agent_mode
+                in {"multi_agent_full_retry", "single_agent_full_retry"},
+            )
+            retry_jobs.append((retry_context, report, failed_keys))
+
+        retry_batch_started = time.perf_counter() if client is not None and retry_jobs else None
+        revisions = await revise_control_reports(
+            retry_jobs,
+            client=client,
+            temperature=temperature,
+            heuristic_source=heuristic_source,
+            agent_mode=agent_mode,
+        )
+        pending_batch_elapsed_seconds = (
+            round(time.perf_counter() - retry_batch_started, 4)
+            if retry_batch_started is not None
+            else 0.0
+        )
+        revisions_by_zone = {
+            str(report.get("zone_id")): (report, failed_keys)
+            for report, failed_keys in revisions
+        }
+        next_reports: list[dict[str, Any]] = []
+        next_usage_by_zone: dict[str, list[dict[str, Any]]] = {}
+        next_revised_keys_by_zone: dict[str, set[tuple[str, str]]] = {}
+        next_phase_by_zone: dict[str, str] = {}
+        for report in current:
+            zone_id = str(report.get("zone_id"))
+            if zone_id not in revisions_by_zone:
+                next_reports.append(report)
+                next_usage_by_zone[zone_id] = []
+                next_revised_keys_by_zone[zone_id] = set()
+                next_phase_by_zone[zone_id] = "frozen"
+                continue
+            revision, failed_keys = revisions_by_zone[zone_id]
+            next_reports.append(
+                merge_failed_window_revision(report, revision, failed_keys)
+            )
+            revision_usage = revision.get("agent_call_usage")
+            next_usage_by_zone[zone_id] = copy.deepcopy(
+                revision_usage if isinstance(revision_usage, list) else []
+            )
+            next_revised_keys_by_zone[zone_id] = set(failed_keys)
+            next_phase_by_zone[zone_id] = retry_proposal_phase(agent_mode)
+        current = next_reports
+        pending_usage_by_zone = next_usage_by_zone
+        pending_revised_keys_by_zone = next_revised_keys_by_zone
+        pending_phase_by_zone = next_phase_by_zone
+
+    global_cumulative_usage = cumulative_global_agent_usage(agent_round_usage)
+    finalized: list[dict[str, Any]] = []
+    for report in current:
+        zone_id = str(report.get("zone_id"))
+        updated = dict(report)
+        updated["control_attempt_trace"] = traces[zone_id]
+        updated["attempts_used"] = len(traces[zone_id])
+        final_windows = updated.get("price_change_windows_3h") or []
+        updated["control_status"] = (
+            "success"
+            if final_windows
+            and all(
+                window.get("control_success")
+                for window in final_windows
+            )
+            else "fail"
+        )
+        cumulative_usage, cumulative_calls = cumulative_zone_agent_usage(
+            traces[zone_id]
+        )
+        updated["agent_cumulative_usage"] = cumulative_usage
+        updated["agent_call_usage"] = cumulative_calls
+        updated["agent_time_cost_seconds"] = cumulative_usage[
+            "agent_elapsed_seconds"
+        ]
+        updated["agent_invoked"] = cumulative_usage["agent_invoked"]
+        updated["agent_call_count"] = cumulative_usage["agent_call_count"]
+        updated["agent_prompt_tokens"] = cumulative_usage["prompt_tokens"]
+        updated["agent_completion_tokens"] = cumulative_usage[
+            "completion_tokens"
+        ]
+        updated["agent_total_tokens"] = cumulative_usage["total_tokens"]
+        updated["agent_token_usage_complete"] = cumulative_usage[
+            "token_usage_complete"
+        ]
+        updated[CONTROL_AGENT_USAGE_KEY] = {
+            "agent_round_usage": agent_round_usage,
+            "agent_cumulative_usage": global_cumulative_usage,
+        }
+        finalized.append(updated)
+    return finalized
+
+
+async def revise_control_reports(
+    jobs: list[tuple[dict[str, Any], dict[str, Any], set[tuple[str, str]]]],
+    *,
+    client: Any,
+    temperature: float,
+    heuristic_source: str,
+    agent_mode: str,
+) -> list[tuple[dict[str, Any], set[tuple[str, str]]]]:
+    async def revise(
+        context: dict[str, Any],
+        previous: dict[str, Any],
+        failed_keys: set[tuple[str, str]],
+    ) -> tuple[dict[str, Any], set[tuple[str, str]]]:
+        if agent_mode in {"multi_agent_full_retry", "single_agent_full_retry"}:
+            revision = await run_zone_chain(
+                context,
+                client=client,
+                temperature=temperature,
+                heuristic_source=heuristic_source,
+                chain_mode=(
+                    "single_agent"
+                    if agent_mode == "single_agent_full_retry"
+                    else "multi_agent"
+                ),
+            )
+        else:
+            revision = await retry_zone_prices(
+                context,
+                previous,
+                client=client,
+                temperature=temperature,
+                single_agent=agent_mode == "single_agent_price_retry",
+                heuristic_source=heuristic_source,
+            )
+        return revision, failed_keys
+
+    return await asyncio.gather(
+        *(revise(context, previous, failed_keys) for context, previous, failed_keys in jobs)
+    )
+
+
+def attach_price_change_diagnostics(
+    report: dict[str, Any],
+    reference: Any,
+) -> dict[str, Any]:
+    updated = dict(report)
+    windows: list[dict[str, Any]] = []
+    for window in report.get("price_change_windows_3h") or []:
+        item = dict(window)
+        shift = optional_number(item.get("suggested_price_shift_pct"))
+        percentile = reference.percentile(shift) if reference is not None else None
+        p95 = reference.p95_pct if reference is not None else None
+        item["historical_price_change_percentile"] = percentile
+        item["historical_price_change_p95_pct"] = p95
+        item["exceeds_historical_p95"] = (
+            abs(shift) > p95
+            if shift is not None and p95 is not None
+            else None
+        )
+        windows.append(item)
+    updated["price_change_windows_3h"] = windows
+    updated["historical_price_change_reference"] = (
+        reference.to_dict(include_values=False) if reference is not None else None
+    )
+    return updated
+
+
+def assess_control_report(report: dict[str, Any], *, attempt: int) -> dict[str, Any]:
+    updated = dict(report)
+    windows: list[dict[str, Any]] = []
+    for window in report.get("price_change_windows_3h") or []:
+        item = dict(window)
+        stress = item.get("price_conditioned_load_stress_level")
+        price_valid = bool(item.get("price_valid"))
+        success = price_valid and stress == MEDIUM_STRESS
+        item["control_attempt"] = attempt
+        item["control_success"] = success
+        if not price_valid:
+            failure_reason = "invalid_non_negative_energy_price_constraint"
+        elif stress is None:
+            failure_reason = "price_conditioned_forecast_unavailable"
+        elif stress != MEDIUM_STRESS:
+            failure_reason = f"price_conditioned_load_is_{stress}"
+        else:
+            failure_reason = None
+        item["control_failure_reason"] = failure_reason
+        windows.append(item)
+    updated["price_change_windows_3h"] = windows
+    updated["control_status"] = (
+        "success" if windows and all(item["control_success"] for item in windows) else "fail"
+    )
+    updated["failed_window_count"] = sum(not item["control_success"] for item in windows)
+    updated["attempts_used"] = attempt
+    return updated
+
+
+def control_attempt_snapshot(
+    report: dict[str, Any],
+    attempt: int,
+    *,
+    previous_snapshot: dict[str, Any] | None = None,
+    revised_keys: set[tuple[str, str]] | None = None,
+    agent_call_usage: list[dict[str, Any]] | None = None,
+    proposal_phase: str | None = None,
+    triggered_by_attempt: int | None = None,
+) -> dict[str, Any]:
+    phase = proposal_phase or ("initial" if attempt == 1 else "frozen")
+    revised = revised_keys or set()
+    previous_windows = {
+        window_key(window): window
+        for window in (previous_snapshot or {}).get("windows", [])
+        if isinstance(window, dict)
+    }
+    usage, usage_calls = build_zone_attempt_agent_usage(
+        agent_call_usage or [],
+        attempt=attempt,
+        proposal_phase=phase,
+        triggered_by_attempt=triggered_by_attempt,
+    )
+    windows: list[dict[str, Any]] = []
+    for window in report.get("price_change_windows_3h") or []:
+        if not isinstance(window, dict):
+            continue
+        key = window_key(window)
+        previous = previous_windows.get(key, {})
+        proposal_status = (
+            "initial"
+            if attempt == 1
+            else "revised"
+            if key in revised
+            else "frozen"
+        )
+        previous_price = optional_number(
+            window.get("mean_energy_price")
+            if attempt == 1
+            else previous.get("proposed_energy_price")
+        )
+        current_price = optional_number(window.get("proposed_energy_price"))
+        previous_shift = (
+            0.0
+            if attempt == 1
+            else optional_number(previous.get("suggested_price_shift_pct"))
+        )
+        current_shift = optional_number(window.get("suggested_price_shift_pct"))
+        price_change_amount = numeric_difference(current_price, previous_price)
+        price_change_pct = (
+            round((price_change_amount / previous_price) * 100.0, 4)
+            if price_change_amount is not None
+            and previous_price is not None
+            and previous_price > 0
+            else None
+        )
+        shift_change = numeric_difference(current_shift, previous_shift)
+        trigger_failure_reason = (
+            previous.get("control_failure_reason")
+            if proposal_status == "revised"
+            else None
+        )
+        reforecast_load = window.get("price_conditioned_baseline_load_kwh")
+        reforecast_position = window.get(
+            "price_conditioned_load_range_position_pct"
+        )
+        reforecast_stress = window.get("price_conditioned_load_stress_level")
+        windows.append(
+            {
+                "window_start": window.get("window_start"),
+                "window_end": window.get("window_end"),
+                "proposal_status": proposal_status,
+                "mean_energy_price": window.get("mean_energy_price"),
+                "previous_proposed_energy_price": previous_price,
+                "proposed_energy_price": current_price,
+                "price_change_amount": price_change_amount,
+                "price_change_pct_vs_previous": price_change_pct,
+                "previous_suggested_price_shift_pct": previous_shift,
+                "suggested_price_shift_pct": current_shift,
+                "shift_change_percentage_points": shift_change,
+                "price_changed": numeric_value_changed(
+                    previous_price,
+                    current_price,
+                ),
+                "trigger_failure_reason": trigger_failure_reason,
+                "historical_price_change_percentile": window.get(
+                    "historical_price_change_percentile"
+                ),
+                "historical_price_change_p95_pct": window.get(
+                    "historical_price_change_p95_pct"
+                ),
+                "exceeds_historical_p95": window.get(
+                    "exceeds_historical_p95"
+                ),
+                "price_conditioned_baseline_load_kwh": reforecast_load,
+                "price_conditioned_load_range_position_pct": reforecast_position,
+                "price_conditioned_load_stress_level": reforecast_stress,
+                "price_conditioned_baseline_source": window.get(
+                    "price_conditioned_baseline_source"
+                ),
+                "reforecast_load_kwh": reforecast_load,
+                "reforecast_load_range_position_pct": reforecast_position,
+                "reforecast_load_stress_level": reforecast_stress,
+                "control_success": window.get("control_success"),
+                "control_failure_reason": window.get("control_failure_reason"),
+                "price_rationale": window.get("price_rationale"),
+            }
+        )
+    return {
+        "attempt": attempt,
+        "proposal_phase": phase,
+        "triggered_by_attempt": triggered_by_attempt,
+        "control_status": report.get("control_status"),
+        "failed_window_count": report.get("failed_window_count"),
+        "agent_usage": usage,
+        "agent_call_usage": usage_calls,
+        "grid_reasoning_summary": report.get("grid_reasoning_summary"),
+        "behavior_reasoning_summary": report.get("behavior_reasoning_summary"),
+        "economist_reasoning_summary": report.get("economist_reasoning_summary"),
+        "price_rationale": report.get("price_rationale"),
+        "price_conditioned_forecast_metadata": report.get(
+            "price_conditioned_forecast_metadata"
+        ),
+        "windows": windows,
+    }
+
+
+def build_zone_attempt_agent_usage(
+    records: list[dict[str, Any]],
+    *,
+    attempt: int,
+    proposal_phase: str,
+    triggered_by_attempt: int | None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    calls: list[dict[str, Any]] = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        item = copy.deepcopy(record)
+        if item.get("token_usage_complete") is None:
+            item["token_usage_complete"] = all(
+                item.get(field) is not None
+                for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+            )
+        item["attempt"] = attempt
+        item["proposal_phase"] = proposal_phase
+        item["triggered_by_attempt"] = triggered_by_attempt
+        calls.append(item)
+    summarized = summarize_agent_call_usage(calls)
+    usage = {
+        "agent_invoked": summarized["agent_invoked"],
+        "agent_call_count": summarized["agent_call_count"],
+        "agent_elapsed_seconds": summarized["elapsed_seconds"],
+        "prompt_tokens": summarized["prompt_tokens"],
+        "completion_tokens": summarized["completion_tokens"],
+        "total_tokens": summarized["total_tokens"],
+        "token_usage_complete": summarized["token_usage_complete"],
+        "proposal_phase": proposal_phase,
+        "triggered_by_attempt": triggered_by_attempt,
+    }
+    return usage, calls
+
+
+def build_global_agent_round_usage(
+    *,
+    attempt: int,
+    zone_usage: list[dict[str, Any]],
+    batch_elapsed_seconds: float,
+    proposal_phase: str,
+    triggered_by_attempt: int | None,
+) -> dict[str, Any]:
+    invoked = [item for item in zone_usage if item.get("agent_invoked")]
+    return {
+        "attempt": attempt,
+        "proposal_phase": proposal_phase,
+        "triggered_by_attempt": triggered_by_attempt,
+        "agent_invoked": bool(invoked),
+        "agent_invoked_zone_count": len(invoked),
+        "agent_call_count": sum(
+            usage_integer(item.get("agent_call_count")) for item in zone_usage
+        ),
+        "agent_batch_wall_time_seconds": round(
+            max(float(batch_elapsed_seconds or 0.0), 0.0),
+            4,
+        ),
+        "agent_elapsed_seconds": round(
+            sum(optional_number(item.get("agent_elapsed_seconds")) or 0.0 for item in zone_usage),
+            4,
+        ),
+        "prompt_tokens": sum(
+            usage_integer(item.get("prompt_tokens")) for item in zone_usage
+        ),
+        "completion_tokens": sum(
+            usage_integer(item.get("completion_tokens")) for item in zone_usage
+        ),
+        "total_tokens": sum(
+            usage_integer(item.get("total_tokens")) for item in zone_usage
+        ),
+        "token_usage_complete": all(
+            bool(item.get("token_usage_complete")) for item in zone_usage
+        ),
+        "invoked_zone_ids": [item.get("zone_id") for item in invoked],
+    }
+
+
+def cumulative_zone_agent_usage(
+    attempts: list[dict[str, Any]],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    usage_rows = [
+        attempt.get("agent_usage")
+        for attempt in attempts
+        if isinstance(attempt, dict) and isinstance(attempt.get("agent_usage"), dict)
+    ]
+    calls = [
+        copy.deepcopy(call)
+        for attempt in attempts
+        if isinstance(attempt, dict)
+        for call in (attempt.get("agent_call_usage") or [])
+        if isinstance(call, dict)
+    ]
+    summary = summarize_agent_call_usage(calls)
+    return (
+        {
+            "agent_attempt_count": len(attempts),
+            "agent_invoked_attempt_count": sum(
+                bool(item.get("agent_invoked")) for item in usage_rows
+            ),
+            "agent_invoked": summary["agent_invoked"],
+            "agent_call_count": summary["agent_call_count"],
+            "agent_elapsed_seconds": summary["elapsed_seconds"],
+            "prompt_tokens": summary["prompt_tokens"],
+            "completion_tokens": summary["completion_tokens"],
+            "total_tokens": summary["total_tokens"],
+            "token_usage_complete": all(
+                bool(item.get("token_usage_complete")) for item in usage_rows
+            ),
+        },
+        calls,
+    )
+
+
+def cumulative_global_agent_usage(
+    rounds: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "agent_round_count": len(rounds),
+        "agent_invoked_round_count": sum(
+            bool(item.get("agent_invoked")) for item in rounds
+        ),
+        "agent_invoked": any(bool(item.get("agent_invoked")) for item in rounds),
+        "agent_invoked_zone_count": sum(
+            usage_integer(item.get("agent_invoked_zone_count")) for item in rounds
+        ),
+        "agent_call_count": sum(
+            usage_integer(item.get("agent_call_count")) for item in rounds
+        ),
+        "agent_batch_wall_time_seconds": round(
+            sum(
+                optional_number(item.get("agent_batch_wall_time_seconds")) or 0.0
+                for item in rounds
+            ),
+            4,
+        ),
+        "agent_elapsed_seconds": round(
+            sum(
+                optional_number(item.get("agent_elapsed_seconds")) or 0.0
+                for item in rounds
+            ),
+            4,
+        ),
+        "prompt_tokens": sum(
+            usage_integer(item.get("prompt_tokens")) for item in rounds
+        ),
+        "completion_tokens": sum(
+            usage_integer(item.get("completion_tokens")) for item in rounds
+        ),
+        "total_tokens": sum(
+            usage_integer(item.get("total_tokens")) for item in rounds
+        ),
+        "token_usage_complete": all(
+            bool(item.get("token_usage_complete")) for item in rounds
+        ),
+    }
+
+
+def retry_proposal_phase(agent_mode: str) -> str:
+    return {
+        "multi_agent_economist_retry": "economist_retry",
+        "multi_agent_full_retry": "full_multi_agent_retry",
+        "single_agent_price_retry": "single_agent_price_retry",
+        "single_agent_full_retry": "single_agent_full_retry",
+    }.get(agent_mode, "price_retry")
+
+
+def numeric_difference(current: float | None, previous: float | None) -> float | None:
+    if current is None or previous is None:
+        return None
+    return round(current - previous, 4)
+
+
+def numeric_value_changed(previous: float | None, current: float | None) -> bool:
+    if previous is None or current is None:
+        return previous is not None or current is not None
+    return not math.isclose(previous, current, rel_tol=0.0, abs_tol=1e-9)
+
+
+def usage_integer(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def build_retry_context(
+    original_context: dict[str, Any],
+    report: dict[str, Any],
+    *,
+    attempt: int,
+    replace_forecast: bool,
+) -> dict[str, Any]:
+    context = copy.deepcopy(original_context)
+    report_windows = {
+        window_key(window): window
+        for window in report.get("price_change_windows_3h") or []
+    }
+    feedback: list[dict[str, Any]] = []
+    updated_windows: list[dict[str, Any]] = []
+    for original in context.get("pricing_windows_3h") or []:
+        latest = report_windows.get(window_key(original), {})
+        item = dict(original)
+        if replace_forecast and latest.get("price_conditioned_baseline_load_kwh") is not None:
+            item["sum_predicted_kwh"] = latest.get("price_conditioned_baseline_load_kwh")
+            item["mean_predicted_kwh"] = latest.get("price_conditioned_mean_predicted_kwh")
+            item["peak_predicted_kwh"] = latest.get("price_conditioned_peak_predicted_kwh")
+            item["load_range_position_pct"] = latest.get(
+                "price_conditioned_load_range_position_pct"
+            )
+            item["load_stress_level"] = latest.get("price_conditioned_load_stress_level")
+            item["grid_stress_level"] = latest.get("price_conditioned_load_stress_level")
+            item["stress_load_3h_kwh"] = latest.get("price_conditioned_baseline_load_kwh")
+        updated_windows.append(item)
+        if latest and not latest.get("control_success"):
+            feedback.append(
+                {
+                    "attempt": attempt,
+                    "window_start": latest.get("window_start"),
+                    "window_end": latest.get("window_end"),
+                    "previous_price_shift_pct": latest.get("suggested_price_shift_pct"),
+                    "previous_energy_price": latest.get("proposed_energy_price"),
+                    "reforecast_load_kwh": latest.get("price_conditioned_baseline_load_kwh"),
+                    "load_range_position_pct": latest.get(
+                        "price_conditioned_load_range_position_pct"
+                    ),
+                    "load_stress_level": latest.get("price_conditioned_load_stress_level"),
+                    "failure_reason": latest.get("control_failure_reason"),
+                }
+            )
+    context["pricing_windows_3h"] = updated_windows
+    context["retry_feedback"] = feedback
+    if replace_forecast:
+        loads = [optional_number(item.get("sum_predicted_kwh")) for item in updated_windows]
+        valid_loads = [value for value in loads if value is not None]
+        context["forecast_total_kwh"] = round(sum(valid_loads), 4)
+        context["forecast_peak_kwh"] = round(
+            max(
+                (
+                    optional_number(item.get("peak_predicted_kwh")) or 0.0
+                    for item in updated_windows
+                ),
+                default=0.0,
+            ),
+            4,
+        )
+        context["grid_stress_level"] = max_stress_level(
+            [item.get("load_stress_level") for item in updated_windows]
+        )
+    return context
+
+
+def merge_failed_window_revision(
+    previous: dict[str, Any],
+    revision: dict[str, Any],
+    failed_keys: set[tuple[str, str]],
+) -> dict[str, Any]:
+    revised_by_key = {
+        window_key(window): window
+        for window in revision.get("price_change_windows_3h") or []
+    }
+    windows: list[dict[str, Any]] = []
+    for old in previous.get("price_change_windows_3h") or []:
+        key = window_key(old)
+        if key not in failed_keys or key not in revised_by_key:
+            windows.append(dict(old))
+            continue
+        new = revised_by_key[key]
+        merged = dict(old)
+        for field in (
+            "suggested_price_shift_pct",
+            "proposed_energy_price",
+            "predicted_energy_price",
+            "price_valid",
+            "price_validation_error",
+            "action_label",
+            "price_rationale",
+        ):
+            if field in new:
+                merged[field] = new.get(field)
+        windows.append(merged)
+    updated = dict(previous)
+    for field in (
+        "grid_reasoning_summary",
+        "behavior_reasoning_summary",
+        "economist_reasoning_summary",
+        "agent_reasoning",
+        "action_label",
+        "price_rationale",
+        "grid_output",
+        "behavior_output",
+        "economist_output",
+        "source",
+    ):
+        if field in revision:
+            updated[field] = revision[field]
+    updated["price_change_windows_3h"] = windows
+    updated["suggested_price_shift_pct"] = round(
+        sum(optional_number(item.get("suggested_price_shift_pct")) or 0.0 for item in windows)
+        / len(windows),
+        4,
+    ) if windows else 0.0
+    return updated
+
+
+def window_key(window: dict[str, Any]) -> tuple[str, str]:
+    return str(window.get("window_start")), str(window.get("window_end"))
 
 
 def energy_price_with_predicted_windows(
@@ -1674,10 +2630,15 @@ def energy_price_with_predicted_windows(
 
 
 def predicted_energy_price(window: dict[str, Any]) -> float | None:
+    proposed = optional_number(
+        window.get("proposed_energy_price")
+        if window.get("proposed_energy_price") is not None
+        else window.get("predicted_energy_price")
+    )
+    if proposed is not None:
+        return round(proposed, 4) if proposed >= 0 else None
     base_price = optional_number(window.get("mean_energy_price"))
     shift_pct = optional_number(window.get("suggested_price_shift_pct"))
-    if shift_pct is None:
-        shift_pct = optional_number(window.get("pre_nash_suggested_price_shift_pct"))
     if base_price is None or shift_pct is None:
         return None
     return round(base_price * (1 + shift_pct / 100), 4)
@@ -1688,6 +2649,7 @@ def attach_price_conditioned_baselines(
     conditioned_windows: list[dict[str, Any]],
     *,
     forecast_model: str,
+    forecast_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     conditioned_by_window = {
         (str(window.get("window_start")), str(window.get("window_end"))): window
@@ -1707,14 +2669,20 @@ def attach_price_conditioned_baselines(
             updated["price_conditioned_mean_predicted_kwh"] = conditioned.get("mean_predicted_kwh")
             updated["price_conditioned_peak_predicted_kwh"] = conditioned.get("peak_predicted_kwh")
             updated["price_conditioned_load_stress_level"] = conditioned.get("load_stress_level")
+            updated["price_conditioned_load_range_position_pct"] = conditioned.get(
+                "load_range_position_pct"
+            )
             updated["price_conditioned_energy_price"] = conditioned.get("mean_energy_price")
             updated["price_conditioned_baseline_source"] = (
-                f"{forecast_model}_forecast_with_predicted_energy_price_and_observed_conditions"
+                f"{forecast_model}_native_backend_reforecast_with_proposed_energy_price"
             )
         updated_windows.append(updated)
 
     updated_report = dict(report)
     updated_report["price_change_windows_3h"] = updated_windows
+    updated_report["price_conditioned_forecast_metadata"] = dict(
+        forecast_metadata or {}
+    )
     return updated_report
 
 
@@ -1837,15 +2805,23 @@ def build_contexts(
                 zone_id=zone_id,
                 original=exc,
             ) from exc
-        pricing_windows_3h = build_pricing_windows_3h(raw_result.hourly, stress_thresholds=zone_stress_thresholds)
+        pricing_windows_3h = build_pricing_windows_3h(
+            raw_result.hourly,
+            stress_thresholds=zone_stress_thresholds,
+            include_evaluation=False,
+        )
         summary = apply_load_policy_stress(raw_result.summary, zone_stress_thresholds, pricing_windows_3h)
-        result = ForecastResult(hourly=raw_result.hourly, summary=summary)
+        result = ForecastResult(
+            hourly=raw_result.hourly,
+            summary=summary,
+            reusable_forecaster=raw_result.reusable_forecaster,
+        )
         forecast_results[zone_id] = result
         hourly_forecast = build_agent_hourly_data(result.hourly)
         hourly_averages = build_hourly_averages(result.hourly)
         horizon_text = format_horizon_days(summary.get("forecast_horizon_days", horizon_days))
         context = {
-            **summary,
+            **decision_summary(summary),
             "selection_reason": row["selection_reason"],
             "hourly_averages": hourly_averages,
             "hourly_forecast": hourly_forecast,
@@ -1868,11 +2844,7 @@ def load_stress_thresholds(
 ) -> dict[str, Any]:
     profile = profile or {}
     zone_mean_energy_price = safe_float(profile.get("mean_energy_price"))
-    price_fields = {
-        "zone_mean_energy_price": zone_mean_energy_price,
-        "min_allowed_energy_price": round(zone_mean_energy_price * 0.4, 4),
-        "max_allowed_energy_price": round(zone_mean_energy_price * 2.0, 4),
-    }
+    price_fields = {"zone_mean_energy_price": zone_mean_energy_price}
     if zone_id not in thresholds_by_zone.index:
         return {
             "available": False,
@@ -1983,50 +2955,7 @@ def apply_load_policy_stress(
         "high_extremely_high_threshold_kwh", 0.0
     )
     updated["zone_mean_energy_price"] = thresholds.get("zone_mean_energy_price", 0.0)
-    updated["min_allowed_energy_price"] = thresholds.get("min_allowed_energy_price", 0.0)
-    updated["max_allowed_energy_price"] = thresholds.get("max_allowed_energy_price", 0.0)
-    updated.update(stress_evaluation_metrics(pricing_windows_3h))
     return updated
-
-
-def stress_evaluation_metrics(pricing_windows_3h: list[dict[str, Any]]) -> dict[str, Any]:
-    evaluated_windows = []
-    for window in pricing_windows_3h:
-        predicted_rank = stress_rank(window.get("load_stress_level") or window.get("grid_stress_level"))
-        actual_rank = stress_rank(window.get("actual_load_stress_level") or window.get("actual_grid_stress_level"))
-        if predicted_rank is None or actual_rank is None:
-            continue
-        evaluated_windows.append((window, predicted_rank, actual_rank))
-
-    if not evaluated_windows:
-        return {
-            "actual_grid_stress_level": None,
-            "actual_grid_stress_load_kwh": None,
-            "stress_accuracy": None,
-            "miss_stress_rate": None,
-            "stress_eval_windows": 0,
-            "stress_miss_count": None,
-        }
-
-    correct_count = sum(1 for _, predicted_rank, actual_rank in evaluated_windows if predicted_rank == actual_rank)
-    miss_count = sum(1 for _, predicted_rank, actual_rank in evaluated_windows if actual_rank > predicted_rank)
-    actual_levels = [
-        window.get("actual_load_stress_level") or window.get("actual_grid_stress_level")
-        for window, _, _ in evaluated_windows
-    ]
-    actual_loads = [
-        safe_float(window.get("actual_stress_load_3h_kwh") or window.get("sum_actual_kwh"))
-        for window, _, _ in evaluated_windows
-    ]
-    total = len(evaluated_windows)
-    return {
-        "actual_grid_stress_level": max_stress_level(actual_levels),
-        "actual_grid_stress_load_kwh": max(actual_loads) if actual_loads else None,
-        "stress_accuracy": round(correct_count / total, 4),
-        "miss_stress_rate": round(miss_count / total, 4),
-        "stress_eval_windows": total,
-        "stress_miss_count": miss_count,
-    }
 
 
 def build_agent_hourly_data(hourly: pd.DataFrame) -> list[dict[str, Any]]:
@@ -2036,9 +2965,6 @@ def build_agent_hourly_data(hourly: pd.DataFrame) -> list[dict[str, Any]]:
         "q10_kwh",
         "q50_kwh",
         "q90_kwh",
-        "actual_kwh",
-        "error_kwh",
-        "abs_pct_error",
         "s_price",
         "e_price",
         "occupancy",
@@ -2057,14 +2983,12 @@ def build_agent_hourly_data(hourly: pd.DataFrame) -> list[dict[str, Any]]:
 def build_hourly_averages(hourly: pd.DataFrame) -> dict[str, Any]:
     columns = {
         "predicted_kwh": "mean_predicted_kwh",
-        "actual_kwh": "mean_actual_kwh",
         "s_price": "mean_service_price",
         "e_price": "mean_energy_price",
         "occupancy": "mean_occupancy",
         "T": "mean_temp_c",
         "U": "mean_humidity",
         "nRAIN": "mean_rain",
-        "abs_pct_error": "mean_abs_pct_error",
     }
     averages: dict[str, Any] = {}
     for source_col, output_col in columns.items():
@@ -2082,6 +3006,7 @@ def build_pricing_windows_3h(
     hourly: pd.DataFrame,
     *,
     stress_thresholds: dict[str, Any] | None = None,
+    include_evaluation: bool = False,
 ) -> list[dict[str, Any]]:
     frame = hourly.copy()
     frame["time"] = pd.to_datetime(frame["time"])
@@ -2098,8 +3023,13 @@ def build_pricing_windows_3h(
         }
         aggregations = {
             "predicted_kwh": ("mean_predicted_kwh", "sum_predicted_kwh", "peak_predicted_kwh"),
-            "actual_kwh": ("mean_actual_kwh", "sum_actual_kwh", "peak_actual_kwh"),
         }
+        if include_evaluation:
+            aggregations["actual_kwh"] = (
+                "mean_actual_kwh",
+                "sum_actual_kwh",
+                "peak_actual_kwh",
+            )
         for source_col, (mean_col, sum_col, max_col) in aggregations.items():
             if source_col in chunk:
                 values = pd.to_numeric(chunk[source_col], errors="coerce")
@@ -2112,7 +3042,6 @@ def build_pricing_windows_3h(
             "occupancy": "mean_occupancy",
             "T": "mean_temp_c",
             "U": "mean_humidity",
-            "abs_pct_error": "mean_abs_pct_error",
         }
         for source_col, output_col in mean_columns.items():
             if source_col in chunk:
@@ -2122,7 +3051,7 @@ def build_pricing_windows_3h(
         if stress_thresholds is not None:
             stress_load = window.get("sum_predicted_kwh")
             stress_level = classify_load_stress(stress_load, stress_thresholds)
-            actual_stress_load = window.get("sum_actual_kwh")
+            actual_stress_load = window.get("sum_actual_kwh") if include_evaluation else None
             actual_stress_level = (
                 classify_load_stress(actual_stress_load, stress_thresholds)
                 if actual_stress_load is not None
@@ -2191,16 +3120,18 @@ def build_pricing_windows_3h(
                 "zone_mean_energy_price",
                 0.0,
             )
-            window["min_allowed_energy_price"] = stress_thresholds.get(
-                "min_allowed_energy_price",
-                0.0,
-            )
-            window["max_allowed_energy_price"] = stress_thresholds.get(
-                "max_allowed_energy_price",
-                0.0,
-            )
         windows.append(window)
     return windows
+
+
+def decision_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    """Return the allowlisted forecast information that may reach an agent."""
+
+    return {
+        key: value
+        for key, value in summary.items()
+        if key in DECISION_SUMMARY_KEYS
+    }
 
 
 def clean_context_value(value: Any, ndigits: int = 4) -> Any:

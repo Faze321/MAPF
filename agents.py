@@ -23,8 +23,9 @@ from prompts import (
     behavior_prompt,
     economist_prompt,
     grid_prompt,
+    price_retry_prompt,
     repair_economist_prompt,
-    single_model_prompt,
+    single_agent_prompt,
 )
 
 
@@ -32,13 +33,8 @@ GRID_STRESS_LEVELS = (LOW_STRESS, MEDIUM_STRESS, HIGH_STRESS, EXTREMELY_HIGH_STR
 MODEL_RESPONSE_FAILED = "MODEL_RESPONSE_FAILED"
 ECONOMIST_AGENT_OUTPUT_KEY = "_economist_agent_output"
 AGENT_COMPLETION_USAGE_KEY = "_agent_completion_usage"
-NASH_MAX_ITERATIONS = 6
-NASH_PRICE_STABILITY_EPSILON_PCT = 0.5
-NASH_MAX_DISCOMFORT_SCORE = 1.0
-NASH_MAX_ABS_PRICE_SHIFT_PCT = 25.0
-NASH_MEDIUM_MAX_PRICE_SHIFT_PCT = 3.0
-NASH_MIN_ELASTICITY = 0.05
-NASH_MAX_ELASTICITY = 0.7
+MIN_ELASTICITY = 0.05
+MAX_ELASTICITY = 0.7
 GRID_STRESS_LEVEL_BY_KEY = {level.lower(): level for level in GRID_STRESS_LEVELS}
 GRID_STRESS_LEVEL_BY_KEY.update(
     {
@@ -138,13 +134,40 @@ class AgentChatClient:
         extra_body = reasoning_extra_body(self.config)
         if extra_body is not None:
             request["extra_body"] = extra_body
-        response = await self._create_completion_with_retry(request)
+        response, provider_attempt_count = await self._create_completion_with_retry(request)
         content = completion_message_content(response, requested_model=self.config.model)
         payload = extract_json_object(content)
-        payload[AGENT_COMPLETION_USAGE_KEY] = response_token_usage(response)
+        token_usage = response_token_usage(response)
+        token_usage["provider_attempt_count"] = provider_attempt_count
+        token_usage["token_usage_complete"] = (
+            provider_attempt_count == 1
+            and all(
+                token_usage.get(field) is not None
+                for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+            )
+        )
+        payload[AGENT_COMPLETION_USAGE_KEY] = token_usage
         return payload
 
-    async def _create_completion_with_retry(self, request: dict[str, Any]) -> Any:
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client on the event loop that used it."""
+
+        client = getattr(self, "_client", None)
+        if client is None or getattr(self, "_closed", False):
+            return
+        self._closed = True
+        await client.close()
+
+    async def __aenter__(self) -> "AgentChatClient":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        await self.aclose()
+
+    async def _create_completion_with_retry(
+        self,
+        request: dict[str, Any],
+    ) -> tuple[Any, int]:
         retry_count = self.config.provider_json_retries
         semaphore = getattr(self, "_request_semaphore", None)
         if semaphore is None:
@@ -154,7 +177,8 @@ class AgentChatClient:
         for attempt_index in range(retry_count + 1):
             try:
                 async with semaphore:
-                    return await self._client.chat.completions.create(**request)
+                    response = await self._client.chat.completions.create(**request)
+                    return response, attempt_index + 1
             except json.JSONDecodeError as exc:
                 if attempt_index >= retry_count:
                     raise ProviderResponseDecodeError(
@@ -238,18 +262,16 @@ async def run_zone_chain(
     client: ChatClient | None,
     temperature: float = 0.2,
     heuristic_source: str = "dry-run",
-    chain_mode: str = "agents",
-    apply_nash: bool = True,
+    chain_mode: str = "multi_agent",
 ) -> dict[str, Any]:
     if client is None:
-        return heuristic_zone_chain(context, source=heuristic_source, apply_nash=apply_nash)
+        return heuristic_zone_chain(context, source=heuristic_source)
 
-    if chain_mode == "single_model":
-        return await run_single_model_zone_chain(
+    if chain_mode == "single_agent":
+        return await run_single_agent_zone_chain(
             context,
             client=client,
             temperature=temperature,
-            apply_nash=apply_nash,
         )
 
     grid_result = await complete_agent_json(
@@ -294,33 +316,60 @@ async def run_zone_chain(
         grid,
         behavior,
         economist,
-        source="model" if apply_nash else "model_no_nash",
+        source="multi_agent",
         economist_debug=economist_debug,
         agent_call_usage=agent_call_usage,
-        apply_nash=apply_nash,
     )
 
 
-async def run_single_model_zone_chain(
+async def run_single_agent_zone_chain(
     context: dict[str, Any],
     *,
     client: ChatClient,
     temperature: float,
-    apply_nash: bool,
 ) -> dict[str, Any]:
     result = await complete_agent_json(
         client,
-        single_model_prompt(context),
+        single_agent_prompt(context),
         context=context,
         temperature=temperature,
-        stage="agent.single_model",
-        agent="Single Model Analyst",
+        stage="agent.single_agent",
+        agent="Single Pricing Agent",
     )
     response = result.content
     grid = merge_grid_fallback(response, context)
     behavior = merge_behavior_fallback(response, context)
-    economist = merge_economist_fallback(response, context)
     validation_errors = validate_economist_report(response, context.get("pricing_windows_3h", []))
+    usage = [result.usage]
+    selected = response
+    repair_response = None
+    repair_errors = None
+    if validation_errors:
+        repaired = await complete_agent_json(
+            client,
+            repair_economist_prompt(
+                context,
+                grid,
+                behavior,
+                response,
+                validation_errors,
+            ),
+            context=context,
+            temperature=min(temperature, 0.1),
+            stage="agent.single_agent.schema_repair",
+            agent="Single Pricing Agent Schema Repair",
+        )
+        usage.append(repaired.usage)
+        repair_response = repaired.content
+        repair_errors = validate_economist_report(
+            repair_response,
+            context.get("pricing_windows_3h", []),
+        )
+        if not repair_errors:
+            selected = repair_response
+            grid = merge_grid_fallback(selected, context)
+            behavior = merge_behavior_fallback(selected, context)
+    economist = merge_economist_fallback(selected, context)
     debug = {
         "zone_id": context.get("zone_id"),
         "category": context.get("category"),
@@ -329,21 +378,22 @@ async def run_single_model_zone_chain(
         "expected_price_window_count": len(context.get("pricing_windows_3h", []))
         if isinstance(context.get("pricing_windows_3h"), list)
         else 0,
-        "single_model_response": response,
-        "single_model_validation_errors": validation_errors,
-        "selected_response_source": "single_model",
-        "agent_call_usage": [result.usage],
-        "agent_usage_summary": summarize_agent_call_usage([result.usage]),
+        "single_agent_response": response,
+        "single_agent_validation_errors": validation_errors,
+        "repair_response": repair_response,
+        "repair_validation_errors": repair_errors,
+        "selected_response_source": "repair" if selected is repair_response else "single_agent",
+        "agent_call_usage": usage,
+        "agent_usage_summary": summarize_agent_call_usage(usage),
     }
     return combine_reports(
         context,
         grid,
         behavior,
         economist,
-        source="single_model" if apply_nash else "single_model_no_nash",
+        source="single_agent",
         economist_debug=debug,
-        agent_call_usage=[result.usage],
-        apply_nash=apply_nash,
+        agent_call_usage=usage,
     )
 
 
@@ -353,8 +403,7 @@ async def run_all_zone_chains(
     client: ChatClient | None,
     temperature: float = 0.2,
     heuristic_source: str = "dry-run",
-    chain_mode: str = "agents",
-    apply_nash: bool = True,
+    chain_mode: str = "multi_agent",
 ) -> list[dict[str, Any]]:
     tasks = [
         run_zone_chain(
@@ -363,11 +412,107 @@ async def run_all_zone_chains(
             temperature=temperature,
             heuristic_source=heuristic_source,
             chain_mode=chain_mode,
-            apply_nash=apply_nash,
         )
         for context in contexts
     ]
     return await asyncio.gather(*tasks)
+
+
+async def retry_zone_prices(
+    context: dict[str, Any],
+    previous_report: dict[str, Any],
+    *,
+    client: ChatClient | None,
+    temperature: float = 0.2,
+    single_agent: bool = False,
+    heuristic_source: str = "dry-run",
+) -> dict[str, Any]:
+    """Revise only the price decision while preserving prior analysis outputs."""
+
+    grid = previous_report.get("grid_output")
+    if not isinstance(grid, dict):
+        grid = heuristic_grid(context)
+    behavior = previous_report.get("behavior_output")
+    if not isinstance(behavior, dict):
+        behavior = heuristic_behavior(context)
+
+    if client is None:
+        economist = heuristic_economist(context, grid)
+        return combine_reports(
+            context,
+            grid,
+            behavior,
+            economist,
+            source=f"{heuristic_source}_price_retry",
+        )
+
+    stage = "agent.single_agent_price_retry" if single_agent else "agent.economist_retry"
+    agent_name = "Single Pricing Agent Retry" if single_agent else "Market Economist Retry"
+    result = await complete_agent_json(
+        client,
+        price_retry_prompt(
+            context,
+            grid,
+            behavior,
+            previous_report.get("economist_output") or previous_report,
+            single_agent=single_agent,
+        ),
+        context=context,
+        temperature=temperature,
+        stage=stage,
+        agent=agent_name,
+    )
+    selected = result.content
+    usage = [result.usage]
+    validation_errors = validate_economist_report(
+        selected,
+        context.get("pricing_windows_3h", []),
+    )
+    repair_response = None
+    repair_errors = None
+    if validation_errors:
+        repaired = await complete_agent_json(
+            client,
+            repair_economist_prompt(
+                context,
+                grid,
+                behavior,
+                selected,
+                validation_errors,
+            ),
+            context=context,
+            temperature=min(temperature, 0.1),
+            stage=f"{stage}.schema_repair",
+            agent=f"{agent_name} Schema Repair",
+        )
+        usage.append(repaired.usage)
+        repair_response = repaired.content
+        repair_errors = validate_economist_report(
+            repair_response,
+            context.get("pricing_windows_3h", []),
+        )
+        if not repair_errors:
+            selected = repair_response
+    economist = merge_economist_fallback(selected, context)
+    debug = {
+        "zone_id": context.get("zone_id"),
+        "retry": True,
+        "single_agent": single_agent,
+        "response": result.content,
+        "validation_errors": validation_errors,
+        "repair_response": repair_response,
+        "repair_validation_errors": repair_errors,
+        "agent_call_usage": usage,
+    }
+    return combine_reports(
+        context,
+        grid,
+        behavior,
+        economist,
+        source="single_agent_price_retry" if single_agent else "economist_retry",
+        economist_debug=debug,
+        agent_call_usage=usage,
+    )
 
 
 async def complete_agent_json(
@@ -393,6 +538,7 @@ async def complete_agent_json(
         ) from exc
     elapsed = round(time.perf_counter() - started, 4)
     token_usage = response.pop(AGENT_COMPLETION_USAGE_KEY, {})
+    response = sanitize_structured_agent_output(response)
     return AgentCallResult(
         content=response,
         usage=agent_call_usage_record(
@@ -403,6 +549,21 @@ async def complete_agent_json(
             token_usage=token_usage,
         ),
     )
+
+
+def sanitize_structured_agent_output(value: Any) -> Any:
+    """Persist decision fields and summaries, never model-supplied hidden reasoning."""
+
+    blocked = {"chain_of_thought", "chain-of-thought", "thoughts", "analysis", "reasoning"}
+    if isinstance(value, dict):
+        return {
+            key: sanitize_structured_agent_output(item)
+            for key, item in value.items()
+            if str(key).strip().lower() not in blocked
+        }
+    if isinstance(value, list):
+        return [sanitize_structured_agent_output(item) for item in value]
+    return value
 
 
 async def complete_validated_economist_report(
@@ -520,24 +681,55 @@ def agent_call_usage_record(
     token_usage: dict[str, Any] | None,
 ) -> dict[str, Any]:
     usage = token_usage if isinstance(token_usage, dict) else {}
+    prompt_tokens = optional_int_usage(usage.get("prompt_tokens"))
+    completion_tokens = optional_int_usage(usage.get("completion_tokens"))
+    total_tokens = optional_int_usage(usage.get("total_tokens"))
+    provider_attempt_count = optional_int_usage(usage.get("provider_attempt_count")) or 1
+    explicit_complete = usage.get("token_usage_complete")
+    token_usage_complete = (
+        bool(explicit_complete)
+        if explicit_complete is not None
+        else all(
+            value is not None
+            for value in (prompt_tokens, completion_tokens, total_tokens)
+        )
+    )
     return {
         "stage": stage,
         "agent": agent,
         "zone_id": zone_id,
         "elapsed_seconds": elapsed_seconds,
-        "prompt_tokens": optional_int_usage(usage.get("prompt_tokens")),
-        "completion_tokens": optional_int_usage(usage.get("completion_tokens")),
-        "total_tokens": optional_int_usage(usage.get("total_tokens")),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "token_usage_complete": token_usage_complete,
+        "provider_attempt_count": provider_attempt_count,
     }
 
 
 def summarize_agent_call_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
+        "agent_invoked": bool(records),
+        "agent_call_count": len(records),
         "elapsed_seconds": round(sum(optional_float_usage(record.get("elapsed_seconds")) for record in records), 4),
         "prompt_tokens": sum_token_usage(records, "prompt_tokens"),
         "completion_tokens": sum_token_usage(records, "completion_tokens"),
         "total_tokens": sum_token_usage(records, "total_tokens"),
+        "token_usage_complete": all(
+            call_token_usage_complete(record)
+            for record in records
+        ),
     }
+
+
+def call_token_usage_complete(record: dict[str, Any]) -> bool:
+    explicit = record.get("token_usage_complete")
+    if explicit is not None:
+        return bool(explicit)
+    return all(
+        optional_int_usage(record.get(field)) is not None
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+    )
 
 
 def sum_token_usage(records: list[dict[str, Any]], field: str) -> int:
@@ -567,15 +759,15 @@ def heuristic_zone_chain(
     context: dict[str, Any],
     *,
     source: str = "dry-run",
-    apply_nash: bool = True,
 ) -> dict[str, Any]:
     grid = heuristic_grid(context)
     behavior = heuristic_behavior(context)
     economist = heuristic_economist(context, grid)
-    return combine_reports(context, grid, behavior, economist, source=source, apply_nash=apply_nash)
+    return combine_reports(context, grid, behavior, economist, source=source)
 
 
 def heuristic_grid(context: dict[str, Any]) -> dict[str, Any]:
+    windows = context.get("pricing_windows_3h") or []
     return {
         "forecast_total_kwh": context["forecast_total_kwh"],
         "forecast_peak_kwh": context["forecast_peak_kwh"],
@@ -586,6 +778,28 @@ def heuristic_grid(context: dict[str, Any]) -> dict[str, Any]:
             f"shape with a {context['predicted_change_pct']:+.1f}% change versus the "
             "recent comparable window."
         ),
+        "reasoning_summary": (
+            "The forecaster is the numerical source of truth; pricing is required "
+            "for each window outside the Medium band."
+        ),
+        "adjustment_needed": any(
+            normalize_grid_stress_level(window.get("load_stress_level"), LOW_STRESS)
+            != MEDIUM_STRESS
+            for window in windows
+        ),
+        "confidence": "medium",
+        "window_assessments": [
+            {
+                "window_start": window.get("window_start"),
+                "window_end": window.get("window_end"),
+                "predicted_load_kwh": window.get("sum_predicted_kwh"),
+                "load_range_position_pct": window.get("load_range_position_pct"),
+                "grid_stress_level": window.get("load_stress_level"),
+                "adjustment_needed": window.get("load_stress_level") != MEDIUM_STRESS,
+                "reasoning_summary": "Assessment uses the forecast-derived load position.",
+            }
+            for window in windows
+        ],
     }
 
 
@@ -632,9 +846,12 @@ def heuristic_behavior(context: dict[str, Any]) -> dict[str, Any]:
             f"{category} demand is best explained by {', '.join(drivers)} and the "
             f"local POI mix of {poi_total} assigned POIs."
         ),
+        "reasoning_summary": (
+            f"Demand is explained by {', '.join(drivers)} together with the local "
+            "static and temporal context."
+        ),
         "demand_drivers": drivers,
         "elasticity_factor": estimate_elasticity_factor(context, {}, peak_window or {}),
-        "tolerance_threshold_pct": estimate_price_tolerance_pct(context, peak_window or {}),
         "confidence": "medium",
     }
 
@@ -648,6 +865,10 @@ def heuristic_economist(context: dict[str, Any], grid: dict[str, Any]) -> dict[s
     return {
         "suggested_price_shift_pct": shift,
         "action_label": label,
+        "reasoning_summary": (
+            f"The schedule responds to {stress} forecast stress and the estimated "
+            f"price sensitivity of the {category} zone."
+        ),
         "price_rationale": (
             f"{stress} stress with {change:+.1f}% expected load change; "
             f"category elasticity proxy is {category}."
@@ -665,23 +886,12 @@ def combine_reports(
     source: str,
     economist_debug: dict[str, Any] | None = None,
     agent_call_usage: list[dict[str, Any]] | None = None,
-    apply_nash: bool = True,
 ) -> dict[str, Any]:
     price_windows = normalize_price_windows(
         economist.get("price_change_windows_3h"),
         context.get("pricing_windows_3h", []),
     )
-    if apply_nash:
-        price_windows = [
-            solve_nash_equilibrium_window(context, behavior, window)
-            for window in price_windows
-        ]
-    else:
-        price_windows = [
-            mark_nash_equilibrium_skipped(context, behavior, window)
-            for window in price_windows
-        ]
-    nash_summary = summarize_nash_equilibrium(price_windows)
+    price_windows = [finalize_price_window(window) for window in price_windows]
     final_shift = average_price_shift(price_windows, as_float(economist.get("suggested_price_shift_pct"), 0))
     usage_summary = summarize_agent_call_usage(agent_call_usage or [])
     report = {
@@ -690,37 +900,48 @@ def combine_reports(
         "predicted_load_kwh": as_float(grid.get("forecast_total_kwh"), context["forecast_total_kwh"]),
         "predicted_peak_kwh": as_float(grid.get("forecast_peak_kwh"), context["forecast_peak_kwh"]),
         "predicted_change_pct": as_float(grid.get("predicted_change_pct"), context["predicted_change_pct"]),
-        "actual_load_kwh": context.get("actual_total_kwh"),
-        "mae_kwh": context.get("mae_kwh"),
-        "rmse_kwh": context.get("rmse_kwh"),
-        "mape_pct": context.get("mape_pct"),
-        "rae": context.get("rae"),
-        "wape_pct": context.get("wape_pct"),
         "grid_stress_level": normalize_grid_stress_level(
             grid.get("grid_stress_level"),
             context["grid_stress_level"],
         ),
-        "actual_grid_stress_level": context.get("actual_grid_stress_level"),
-        "stress_accuracy": context.get("stress_accuracy"),
-        "miss_stress_rate": context.get("miss_stress_rate"),
-        "stress_eval_windows": context.get("stress_eval_windows"),
-        "stress_miss_count": context.get("stress_miss_count"),
-        "agent_reasoning": str(behavior.get("agent_reasoning") or ""),
+        "agent_reasoning": str(
+            behavior.get("reasoning_summary") or behavior.get("agent_reasoning") or ""
+        ),
+        "grid_reasoning_summary": str(
+            grid.get("reasoning_summary") or grid.get("forecast_summary") or ""
+        ),
+        "behavior_reasoning_summary": str(
+            behavior.get("reasoning_summary") or behavior.get("agent_reasoning") or ""
+        ),
+        "economist_reasoning_summary": str(
+            economist.get("reasoning_summary") or economist.get("price_rationale") or ""
+        ),
         "suggested_price_shift_pct": final_shift,
         "model_action_label": str(economist.get("action_label") or ""),
         "model_price_rationale": str(economist.get("price_rationale") or ""),
-        "action_label": final_price_action_label(final_shift),
-        "price_rationale": summarize_medium_target_schedule(price_windows, final_shift),
+        "action_label": str(
+            economist.get("action_label") or final_price_action_label(final_shift)
+        ),
+        "price_rationale": str(
+            economist.get("reasoning_summary")
+            or economist.get("price_rationale")
+            or summarize_medium_target_schedule(price_windows, final_shift)
+        ),
         "price_change_windows_3h": price_windows,
-        "nash_equilibrium_reached": nash_summary["nash_equilibrium_reached"],
-        "nash_equilibrium_windows": nash_summary["nash_equilibrium_windows"],
-        "nash_equilibrium_reached_windows": nash_summary["nash_equilibrium_reached_windows"],
-        "nash_equilibrium_rounds": nash_summary["nash_equilibrium_rounds"],
-        "nash_equilibrium_summary": nash_summary["nash_equilibrium_summary"],
+        "grid_output": grid,
+        "behavior_output": behavior,
+        "economist_output": {
+            key: value
+            for key, value in economist.items()
+            if key != ECONOMIST_AGENT_OUTPUT_KEY
+        },
         "agent_time_cost_seconds": usage_summary["elapsed_seconds"],
+        "agent_invoked": usage_summary["agent_invoked"],
+        "agent_call_count": usage_summary["agent_call_count"],
         "agent_prompt_tokens": usage_summary["prompt_tokens"],
         "agent_completion_tokens": usage_summary["completion_tokens"],
         "agent_total_tokens": usage_summary["total_tokens"],
+        "agent_token_usage_complete": usage_summary["token_usage_complete"],
         "agent_call_usage": agent_call_usage or [],
         "source": source,
     }
@@ -729,40 +950,22 @@ def combine_reports(
     return report
 
 
-def recompute_report_nash(
-    context: dict[str, Any],
-    report: dict[str, Any],
-    *,
-    apply_nash: bool = True,
-) -> dict[str, Any]:
-    report_windows = report.get("price_change_windows_3h") or []
-    if apply_nash:
-        price_windows = [
-            solve_nash_equilibrium_window(context, {}, window)
-            for window in report_windows
-        ]
-    else:
-        price_windows = [
-            mark_nash_equilibrium_skipped(context, {}, window)
-            for window in report_windows
-        ]
-    nash_summary = summarize_nash_equilibrium(price_windows)
-    updated = dict(report)
-    updated["price_change_windows_3h"] = price_windows
-    updated["suggested_price_shift_pct"] = average_price_shift(
-        price_windows,
-        as_float(report.get("suggested_price_shift_pct"), 0),
+def finalize_price_window(window: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(window)
+    base_price = optional_float(window.get("mean_energy_price"))
+    shift = optional_float(window.get("suggested_price_shift_pct"))
+    proposed = optional_float(window.get("proposed_energy_price"))
+    if proposed is None and base_price is not None and shift is not None:
+        proposed = base_price * (1.0 + shift / 100.0)
+    if shift is None and proposed is not None and base_price not in (None, 0):
+        shift = ((proposed / base_price) - 1.0) * 100.0
+    updated["suggested_price_shift_pct"] = round(float(shift or 0.0), 4)
+    updated["predicted_energy_price"] = round(proposed, 4) if proposed is not None else None
+    updated["proposed_energy_price"] = updated["predicted_energy_price"]
+    updated["price_valid"] = proposed is not None and proposed >= 0
+    updated["price_validation_error"] = (
+        None if updated["price_valid"] else "proposed energy price must be non-negative"
     )
-    updated["action_label"] = final_price_action_label(updated["suggested_price_shift_pct"])
-    updated["price_rationale"] = summarize_medium_target_schedule(
-        price_windows,
-        updated["suggested_price_shift_pct"],
-    )
-    updated["nash_equilibrium_reached"] = nash_summary["nash_equilibrium_reached"]
-    updated["nash_equilibrium_windows"] = nash_summary["nash_equilibrium_windows"]
-    updated["nash_equilibrium_reached_windows"] = nash_summary["nash_equilibrium_reached_windows"]
-    updated["nash_equilibrium_rounds"] = nash_summary["nash_equilibrium_rounds"]
-    updated["nash_equilibrium_summary"] = nash_summary["nash_equilibrium_summary"]
     return updated
 
 
@@ -818,6 +1021,8 @@ def validate_economist_report(report: dict[str, Any], expected_windows: Any) -> 
 
     if not is_number_like(report.get("suggested_price_shift_pct")):
         errors.append("missing or invalid suggested_price_shift_pct")
+    if not has_text(report.get("reasoning_summary")):
+        errors.append("missing reasoning_summary")
     if not has_text(report.get("action_label")):
         errors.append("missing action_label")
     if not has_text(report.get("price_rationale")):
@@ -841,6 +1046,8 @@ def validate_economist_report(report: dict[str, Any], expected_windows: Any) -> 
                 errors.append(f"price_change_windows_3h[{idx}] missing {field}")
         if not is_number_like(item.get("suggested_price_shift_pct")):
             errors.append(f"price_change_windows_3h[{idx}] missing or invalid suggested_price_shift_pct")
+        if not is_number_like(item.get("proposed_energy_price")):
+            errors.append(f"price_change_windows_3h[{idx}] missing or invalid proposed_energy_price")
         for field in ("window_start", "window_end"):
             expected_value = expected_window.get(field) if isinstance(expected_window, dict) else None
             if has_text(expected_value) and has_text(item.get(field)) and str(item.get(field)) != str(expected_value):
@@ -908,22 +1115,14 @@ def build_heuristic_price_windows(
                 "window_end": window.get("window_end"),
                 "sum_predicted_kwh": window.get("sum_predicted_kwh"),
                 "mean_predicted_kwh": window.get("mean_predicted_kwh"),
-                "sum_actual_kwh": window.get("sum_actual_kwh"),
                 "mean_service_price": window.get("mean_service_price"),
                 "mean_energy_price": window.get("mean_energy_price"),
                 "load_stress_level": window.get("load_stress_level") or window.get("grid_stress_level"),
                 "stress_load_3h_kwh": window.get("stress_load_3h_kwh"),
-                "actual_load_stress_level": window.get("actual_load_stress_level") or window.get("actual_grid_stress_level"),
-                "actual_stress_load_3h_kwh": window.get("actual_stress_load_3h_kwh"),
-                "stress_correct": window.get("stress_correct"),
-                "stress_missed": window.get("stress_missed"),
                 "historical_min_load_3h_kwh": window.get("historical_min_load_3h_kwh"),
                 "historical_max_load_3h_kwh": window.get("historical_max_load_3h_kwh"),
                 "historical_load_range_3h_kwh": window.get("historical_load_range_3h_kwh"),
                 "load_range_position_pct": window.get("load_range_position_pct"),
-                "actual_load_range_position_pct": window.get(
-                    "actual_load_range_position_pct"
-                ),
                 "low_medium_threshold_pct": window.get("low_medium_threshold_pct"),
                 "medium_high_threshold_pct": window.get("medium_high_threshold_pct"),
                 "high_extremely_high_threshold_pct": window.get(
@@ -939,18 +1138,14 @@ def build_heuristic_price_windows(
                     "load_3h_high_extremely_high_threshold_kwh"
                 ),
                 "zone_mean_energy_price": window.get("zone_mean_energy_price"),
-                "min_allowed_energy_price": window.get("min_allowed_energy_price"),
-                "max_allowed_energy_price": window.get("max_allowed_energy_price"),
                 "suggested_price_shift_pct": shift,
                 "action_label": label,
                 "price_rationale": (
                     f"{window_stress} 3-hour load at "
                     f"{as_float(window.get('load_range_position_pct'), 0):.2f}% through the "
                     f"historical 3-hour load range; "
-                    f"price shift targets the Medium band and keeps energy price within "
-                    f"the allowed range from "
-                    f"{as_float(window.get('min_allowed_energy_price'), window_energy_price):.4f} "
-                    f"to {as_float(window.get('max_allowed_energy_price'), window_energy_price):.4f}."
+                    f"price shift targets the Medium band while keeping the resulting "
+                    f"energy price non-negative from the {window_energy_price:.4f} baseline."
                 ),
             }
         )
@@ -997,7 +1192,6 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
                 "sum_predicted_kwh": fallback.get("sum_predicted_kwh"),
                 "mean_predicted_kwh": fallback.get("mean_predicted_kwh"),
                 "peak_predicted_kwh": fallback.get("peak_predicted_kwh"),
-                "sum_actual_kwh": fallback.get("sum_actual_kwh"),
                 "mean_service_price": fallback.get("mean_service_price"),
                 "mean_energy_price": fallback.get("mean_energy_price"),
                 "mean_occupancy": fallback.get("mean_occupancy"),
@@ -1006,10 +1200,6 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
                 "total_rain": fallback.get("total_rain"),
                 "load_stress_level": fallback.get("load_stress_level") or fallback.get("grid_stress_level"),
                 "stress_load_3h_kwh": fallback.get("stress_load_3h_kwh"),
-                "actual_load_stress_level": fallback.get("actual_load_stress_level") or fallback.get("actual_grid_stress_level"),
-                "actual_stress_load_3h_kwh": fallback.get("actual_stress_load_3h_kwh"),
-                "stress_correct": fallback.get("stress_correct"),
-                "stress_missed": fallback.get("stress_missed"),
                 "stress_source_file": fallback.get("stress_source_file"),
                 "stress_window_hours": fallback.get("stress_window_hours"),
                 "historical_min_load_3h_kwh": fallback.get("historical_min_load_3h_kwh"),
@@ -1018,9 +1208,6 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
                     "historical_load_range_3h_kwh"
                 ),
                 "load_range_position_pct": fallback.get("load_range_position_pct"),
-                "actual_load_range_position_pct": fallback.get(
-                    "actual_load_range_position_pct"
-                ),
                 "low_medium_threshold_pct": fallback.get("low_medium_threshold_pct"),
                 "medium_high_threshold_pct": fallback.get("medium_high_threshold_pct"),
                 "high_extremely_high_threshold_pct": fallback.get(
@@ -1036,273 +1223,13 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
                     "load_3h_high_extremely_high_threshold_kwh"
                 ),
                 "zone_mean_energy_price": fallback.get("zone_mean_energy_price"),
-                "min_allowed_energy_price": fallback.get("min_allowed_energy_price"),
-                "max_allowed_energy_price": fallback.get("max_allowed_energy_price"),
                 "suggested_price_shift_pct": shift,
+                "proposed_energy_price": item.get("proposed_energy_price"),
                 "action_label": required_model_text(item, "action_label", item_missing),
                 "price_rationale": required_model_text(item, "price_rationale", item_missing),
             }
         )
     return normalized
-
-
-def mark_nash_equilibrium_skipped(
-    context: dict[str, Any],
-    behavior: dict[str, Any],
-    window: dict[str, Any],
-) -> dict[str, Any]:
-    baseline_load = window_predicted_load(window)
-    historical_min_load, historical_max_load, load_range_source = historical_load_bounds_kwh(
-        context, window
-    )
-    elasticity = estimate_elasticity_factor(context, behavior, window)
-    tolerance_pct = estimate_price_tolerance_pct(context, window)
-    raw_shift = as_float(window.get("suggested_price_shift_pct"), 0)
-    policy_shift = price_shift_to_medium_band(context, window, elasticity)
-    expected_load = expected_load_after_price(baseline_load, policy_shift, elasticity)
-    lower_load, upper_load = medium_load_bounds(historical_min_load, historical_max_load)
-    target_load = target_medium_load(
-        baseline_load, historical_min_load, historical_max_load
-    )
-    min_price, max_price, energy_price_bound_source, zone_mean_price = energy_price_bounds(
-        context, window
-    )
-    recommended_price = energy_price_after_shift(window, policy_shift)
-    price_within_bounds = price_is_within_bounds(recommended_price, min_price, max_price)
-    discomfort_score = user_discomfort_score(policy_shift, tolerance_pct)
-    load_in_medium_band = lower_load <= expected_load < upper_load
-    enriched = dict(window)
-    enriched.update(
-        {
-            "model_action_label": window.get("action_label"),
-            "model_price_rationale": window.get("price_rationale"),
-            "action_label": final_price_action_label(policy_shift),
-            "price_rationale": medium_target_price_rationale(
-                baseline_load,
-                historical_min_load,
-                historical_max_load,
-                policy_shift,
-                min_price,
-                max_price,
-            ),
-            "pre_nash_suggested_price_shift_pct": raw_shift,
-            "suggested_price_shift_pct": round(policy_shift, 2),
-            "nash_equilibrium_reached": None,
-            "nash_status": "skipped",
-            "nash_iterations": 0,
-            "nash_iteration_trace": [],
-            "baseline_load_kwh": round(baseline_load, 4),
-            "baseline_load_source": window_predicted_load_source(window),
-            "baseline_load_range_position_pct": round(
-                load_range_position_pct(
-                    baseline_load, historical_min_load, historical_max_load
-                ),
-                4,
-            ),
-            "target_load_kwh": round(target_load, 4),
-            "target_load_range_position_pct": round(
-                load_range_position_pct(target_load, historical_min_load, historical_max_load),
-                4,
-            ),
-            "medium_load_min_kwh": round(lower_load, 4),
-            "medium_load_max_kwh": round(upper_load, 4),
-            "target_peak_reduction_pct": round(target_peak_reduction_pct(baseline_load, upper_load), 4),
-            "elasticity_factor": round(elasticity, 4),
-            "historical_min_load_3h_kwh": round(historical_min_load, 4),
-            "historical_max_load_3h_kwh": round(historical_max_load, 4),
-            "historical_load_range_3h_kwh": round(
-                historical_max_load - historical_min_load, 4
-            ),
-            "load_range_source": load_range_source,
-            "expected_load_kwh": round(expected_load, 4),
-            "expected_load_range_position_pct": round(
-                load_range_position_pct(
-                    expected_load, historical_min_load, historical_max_load
-                ),
-                4,
-            ),
-            "grid_safe": load_in_medium_band,
-            "load_in_medium_band": load_in_medium_band,
-            "zone_mean_energy_price": zone_mean_price,
-            "min_allowed_energy_price": min_price,
-            "max_allowed_energy_price": max_price,
-            "recommended_energy_price": recommended_price,
-            "predicted_energy_price": recommended_price,
-            "energy_price_bound_source": energy_price_bound_source,
-            "price_within_allowed_bounds": price_within_bounds,
-            "user_tolerant": price_within_bounds,
-            "price_stable": None,
-            "discomfort_score": round(discomfort_score, 4),
-            "max_discomfort_score": NASH_MAX_DISCOMFORT_SCORE,
-            "price_stability_epsilon_pct": NASH_PRICE_STABILITY_EPSILON_PCT,
-        }
-    )
-    return enriched
-
-
-def solve_nash_equilibrium_window(
-    context: dict[str, Any],
-    behavior: dict[str, Any],
-    window: dict[str, Any],
-) -> dict[str, Any]:
-    baseline_load = window_predicted_load(window)
-    historical_min_load, historical_max_load, load_range_source = historical_load_bounds_kwh(
-        context, window
-    )
-    elasticity = estimate_elasticity_factor(context, behavior, window)
-    tolerance_pct = estimate_price_tolerance_pct(context, window)
-    previous_shift = 0.0
-    raw_shift = as_float(window.get("suggested_price_shift_pct"), 0)
-    lower_load, upper_load = medium_load_bounds(historical_min_load, historical_max_load)
-    target_load = target_medium_load(
-        baseline_load, historical_min_load, historical_max_load
-    )
-    required_reduction_pct = target_peak_reduction_pct(baseline_load, upper_load)
-    target_shift = price_shift_to_medium_band(context, window, elasticity)
-    min_price, max_price, energy_price_bound_source, zone_mean_price = energy_price_bounds(
-        context, window
-    )
-    trace: list[dict[str, Any]] = []
-    final_state: dict[str, Any] = {}
-
-    for iteration in range(1, NASH_MAX_ITERATIONS + 1):
-        price_shift = round(target_shift, 4)
-        expected_load = expected_load_after_price(baseline_load, price_shift, elasticity)
-        discomfort_score = user_discomfort_score(price_shift, tolerance_pct)
-        recommended_price = energy_price_after_shift(window, price_shift)
-        grid_safe = lower_load <= expected_load < upper_load
-        price_within_bounds = price_is_within_bounds(recommended_price, min_price, max_price)
-        user_tolerant = price_within_bounds
-        price_stable = abs(price_shift - previous_shift) < NASH_PRICE_STABILITY_EPSILON_PCT
-        final_state = {
-            "iteration": iteration,
-            "price_shift_pct": round(price_shift, 4),
-            "expected_load_kwh": round(expected_load, 4),
-            "expected_load_range_position_pct": round(
-                load_range_position_pct(
-                    expected_load, historical_min_load, historical_max_load
-                ),
-                4,
-            ),
-            "grid_safe": grid_safe,
-            "load_in_medium_band": grid_safe,
-            "user_tolerant": user_tolerant,
-            "recommended_energy_price": recommended_price,
-            "price_within_allowed_bounds": price_within_bounds,
-            "price_stable": price_stable,
-            "discomfort_score": round(discomfort_score, 4),
-        }
-        trace.append(final_state)
-        if grid_safe and user_tolerant and price_stable:
-            break
-        previous_shift = price_shift
-
-    reached = bool(
-        final_state.get("grid_safe")
-        and final_state.get("user_tolerant")
-        and final_state.get("price_stable")
-    )
-    enriched = dict(window)
-    final_shift = round(float(final_state.get("price_shift_pct", target_shift)), 2)
-    enriched.update(
-        {
-            "model_action_label": window.get("action_label"),
-            "model_price_rationale": window.get("price_rationale"),
-            "action_label": final_price_action_label(final_shift),
-            "price_rationale": medium_target_price_rationale(
-                baseline_load,
-                historical_min_load,
-                historical_max_load,
-                final_shift,
-                min_price,
-                max_price,
-            ),
-            "pre_nash_suggested_price_shift_pct": raw_shift,
-            "suggested_price_shift_pct": final_shift,
-            "nash_equilibrium_reached": reached,
-            "nash_status": "reached" if reached else "not_reached",
-            "nash_iterations": int(final_state.get("iteration", 0) or 0),
-            "nash_iteration_trace": trace,
-            "baseline_load_kwh": round(baseline_load, 4),
-            "baseline_load_source": window_predicted_load_source(window),
-            "baseline_load_range_position_pct": round(
-                load_range_position_pct(
-                    baseline_load, historical_min_load, historical_max_load
-                ),
-                4,
-            ),
-            "target_load_kwh": round(target_load, 4),
-            "target_load_range_position_pct": round(
-                load_range_position_pct(target_load, historical_min_load, historical_max_load),
-                4,
-            ),
-            "medium_load_min_kwh": round(lower_load, 4),
-            "medium_load_max_kwh": round(upper_load, 4),
-            "target_peak_reduction_pct": round(required_reduction_pct, 4),
-            "elasticity_factor": round(elasticity, 4),
-            "historical_min_load_3h_kwh": round(historical_min_load, 4),
-            "historical_max_load_3h_kwh": round(historical_max_load, 4),
-            "historical_load_range_3h_kwh": round(
-                historical_max_load - historical_min_load, 4
-            ),
-            "load_range_source": load_range_source,
-            "expected_load_kwh": round(float(final_state.get("expected_load_kwh", baseline_load)), 4),
-            "expected_load_range_position_pct": round(
-                float(
-                    final_state.get(
-                        "expected_load_range_position_pct",
-                        load_range_position_pct(
-                            baseline_load, historical_min_load, historical_max_load
-                        ),
-                    )
-                ),
-                4,
-            ),
-            "grid_safe": bool(final_state.get("grid_safe", False)),
-            "load_in_medium_band": bool(final_state.get("load_in_medium_band", False)),
-            "zone_mean_energy_price": zone_mean_price,
-            "min_allowed_energy_price": min_price,
-            "max_allowed_energy_price": max_price,
-            "recommended_energy_price": final_state.get("recommended_energy_price"),
-            "predicted_energy_price": final_state.get("recommended_energy_price"),
-            "energy_price_bound_source": energy_price_bound_source,
-            "price_within_allowed_bounds": bool(
-                final_state.get("price_within_allowed_bounds", False)
-            ),
-            "user_tolerant": bool(final_state.get("user_tolerant", False)),
-            "price_stable": bool(final_state.get("price_stable", False)),
-            "discomfort_score": round(float(final_state.get("discomfort_score", 0)), 4),
-            "max_discomfort_score": NASH_MAX_DISCOMFORT_SCORE,
-            "price_stability_epsilon_pct": NASH_PRICE_STABILITY_EPSILON_PCT,
-        }
-    )
-    return enriched
-
-
-def summarize_nash_equilibrium(windows: list[dict[str, Any]]) -> dict[str, Any]:
-    total = len(windows)
-    if total and all(window.get("nash_status") == "skipped" for window in windows):
-        return {
-            "nash_equilibrium_reached": None,
-            "nash_equilibrium_windows": total,
-            "nash_equilibrium_reached_windows": 0,
-            "nash_equilibrium_rounds": 0,
-            "nash_equilibrium_summary": f"Nash equilibrium skipped for {total} pricing windows",
-        }
-    reached = sum(1 for window in windows if window.get("nash_equilibrium_reached") is True)
-    rounds = max((int(window.get("nash_iterations") or 0) for window in windows), default=0)
-    all_reached = total > 0 and reached == total
-    return {
-        "nash_equilibrium_reached": all_reached,
-        "nash_equilibrium_windows": total,
-        "nash_equilibrium_reached_windows": reached,
-        "nash_equilibrium_rounds": rounds,
-        "nash_equilibrium_summary": (
-            f"Nash equilibrium reached for {reached}/{total} pricing windows"
-            if total
-            else "No pricing windows available for Nash equilibrium evaluation"
-        ),
-    }
 
 
 def average_price_shift(windows: list[dict[str, Any]], fallback: float) -> float:
@@ -1319,12 +1246,12 @@ def summarize_medium_target_schedule(
     return (
         f"Final {len(windows)}-window energy-price schedule applies an average "
         f"{average_shift_pct:+.2f}% change to move or keep load in the 35%-80% Medium "
-        f"band, with each price constrained to 0.4-2.0 times its zone mean energy price."
+        f"band while keeping every proposed energy price non-negative."
     )
 
 
 def window_predicted_load(window: dict[str, Any]) -> float:
-    for key in ("price_conditioned_baseline_load_kwh", "nash_baseline_load_kwh", "sum_predicted_kwh"):
+    for key in ("price_conditioned_baseline_load_kwh", "sum_predicted_kwh"):
         load = optional_float(window.get(key))
         if load is not None:
             return max(0.0, load)
@@ -1336,7 +1263,6 @@ def window_predicted_load(window: dict[str, Any]) -> float:
 def window_predicted_load_source(window: dict[str, Any]) -> str:
     for key, source in (
         ("price_conditioned_baseline_load_kwh", "price_conditioned_forecast_sum_predicted_kwh"),
-        ("nash_baseline_load_kwh", "nash_baseline_load_kwh"),
         ("sum_predicted_kwh", "forecast_sum_predicted_kwh"),
     ):
         if optional_float(window.get(key)) is not None:
@@ -1372,12 +1298,6 @@ def historical_load_bounds_kwh(
     return 0.0, max(baseline, 1.0), "fallback_zero_to_baseline_predicted_load"
 
 
-def target_peak_reduction_pct(load: float, upper_medium_load_kwh: float) -> float:
-    if load <= 0:
-        return 0.0
-    return max(0.0, ((load - upper_medium_load_kwh) / load) * 100)
-
-
 def price_shift_to_medium_band(
     context: dict[str, Any],
     window: dict[str, Any],
@@ -1388,11 +1308,7 @@ def price_shift_to_medium_band(
         context, window
     )
     if baseline_load <= 0 or historical_max_load <= historical_min_load or elasticity <= 0:
-        return clamp_shift_to_allowed_energy_price_range(
-            context,
-            window,
-            as_float(window.get("suggested_price_shift_pct"), 0),
-        )
+        return max(-100.0, as_float(window.get("suggested_price_shift_pct"), 0))
 
     load_position_pct = load_range_position_pct(
         baseline_load, historical_min_load, historical_max_load
@@ -1406,8 +1322,8 @@ def price_shift_to_medium_band(
     if stress == MEDIUM_STRESS:
         candidate = clamp(
             raw_shift,
-            -NASH_MEDIUM_MAX_PRICE_SHIFT_PCT,
-            NASH_MEDIUM_MAX_PRICE_SHIFT_PCT,
+            -3.0,
+            3.0,
         )
         expected_load = expected_load_after_price(baseline_load, candidate, elasticity)
         lower_load, upper_load = medium_load_bounds(
@@ -1418,63 +1334,7 @@ def price_shift_to_medium_band(
     else:
         candidate = ((1.0 - (target_load / baseline_load)) / elasticity) * 100.0
 
-    return clamp_shift_to_allowed_energy_price_range(context, window, candidate)
-
-
-def clamp_shift_to_allowed_energy_price_range(
-    context: dict[str, Any],
-    window: dict[str, Any],
-    shift_pct: float,
-) -> float:
-    current_price = optional_float(window.get("mean_energy_price"))
-    min_price, max_price, _, _ = energy_price_bounds(context, window)
-    if current_price is None or current_price <= 0:
-        raise ValueError(
-            "Current window mean energy price is required to calculate an energy-price shift."
-        )
-    minimum_shift = ((min_price / current_price) - 1.0) * 100.0
-    maximum_shift = ((max_price / current_price) - 1.0) * 100.0
-    return clamp(shift_pct, minimum_shift, maximum_shift)
-
-
-def energy_price_bounds(
-    context: dict[str, Any],
-    window: dict[str, Any],
-) -> tuple[float, float, str, float]:
-    profile = context.get("profile") if isinstance(context.get("profile"), dict) else {}
-    zone_mean_price = first_positive_float(
-        window.get("zone_mean_energy_price"),
-        context.get("zone_mean_energy_price"),
-        profile.get("mean_energy_price"),
-    )
-    if zone_mean_price is None:
-        raise ValueError(
-            "Zone mean energy price is required to calculate the allowed 0.4x-2.0x "
-            "energy-price range."
-        )
-    return (
-        zone_mean_price * 0.4,
-        zone_mean_price * 2.0,
-        "zone_mean_energy_price_0.4x_to_2.0x",
-        zone_mean_price,
-    )
-
-
-def energy_price_after_shift(window: dict[str, Any], shift_pct: float) -> float | None:
-    current_price = optional_float(window.get("mean_energy_price"))
-    if current_price is None:
-        return None
-    return round(current_price * (1.0 + shift_pct / 100.0), 4)
-
-
-def price_is_within_bounds(
-    price: float | None,
-    minimum: float | None,
-    maximum: float | None,
-) -> bool:
-    if price is None or minimum is None or maximum is None:
-        return False
-    return minimum - 1e-9 <= price <= maximum + 1e-9
+    return max(-100.0, candidate)
 
 
 def final_price_action_label(shift_pct: float) -> str:
@@ -1485,31 +1345,6 @@ def final_price_action_label(shift_pct: float) -> str:
     return "Hold energy price in Medium load band"
 
 
-def medium_target_price_rationale(
-    load_kwh: float,
-    historical_min_load_kwh: float,
-    historical_max_load_kwh: float,
-    shift_pct: float,
-    minimum_price: float | None,
-    maximum_price: float | None,
-) -> str:
-    range_position = load_range_position_pct(
-        load_kwh, historical_min_load_kwh, historical_max_load_kwh
-    )
-    stress = classify_load_percentage(range_position)
-    bounds = (
-        f"[{minimum_price:.4f}, {maximum_price:.4f}]"
-        if minimum_price is not None and maximum_price is not None
-        else "the available price range"
-    )
-    return (
-        f"{stress} load at {range_position:.2f}% through the zone historical 3-hour load "
-        f"range [{historical_min_load_kwh:.4f}, {historical_max_load_kwh:.4f}] kWh; apply "
-        f"{shift_pct:+.2f}% energy-price change to move or keep load in "
-        f"the 35%-80% Medium band while keeping price within {bounds}."
-    )
-
-
 def estimate_elasticity_factor(
     context: dict[str, Any],
     behavior: dict[str, Any],
@@ -1517,11 +1352,11 @@ def estimate_elasticity_factor(
 ) -> float:
     window_value = optional_float(window.get("elasticity_factor"))
     if window_value is not None:
-        return clamp(abs(window_value), NASH_MIN_ELASTICITY, NASH_MAX_ELASTICITY)
+        return clamp(abs(window_value), MIN_ELASTICITY, MAX_ELASTICITY)
 
     reported = optional_float(behavior.get("elasticity_factor"))
     if reported is not None:
-        return clamp(abs(reported), NASH_MIN_ELASTICITY, NASH_MAX_ELASTICITY)
+        return clamp(abs(reported), MIN_ELASTICITY, MAX_ELASTICITY)
 
     category = str(context.get("category") or "").lower()
     if "residential" in category:
@@ -1544,36 +1379,12 @@ def estimate_elasticity_factor(
         rain = optional_float(weather.get("rain_hours")) or 0.0
     occupancy_factor = 1.0 - 0.25 * occupancy
     rain_factor = 0.85 if rain > 0 else 1.0
-    return clamp(base * occupancy_factor * rain_factor, NASH_MIN_ELASTICITY, NASH_MAX_ELASTICITY)
-
-
-def estimate_price_tolerance_pct(context: dict[str, Any], window: dict[str, Any]) -> float:
-    category = str(context.get("category") or "").lower()
-    if "residential" in category:
-        base = 15.0
-    elif "commercial" in category or "mall" in category:
-        base = 12.0
-    elif "industrial" in category:
-        base = 9.0
-    else:
-        base = 10.0
-    occupancy = normalized_rate(window.get("mean_occupancy"))
-    rain = optional_float(window.get("total_rain")) or 0.0
-    tolerance = base * (1.0 - 0.25 * occupancy)
-    if rain > 0:
-        tolerance *= 0.85
-    return clamp(tolerance, 5.0, NASH_MAX_ABS_PRICE_SHIFT_PCT)
+    return clamp(base * occupancy_factor * rain_factor, MIN_ELASTICITY, MAX_ELASTICITY)
 
 
 def expected_load_after_price(baseline_load: float, price_shift_pct: float, elasticity: float) -> float:
     response = elasticity * (price_shift_pct / 100.0)
     return max(0.0, baseline_load * (1.0 - response))
-
-
-def user_discomfort_score(price_shift_pct: float, tolerance_pct: float) -> float:
-    if tolerance_pct <= 0:
-        return float("inf")
-    return abs(price_shift_pct) / tolerance_pct
 
 
 def normalized_rate(value: Any) -> float:

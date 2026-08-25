@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -358,6 +357,9 @@ async def run_multi_agent_discussion_zone_chain(
     final_grid: dict[str, Any] = {}
     final_behavior: dict[str, Any] = {}
     final_economist: dict[str, Any] = {}
+    previous_decision_signature: str | None = None
+    discussion_converged = False
+    discussion_stop_reason = "max_rounds_reached"
 
     for discussion_round in range(1, MULTI_AGENT_DISCUSSION_ROUNDS + 1):
         grid_result = await complete_agent_json(
@@ -424,15 +426,34 @@ async def run_multi_agent_discussion_zone_chain(
             economist_debug=economist_debug,
             agent_call_usage=round_usage,
         )
+        decision_signature = discussion_decision_signature(
+            grid,
+            behavior,
+            economist,
+        )
+        matches_previous_round = (
+            previous_decision_signature is not None
+            and decision_signature == previous_decision_signature
+        )
+        exchange["matches_previous_round"] = matches_previous_round
         discussion_rounds.append(exchange)
         previous_exchange = discussion_exchange_for_prompt(exchange)
+        previous_decision_signature = decision_signature
         final_grid = grid
         final_behavior = behavior
         final_economist = economist
+        if discussion_round == 2 and matches_previous_round:
+            discussion_converged = True
+            discussion_stop_reason = "round_2_matches_round_1"
+            break
 
+    actual_round_count = len(discussion_rounds)
     debug = {
         "zone_id": context.get("zone_id"),
-        "discussion_round_count": MULTI_AGENT_DISCUSSION_ROUNDS,
+        "discussion_round_count": actual_round_count,
+        "discussion_round_limit": MULTI_AGENT_DISCUSSION_ROUNDS,
+        "discussion_converged": discussion_converged,
+        "discussion_stop_reason": discussion_stop_reason,
         "discussion_rounds": discussion_rounds,
         "agent_call_usage": agent_call_usage,
         "agent_usage_summary": summarize_agent_call_usage(agent_call_usage),
@@ -446,7 +467,10 @@ async def run_multi_agent_discussion_zone_chain(
         economist_debug=debug,
         agent_call_usage=agent_call_usage,
     )
-    report["agent_discussion_round_count"] = MULTI_AGENT_DISCUSSION_ROUNDS
+    report["agent_discussion_round_count"] = actual_round_count
+    report["agent_discussion_round_limit"] = MULTI_AGENT_DISCUSSION_ROUNDS
+    report["agent_discussion_converged"] = discussion_converged
+    report["agent_discussion_stop_reason"] = discussion_stop_reason
     report["agent_discussion_rounds"] = discussion_rounds
     return report
 
@@ -480,6 +504,7 @@ def discussion_round_record(
         },
         "economist_validation": economist_debug,
         "agent_usage": summarize_agent_call_usage(agent_call_usage),
+        "agent_call_usage": [dict(item) for item in agent_call_usage],
     }
 
 
@@ -491,6 +516,99 @@ def discussion_exchange_for_prompt(exchange: dict[str, Any]) -> dict[str, Any]:
         "economist_output": exchange.get("economist_output"),
         "communication_summary": exchange.get("communication_summary"),
     }
+
+
+def discussion_decision_signature(
+    grid: dict[str, Any],
+    behavior: dict[str, Any],
+    economist: dict[str, Any],
+) -> str:
+    """Compare substantive decisions while ignoring free-form explanation text."""
+
+    grid_windows = [
+        {
+            key: item.get(key)
+            for key in (
+                "window_start",
+                "window_end",
+                "predicted_load_kwh",
+                "load_range_position_pct",
+                "grid_stress_level",
+                "adjustment_needed",
+            )
+            if key in item
+        }
+        for item in grid.get("window_assessments") or []
+        if isinstance(item, dict)
+    ]
+    price_windows = [
+        {
+            key: item.get(key)
+            for key in (
+                "window_start",
+                "window_end",
+                "suggested_price_shift_pct",
+                "proposed_energy_price",
+                "action_label",
+            )
+            if key in item
+        }
+        for item in economist.get("price_change_windows_3h") or []
+        if isinstance(item, dict)
+    ]
+    decision = {
+        "grid": {
+            "adjustment_needed": grid.get("adjustment_needed"),
+            "grid_stress_level": grid.get("grid_stress_level"),
+            "window_assessments": grid_windows,
+        },
+        "behavior": {
+            "elasticity_factor": behavior.get("elasticity_factor"),
+            "window_elasticities": behavior.get("window_elasticities"),
+        },
+        "economist": {
+            "suggested_price_shift_pct": economist.get(
+                "suggested_price_shift_pct"
+            ),
+            "action_label": economist.get("action_label"),
+            "price_change_windows_3h": price_windows,
+        },
+    }
+    return json.dumps(
+        canonical_discussion_decision(decision),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def canonical_discussion_decision(value: Any) -> Any:
+    if isinstance(value, dict):
+        explanation_keys = {
+            "reasoning_summary",
+            "forecast_summary",
+            "price_rationale",
+            "message_to_other_agents",
+            "agreements",
+            "disagreements",
+            "revisions_from_prior_round",
+        }
+        return {
+            str(key): canonical_discussion_decision(item)
+            for key, item in value.items()
+            if str(key).strip().lower() not in explanation_keys
+        }
+    if isinstance(value, list):
+        return [canonical_discussion_decision(item) for item in value]
+    if isinstance(value, float):
+        return round(value, 6)
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            return round(float(text), 6)
+        except ValueError:
+            return text
+    return value
 
 
 async def run_single_agent_zone_chain(
@@ -695,7 +813,6 @@ async def complete_agent_json(
     stage: str,
     agent: str,
 ) -> AgentCallResult:
-    started = time.perf_counter()
     try:
         response = await client.complete_json(prompt, temperature=temperature)
     except AgentStageError:
@@ -707,7 +824,6 @@ async def complete_agent_json(
             agent=agent,
             original=exc,
         ) from exc
-    elapsed = round(time.perf_counter() - started, 4)
     token_usage = response.pop(AGENT_COMPLETION_USAGE_KEY, {})
     response = sanitize_structured_agent_output(response)
     return AgentCallResult(
@@ -716,7 +832,6 @@ async def complete_agent_json(
             stage=stage,
             agent=agent,
             zone_id=context.get("zone_id"),
-            elapsed_seconds=elapsed,
             token_usage=token_usage,
         ),
     )
@@ -853,7 +968,6 @@ def agent_call_usage_record(
     stage: str,
     agent: str,
     zone_id: Any,
-    elapsed_seconds: float,
     token_usage: dict[str, Any] | None,
 ) -> dict[str, Any]:
     usage = token_usage if isinstance(token_usage, dict) else {}
@@ -874,7 +988,6 @@ def agent_call_usage_record(
         "stage": stage,
         "agent": agent,
         "zone_id": zone_id,
-        "elapsed_seconds": elapsed_seconds,
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
@@ -887,7 +1000,6 @@ def summarize_agent_call_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "agent_invoked": bool(records),
         "agent_call_count": len(records),
-        "elapsed_seconds": round(sum(optional_float_usage(record.get("elapsed_seconds")) for record in records), 4),
         "prompt_tokens": sum_token_usage(records, "prompt_tokens"),
         "completion_tokens": sum_token_usage(records, "completion_tokens"),
         "total_tokens": sum_token_usage(records, "total_tokens"),
@@ -924,13 +1036,6 @@ def optional_int_usage(value: Any) -> int | None:
         return None
 
 
-def optional_float_usage(value: Any) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def heuristic_zone_chain(
     context: dict[str, Any],
     *,
@@ -951,6 +1056,9 @@ def heuristic_discussion_zone_chain(
     final_grid: dict[str, Any] = {}
     final_behavior: dict[str, Any] = {}
     final_economist: dict[str, Any] = {}
+    previous_decision_signature: str | None = None
+    discussion_converged = False
+    discussion_stop_reason = "max_rounds_reached"
     for discussion_round in range(1, MULTI_AGENT_DISCUSSION_ROUNDS + 1):
         grid = heuristic_grid(context)
         behavior = heuristic_behavior(context)
@@ -964,19 +1072,29 @@ def heuristic_discussion_zone_chain(
         economist["message_to_other_agents"] = (
             f"Dry-run Economist summary for discussion round {discussion_round}."
         )
-        discussion_rounds.append(
-            discussion_round_record(
-                discussion_round=discussion_round,
-                grid=grid,
-                behavior=behavior,
-                economist=economist,
-                economist_debug=None,
-                agent_call_usage=[],
-            )
+        exchange = discussion_round_record(
+            discussion_round=discussion_round,
+            grid=grid,
+            behavior=behavior,
+            economist=economist,
+            economist_debug=None,
+            agent_call_usage=[],
         )
+        decision_signature = discussion_decision_signature(grid, behavior, economist)
+        matches_previous_round = (
+            previous_decision_signature is not None
+            and decision_signature == previous_decision_signature
+        )
+        exchange["matches_previous_round"] = matches_previous_round
+        discussion_rounds.append(exchange)
+        previous_decision_signature = decision_signature
         final_grid = grid
         final_behavior = behavior
         final_economist = economist
+        if discussion_round == 2 and matches_previous_round:
+            discussion_converged = True
+            discussion_stop_reason = "round_2_matches_round_1"
+            break
     report = combine_reports(
         context,
         final_grid,
@@ -985,7 +1103,10 @@ def heuristic_discussion_zone_chain(
         source=source,
         agent_call_usage=[],
     )
-    report["agent_discussion_round_count"] = MULTI_AGENT_DISCUSSION_ROUNDS
+    report["agent_discussion_round_count"] = len(discussion_rounds)
+    report["agent_discussion_round_limit"] = MULTI_AGENT_DISCUSSION_ROUNDS
+    report["agent_discussion_converged"] = discussion_converged
+    report["agent_discussion_stop_reason"] = discussion_stop_reason
     report["agent_discussion_rounds"] = discussion_rounds
     return report
 
@@ -1159,7 +1280,6 @@ def combine_reports(
             for key, value in economist.items()
             if key != ECONOMIST_AGENT_OUTPUT_KEY
         },
-        "agent_time_cost_seconds": usage_summary["elapsed_seconds"],
         "agent_invoked": usage_summary["agent_invoked"],
         "agent_call_count": usage_summary["agent_call_count"],
         "agent_prompt_tokens": usage_summary["prompt_tokens"],

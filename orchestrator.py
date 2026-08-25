@@ -4,7 +4,6 @@ import asyncio
 import copy
 import json
 import math
-import time
 import traceback
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -459,7 +458,6 @@ def run_pipeline(
         reports_by_zone: dict[str, dict[str, Any]] = {}
         client: AgentChatClient | None = None
         heuristic_source = "dry-run"
-        initial_agent_batch_elapsed_seconds = 0.0
         try:
             try:
                 if cached_contexts:
@@ -500,7 +498,6 @@ def run_pipeline(
                             cli_model=model,
                         )
                         client = AgentChatClient(config)
-                    initial_batch_started = time.perf_counter() if client is not None else None
                     live_reports = await run_all_zone_chains(
                         live_contexts,
                         client=client,
@@ -508,11 +505,6 @@ def run_pipeline(
                         heuristic_source=heuristic_source,
                         chain_mode=chain_mode,
                     )
-                    if initial_batch_started is not None:
-                        initial_agent_batch_elapsed_seconds = round(
-                            time.perf_counter() - initial_batch_started,
-                            4,
-                        )
                     reports_by_zone.update(
                         {str(report.get("zone_id")): report for report in live_reports}
                     )
@@ -543,9 +535,6 @@ def run_pipeline(
                     price_change_reference=pipeline_data.price_change_reference,
                     forecast_parameters=forecast_parameters,
                     scenario_artifacts=scenario_artifacts,
-                    initial_agent_batch_elapsed_seconds=(
-                        initial_agent_batch_elapsed_seconds
-                    ),
                 )
                 reports_by_zone.update(
                     {str(report.get("zone_id")): report for report in live_reports}
@@ -891,6 +880,7 @@ def run_experiment_matrix(
     rationale_path = experiment_dir / "experiment_rationale_trace.csv"
     explainability_path = experiment_dir / "experiment_explainability_review_packet.csv"
     agent_attempt_usage_path = experiment_dir / "experiment_agent_attempt_usage.csv"
+    agent_step_token_usage_path = experiment_dir / "experiment_agent_step_token_usage.csv"
     control_attempt_trace_path = experiment_dir / "experiment_control_attempt_trace.csv"
     forecast_summary_path = experiment_dir / "experiment_forecast_summary.csv"
     price_summary_path = experiment_dir / "experiment_price_summary.csv"
@@ -903,6 +893,7 @@ def run_experiment_matrix(
     rationale_frames: list[pd.DataFrame] = []
     explainability_frames: list[pd.DataFrame] = []
     agent_attempt_usage_frames: list[pd.DataFrame] = []
+    agent_step_token_usage_frames: list[pd.DataFrame] = []
     control_attempt_trace_frames: list[pd.DataFrame] = []
     cache_attempted = False
     add_seed_folder = len(seeds) > 1
@@ -1014,6 +1005,11 @@ def run_experiment_matrix(
                                 metadata,
                             )
                             append_experiment_frame(
+                                agent_step_token_usage_frames,
+                                outputs.get("agent_step_token_usage_csv"),
+                                metadata,
+                            )
+                            append_experiment_frame(
                                 control_attempt_trace_frames,
                                 outputs.get("control_attempt_trace_csv"),
                                 metadata,
@@ -1040,6 +1036,10 @@ def run_experiment_matrix(
     rationales = write_experiment_summary(rationale_frames, rationale_path)
     write_experiment_summary(explainability_frames, explainability_path)
     write_experiment_summary(agent_attempt_usage_frames, agent_attempt_usage_path)
+    write_experiment_summary(
+        agent_step_token_usage_frames,
+        agent_step_token_usage_path,
+    )
     write_experiment_summary(control_attempt_trace_frames, control_attempt_trace_path)
     write_numeric_summary(
         metrics,
@@ -1069,6 +1069,7 @@ def run_experiment_matrix(
         "experiment_rationale_trace_csv": rationale_path,
         "experiment_explainability_review_packet_csv": explainability_path,
         "experiment_agent_attempt_usage_csv": agent_attempt_usage_path,
+        "experiment_agent_step_token_usage_csv": agent_step_token_usage_path,
         "experiment_control_attempt_trace_csv": control_attempt_trace_path,
         "experiment_forecast_summary_csv": forecast_summary_path,
         "experiment_price_summary_csv": price_summary_path,
@@ -1727,7 +1728,6 @@ def apply_precomputed_window_data(
         updated_report["agent_reasoning"] = f"Reused window load and energy-price predictions from {source_name}."
         updated_report["action_label"] = "Reuse precomputed window predictions"
         updated_report["price_rationale"] = f"Loaded complete 3-hour window predictions from {source_name}."
-        updated_report["agent_time_cost_seconds"] = 0.0
         updated_report["agent_invoked"] = False
         updated_report["agent_call_count"] = 0
         updated_report["agent_prompt_tokens"] = 0
@@ -1914,7 +1914,6 @@ async def run_control_loop(
     price_change_reference: Any,
     forecast_parameters: dict[str, Any],
     scenario_artifacts: dict[str, NativeForecasterArtifact],
-    initial_agent_batch_elapsed_seconds: float = 0.0,
 ) -> list[dict[str, Any]]:
     """Run at most three forecast-validated price proposals."""
 
@@ -1937,10 +1936,6 @@ async def run_control_loop(
     pending_phase_by_zone: dict[str, str] = {
         str(report.get("zone_id")): "initial" for report in current
     }
-    pending_batch_elapsed_seconds = round(
-        max(float(initial_agent_batch_elapsed_seconds or 0.0), 0.0),
-        4,
-    )
     agent_round_usage: list[dict[str, Any]] = []
 
     for attempt in range(1, MAX_CONTROL_ATTEMPTS + 1):
@@ -1992,7 +1987,6 @@ async def run_control_loop(
             build_global_agent_round_usage(
                 attempt=attempt,
                 zone_usage=zone_usage_for_round,
-                batch_elapsed_seconds=pending_batch_elapsed_seconds,
                 proposal_phase=(
                     "initial" if attempt == 1 else retry_proposal_phase(agent_mode)
                 ),
@@ -2028,18 +2022,12 @@ async def run_control_loop(
             )
             retry_jobs.append((retry_context, report, failed_keys))
 
-        retry_batch_started = time.perf_counter() if client is not None and retry_jobs else None
         revisions = await revise_control_reports(
             retry_jobs,
             client=client,
             temperature=temperature,
             heuristic_source=heuristic_source,
             agent_mode=agent_mode,
-        )
-        pending_batch_elapsed_seconds = (
-            round(time.perf_counter() - retry_batch_started, 4)
-            if retry_batch_started is not None
-            else 0.0
         )
         revisions_by_zone = {
             str(report.get("zone_id")): (report, failed_keys)
@@ -2094,9 +2082,6 @@ async def run_control_loop(
         )
         updated["agent_cumulative_usage"] = cumulative_usage
         updated["agent_call_usage"] = cumulative_calls
-        updated["agent_time_cost_seconds"] = cumulative_usage[
-            "agent_elapsed_seconds"
-        ]
         updated["agent_invoked"] = cumulative_usage["agent_invoked"]
         updated["agent_call_count"] = cumulative_usage["agent_call_count"]
         updated["agent_prompt_tokens"] = cumulative_usage["prompt_tokens"]
@@ -2107,9 +2092,11 @@ async def run_control_loop(
         updated["agent_token_usage_complete"] = cumulative_usage[
             "token_usage_complete"
         ]
+        updated["agent_token_totals"] = token_total_summary(cumulative_usage)
         updated[CONTROL_AGENT_USAGE_KEY] = {
             "agent_round_usage": agent_round_usage,
             "agent_cumulative_usage": global_cumulative_usage,
+            "agent_token_totals": token_total_summary(global_cumulative_usage),
         }
         finalized.append(updated)
     return finalized
@@ -2337,6 +2324,16 @@ def control_attempt_snapshot(
             "agent_discussion_round_count",
             0,
         ),
+        "agent_discussion_round_limit": report.get(
+            "agent_discussion_round_limit",
+            0,
+        ),
+        "agent_discussion_converged": bool(
+            report.get("agent_discussion_converged", False)
+        ),
+        "agent_discussion_stop_reason": report.get(
+            "agent_discussion_stop_reason"
+        ),
         "agent_discussion_rounds": copy.deepcopy(
             report.get("agent_discussion_rounds") or []
         ),
@@ -2376,7 +2373,6 @@ def build_zone_attempt_agent_usage(
     usage = {
         "agent_invoked": summarized["agent_invoked"],
         "agent_call_count": summarized["agent_call_count"],
-        "agent_elapsed_seconds": summarized["elapsed_seconds"],
         "prompt_tokens": summarized["prompt_tokens"],
         "completion_tokens": summarized["completion_tokens"],
         "total_tokens": summarized["total_tokens"],
@@ -2391,7 +2387,6 @@ def build_global_agent_round_usage(
     *,
     attempt: int,
     zone_usage: list[dict[str, Any]],
-    batch_elapsed_seconds: float,
     proposal_phase: str,
     triggered_by_attempt: int | None,
 ) -> dict[str, Any]:
@@ -2404,14 +2399,6 @@ def build_global_agent_round_usage(
         "agent_invoked_zone_count": len(invoked),
         "agent_call_count": sum(
             usage_integer(item.get("agent_call_count")) for item in zone_usage
-        ),
-        "agent_batch_wall_time_seconds": round(
-            max(float(batch_elapsed_seconds or 0.0), 0.0),
-            4,
-        ),
-        "agent_elapsed_seconds": round(
-            sum(optional_number(item.get("agent_elapsed_seconds")) or 0.0 for item in zone_usage),
-            4,
         ),
         "prompt_tokens": sum(
             usage_integer(item.get("prompt_tokens")) for item in zone_usage
@@ -2453,7 +2440,6 @@ def cumulative_zone_agent_usage(
             ),
             "agent_invoked": summary["agent_invoked"],
             "agent_call_count": summary["agent_call_count"],
-            "agent_elapsed_seconds": summary["elapsed_seconds"],
             "prompt_tokens": summary["prompt_tokens"],
             "completion_tokens": summary["completion_tokens"],
             "total_tokens": summary["total_tokens"],
@@ -2480,20 +2466,6 @@ def cumulative_global_agent_usage(
         "agent_call_count": sum(
             usage_integer(item.get("agent_call_count")) for item in rounds
         ),
-        "agent_batch_wall_time_seconds": round(
-            sum(
-                optional_number(item.get("agent_batch_wall_time_seconds")) or 0.0
-                for item in rounds
-            ),
-            4,
-        ),
-        "agent_elapsed_seconds": round(
-            sum(
-                optional_number(item.get("agent_elapsed_seconds")) or 0.0
-                for item in rounds
-            ),
-            4,
-        ),
         "prompt_tokens": sum(
             usage_integer(item.get("prompt_tokens")) for item in rounds
         ),
@@ -2506,6 +2478,17 @@ def cumulative_global_agent_usage(
         "token_usage_complete": all(
             bool(item.get("token_usage_complete")) for item in rounds
         ),
+    }
+
+
+def token_total_summary(usage: dict[str, Any]) -> dict[str, Any]:
+    """Expose a compact final token-only total without timing fields."""
+    return {
+        "agent_call_count": usage_integer(usage.get("agent_call_count")),
+        "prompt_tokens": usage_integer(usage.get("prompt_tokens")),
+        "completion_tokens": usage_integer(usage.get("completion_tokens")),
+        "total_tokens": usage_integer(usage.get("total_tokens")),
+        "token_usage_complete": bool(usage.get("token_usage_complete")),
     }
 
 
@@ -2645,6 +2628,9 @@ def merge_failed_window_revision(
         "behavior_output",
         "economist_output",
         "agent_discussion_round_count",
+        "agent_discussion_round_limit",
+        "agent_discussion_converged",
+        "agent_discussion_stop_reason",
         "agent_discussion_rounds",
         "source",
     ):

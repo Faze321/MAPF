@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +41,6 @@ TRACE_COLUMNS = [
     "control_status",
     "attempts_used",
     "failed_window_count",
-    "agent_time_cost_seconds",
     "agent_invoked",
     "agent_call_count",
     "agent_prompt_tokens",
@@ -119,8 +119,6 @@ AGENT_ATTEMPT_USAGE_COLUMNS = [
     "agent_invoked",
     "agent_invoked_zone_count",
     "agent_call_count",
-    "agent_batch_wall_time_seconds",
-    "agent_elapsed_seconds",
     "prompt_tokens",
     "completion_tokens",
     "total_tokens",
@@ -128,6 +126,25 @@ AGENT_ATTEMPT_USAGE_COLUMNS = [
     "agent_stages",
     "agent_names",
     "agent_call_usage_json",
+]
+
+AGENT_STEP_TOKEN_USAGE_COLUMNS = [
+    "forecast_model",
+    "agent_mode",
+    "zone_id",
+    "category",
+    "attempt",
+    "proposal_phase",
+    "triggered_by_attempt",
+    "step_index",
+    "discussion_round",
+    "stage",
+    "agent",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "token_usage_complete",
+    "provider_attempt_count",
 ]
 
 
@@ -249,6 +266,7 @@ def write_agent_outputs(
     control_final_windows_csv = output_dir / "control_final_windows.csv"
     control_attempt_trace_csv = output_dir / "control_attempt_trace.csv"
     agent_attempt_usage_csv = output_dir / "agent_attempt_usage.csv"
+    agent_step_token_usage_csv = output_dir / "agent_step_token_usage.csv"
     experiment_aggregate_csv = output_dir / "control_experiment_summary.csv"
 
     control_agent_usage = extract_control_agent_usage(reports)
@@ -278,6 +296,7 @@ def write_agent_outputs(
         control_final_windows_csv,
         control_attempt_trace_csv,
         agent_attempt_usage_csv,
+        agent_step_token_usage_csv,
         experiment_aggregate_csv,
         trace_reports,
         forecast_model=forecast_model,
@@ -303,6 +322,7 @@ def write_agent_outputs(
         "control_final_windows_csv": control_final_windows_csv,
         "control_attempt_trace_csv": control_attempt_trace_csv,
         "agent_attempt_usage_csv": agent_attempt_usage_csv,
+        "agent_step_token_usage_csv": agent_step_token_usage_csv,
         "control_experiment_summary_csv": experiment_aggregate_csv,
     }
     if manifest is not None:
@@ -323,6 +343,7 @@ def write_control_outputs(
     final_windows_csv: Path,
     attempt_trace_csv: Path,
     agent_attempt_usage_csv: Path,
+    agent_step_token_usage_csv: Path,
     experiment_summary_csv: Path,
     reports: list[dict[str, Any]],
     *,
@@ -337,17 +358,22 @@ def write_control_outputs(
     final_rows: list[dict[str, Any]] = []
     attempt_rows: list[dict[str, Any]] = []
     zone_usage_rows: list[dict[str, Any]] = []
+    step_token_rows: list[dict[str, Any]] = []
     zone_usage_by_attempt: dict[int, list[dict[str, Any]]] = {}
     zones: list[dict[str, Any]] = []
     usage_metadata = dict(control_agent_usage or {})
     global_round_usage = [
-        dict(item)
+        token_only_round_usage(item)
         for item in usage_metadata.get("agent_round_usage") or []
         if isinstance(item, dict)
     ]
     global_cumulative_usage = usage_metadata.get("agent_cumulative_usage")
     if not isinstance(global_cumulative_usage, dict):
         global_cumulative_usage = {}
+    else:
+        global_cumulative_usage = token_only_cumulative_usage(
+            global_cumulative_usage
+        )
     safe_window_keys = (
         "window_start",
         "window_end",
@@ -381,7 +407,7 @@ def write_control_outputs(
         attempts = report.get("control_attempt_trace") or []
         zone_cumulative_usage = normalized_zone_cumulative_usage(report, attempts)
         zone_call_usage = [
-            dict(call)
+            token_only_call_usage(call)
             for call in report.get("agent_call_usage") or []
             if isinstance(call, dict)
         ]
@@ -403,10 +429,21 @@ def write_control_outputs(
                     "price_conditioned_forecast_metadata"
                 ),
                 "agent_cumulative_usage": zone_cumulative_usage,
+                "agent_token_totals": token_total_payload(zone_cumulative_usage),
                 "agent_call_usage": zone_call_usage,
                 "final_agent_discussion_round_count": report.get(
                     "agent_discussion_round_count",
                     0,
+                ),
+                "final_agent_discussion_round_limit": report.get(
+                    "agent_discussion_round_limit",
+                    0,
+                ),
+                "final_agent_discussion_converged": bool(
+                    report.get("agent_discussion_converged", False)
+                ),
+                "final_agent_discussion_stop_reason": report.get(
+                    "agent_discussion_stop_reason"
                 ),
                 "final_agent_discussion_rounds": report.get(
                     "agent_discussion_rounds"
@@ -434,10 +471,26 @@ def write_control_outputs(
             attempt_number = reporting_usage_integer(attempt.get("attempt"))
             attempt_usage = normalized_attempt_usage(attempt)
             attempt_calls = [
-                dict(call)
+                token_only_call_usage(call)
                 for call in attempt.get("agent_call_usage") or []
                 if isinstance(call, dict)
             ]
+            for step_index, call in enumerate(attempt_calls, start=1):
+                step_token_rows.append(
+                    agent_step_token_usage_row(
+                        forecast_model=forecast_model,
+                        agent_mode=agent_mode,
+                        zone_id=zone_id,
+                        category=report.get("category"),
+                        attempt=attempt_number,
+                        proposal_phase=attempt.get("proposal_phase"),
+                        triggered_by_attempt=attempt.get(
+                            "triggered_by_attempt"
+                        ),
+                        step_index=step_index,
+                        call=call,
+                    )
+                )
             zone_usage_by_attempt.setdefault(attempt_number, []).append(
                 {"zone_id": zone_id, **attempt_usage}
             )
@@ -495,7 +548,7 @@ def write_control_outputs(
     ]
     global_status = "success" if zones and all(z["status"] == "success" for z in zones) else "fail"
     payload = {
-        "schema_version": 2,
+        "schema_version": 3,
         "result_type": "forecaster_agent_control",
         "status": global_status,
         "forecast_origin": metadata.get("forecast_origin"),
@@ -509,6 +562,8 @@ def write_control_outputs(
         "success_policy": "all zones and all 3-hour windows are Medium",
         "agent_round_usage": global_round_usage,
         "agent_cumulative_usage": global_cumulative_usage,
+        "agent_token_totals": token_total_payload(global_cumulative_usage),
+        "agent_step_token_usage": step_token_rows,
         "zones": zones,
     }
     results_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -518,6 +573,10 @@ def write_control_outputs(
         [*global_usage_rows, *zone_usage_rows],
         columns=AGENT_ATTEMPT_USAGE_COLUMNS,
     ).to_csv(agent_attempt_usage_csv, index=False)
+    pd.DataFrame(
+        step_token_rows,
+        columns=AGENT_STEP_TOKEN_USAGE_COLUMNS,
+    ).to_csv(agent_step_token_usage_csv, index=False)
     pd.DataFrame(
         [
             {
@@ -575,19 +634,6 @@ def normalized_attempt_usage(attempt: dict[str, Any]) -> dict[str, Any]:
             raw.get("agent_invoked_zone_count", 1 if agent_call_count > 0 else 0)
         ),
         "agent_call_count": agent_call_count,
-        "agent_batch_wall_time_seconds": reporting_optional_float(
-            raw.get("agent_batch_wall_time_seconds")
-        ),
-        "agent_elapsed_seconds": round(
-            reporting_optional_float(
-                raw.get(
-                    "agent_elapsed_seconds",
-                    sum(reporting_optional_float(call.get("elapsed_seconds")) or 0.0 for call in calls),
-                )
-            )
-            or 0.0,
-            4,
-        ),
         "prompt_tokens": reporting_usage_integer(
             raw.get(
                 "prompt_tokens",
@@ -616,7 +662,7 @@ def normalized_zone_cumulative_usage(
 ) -> dict[str, Any]:
     value = report.get("agent_cumulative_usage")
     if isinstance(value, dict):
-        return dict(value)
+        return token_only_cumulative_usage(value)
     usage_rows = [
         normalized_attempt_usage(attempt)
         for attempt in attempts
@@ -634,13 +680,6 @@ def normalized_zone_cumulative_usage(
             "agent_call_count": sum(
                 reporting_usage_integer(item.get("agent_call_count"))
                 for item in usage_rows
-            ),
-            "agent_elapsed_seconds": round(
-                sum(
-                    reporting_optional_float(item.get("agent_elapsed_seconds")) or 0.0
-                    for item in usage_rows
-                ),
-                4,
             ),
             "prompt_tokens": sum(
                 reporting_usage_integer(item.get("prompt_tokens"))
@@ -677,10 +716,6 @@ def normalized_zone_cumulative_usage(
         "agent_invoked_attempt_count": 1 if calls else 0,
         "agent_invoked": bool(calls),
         "agent_call_count": len(calls),
-        "agent_elapsed_seconds": round(
-            reporting_optional_float(report.get("agent_time_cost_seconds")) or 0.0,
-            4,
-        ),
         "prompt_tokens": reporting_usage_integer(report.get("agent_prompt_tokens")),
         "completion_tokens": reporting_usage_integer(
             report.get("agent_completion_tokens")
@@ -731,15 +766,6 @@ def derive_global_agent_round_usage(
                     reporting_usage_integer(item.get("agent_call_count"))
                     for item in usage_rows
                 ),
-                "agent_batch_wall_time_seconds": 0.0,
-                "agent_elapsed_seconds": round(
-                    sum(
-                        reporting_optional_float(item.get("agent_elapsed_seconds"))
-                        or 0.0
-                        for item in usage_rows
-                    ),
-                    4,
-                ),
                 "prompt_tokens": sum(
                     reporting_usage_integer(item.get("prompt_tokens"))
                     for item in usage_rows
@@ -776,21 +802,6 @@ def derive_global_cumulative_usage(
         ),
         "agent_call_count": sum(
             reporting_usage_integer(item.get("agent_call_count")) for item in rounds
-        ),
-        "agent_batch_wall_time_seconds": round(
-            sum(
-                reporting_optional_float(item.get("agent_batch_wall_time_seconds"))
-                or 0.0
-                for item in rounds
-            ),
-            4,
-        ),
-        "agent_elapsed_seconds": round(
-            sum(
-                reporting_optional_float(item.get("agent_elapsed_seconds")) or 0.0
-                for item in rounds
-            ),
-            4,
         ),
         "prompt_tokens": sum(
             reporting_usage_integer(item.get("prompt_tokens")) for item in rounds
@@ -837,10 +848,6 @@ def agent_attempt_usage_row(
             )
         ),
         "agent_call_count": reporting_usage_integer(usage.get("agent_call_count")),
-        "agent_batch_wall_time_seconds": usage.get(
-            "agent_batch_wall_time_seconds"
-        ),
-        "agent_elapsed_seconds": usage.get("agent_elapsed_seconds"),
         "prompt_tokens": reporting_usage_integer(usage.get("prompt_tokens")),
         "completion_tokens": reporting_usage_integer(
             usage.get("completion_tokens")
@@ -853,19 +860,112 @@ def agent_attempt_usage_row(
     }
 
 
+def agent_step_token_usage_row(
+    *,
+    forecast_model: str | None,
+    agent_mode: str | None,
+    zone_id: Any,
+    category: Any,
+    attempt: int,
+    proposal_phase: Any,
+    triggered_by_attempt: Any,
+    step_index: int,
+    call: dict[str, Any],
+) -> dict[str, Any]:
+    stage = str(call.get("stage") or "")
+    match = re.search(r"(?:^|\.)round_(\d+)(?:\.|$)", stage)
+    return {
+        "forecast_model": forecast_model,
+        "agent_mode": agent_mode,
+        "zone_id": zone_id,
+        "category": category,
+        "attempt": attempt,
+        "proposal_phase": proposal_phase,
+        "triggered_by_attempt": triggered_by_attempt,
+        "step_index": step_index,
+        "discussion_round": int(match.group(1)) if match else None,
+        "stage": stage,
+        "agent": call.get("agent"),
+        "prompt_tokens": reporting_usage_integer(call.get("prompt_tokens")),
+        "completion_tokens": reporting_usage_integer(
+            call.get("completion_tokens")
+        ),
+        "total_tokens": reporting_usage_integer(call.get("total_tokens")),
+        "token_usage_complete": bool(call.get("token_usage_complete")),
+        "provider_attempt_count": reporting_usage_integer(
+            call.get("provider_attempt_count", 1)
+        ),
+    }
+
+
+def token_only_call_usage(value: dict[str, Any]) -> dict[str, Any]:
+    allowed = (
+        "stage",
+        "agent",
+        "zone_id",
+        "attempt",
+        "proposal_phase",
+        "triggered_by_attempt",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "token_usage_complete",
+        "provider_attempt_count",
+    )
+    return {key: value.get(key) for key in allowed if key in value}
+
+
+def token_only_round_usage(value: dict[str, Any]) -> dict[str, Any]:
+    allowed = (
+        "attempt",
+        "proposal_phase",
+        "triggered_by_attempt",
+        "agent_invoked",
+        "agent_invoked_zone_count",
+        "agent_call_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "token_usage_complete",
+        "invoked_zone_ids",
+    )
+    return {key: value.get(key) for key in allowed if key in value}
+
+
+def token_only_cumulative_usage(value: dict[str, Any]) -> dict[str, Any]:
+    allowed = (
+        "agent_round_count",
+        "agent_attempt_count",
+        "agent_invoked_round_count",
+        "agent_invoked_attempt_count",
+        "agent_invoked",
+        "agent_invoked_zone_count",
+        "agent_call_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "token_usage_complete",
+    )
+    return {key: value.get(key) for key in allowed if key in value}
+
+
+def token_total_payload(value: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "agent_call_count": reporting_usage_integer(value.get("agent_call_count")),
+        "prompt_tokens": reporting_usage_integer(value.get("prompt_tokens")),
+        "completion_tokens": reporting_usage_integer(
+            value.get("completion_tokens")
+        ),
+        "total_tokens": reporting_usage_integer(value.get("total_tokens")),
+        "token_usage_complete": bool(value.get("token_usage_complete")),
+    }
+
+
 def reporting_usage_integer(value: Any) -> int:
     try:
         return int(value)
     except (TypeError, ValueError):
         return 0
-
-
-def reporting_optional_float(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return None if pd.isna(number) else number
 
 
 def split_agent_debug_outputs(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

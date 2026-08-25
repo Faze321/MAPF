@@ -113,7 +113,7 @@ Supported control modes are:
 
 - `multi_agent_economist_retry`: Grid → Behaviour → Economist initially; only Economist revises failed windows.
 - `multi_agent_full_retry`: reruns all three Agents with the latest reforecast context.
-- `multi_agent_discussion_3rounds`: runs three internal Grid/Behaviour/Economist discussion rounds for every price proposal. Rounds 2 and 3 receive the previous structured exchange, and a failed outer control attempt reruns all three discussion rounds with the latest reforecast context.
+- `multi_agent_discussion_3rounds`: runs up to three internal Grid/Behaviour/Economist discussion rounds for every price proposal. Rounds 2 and 3 receive the previous structured exchange. If the substantive Grid, Behaviour, and Economist decisions in round 2 match round 1, the discussion converges immediately and round 3 is skipped. A failed outer control attempt starts a fresh discussion with the latest reforecast context.
 - `single_agent_price_retry`: one Agent performs all roles; failure retries revise prices only.
 - `single_agent_full_retry`: one Agent fully re-evaluates the updated context on failure.
 
@@ -133,13 +133,14 @@ For every Zone, the adapter computes mean energy price in consecutive non-overla
 
 ## Outputs
 
-The authoritative control artifact is `control_results.json` (schema version 2). It records the dataset fingerprint, split cache key, feature manifest, forecast origin/model, experiment mode, global and Zone status, attempts, structured Agent summaries, reforecast trace, final window prices/load positions/stress, rationale, and historical price diagnostics. Each proposal attempt also stores per-Zone Agent call timing/token usage, while top-level round records store concurrent Agent batch wall time and cumulative usage. Missing provider usage remains explicitly incomplete instead of being estimated.
+The authoritative control artifact is `control_results.json` (schema version 3). It records the dataset fingerprint, split cache key, feature manifest, forecast origin/model, experiment mode, global and Zone status, attempts, structured Agent summaries, reforecast trace, final window prices/load positions/stress, rationale, and historical price diagnostics. Agent time is not measured or emitted. Every concrete Grid, Behaviour, Economist, schema-repair, and retry call records prompt, completion, and total tokens. Attempt-level summaries and the final `agent_token_totals` provide Zone and global totals. Missing provider usage remains explicitly incomplete instead of being estimated.
 
 Companion outputs are:
 
 - `control_final_windows.csv`
 - `control_attempt_trace.csv`, with every Zone/window/attempt price transition, including frozen windows and previous-to-current price/shift deltas
 - `agent_attempt_usage.csv`, with separate `global` and `zone` rows so token totals are not repeated for each window
+- `agent_step_token_usage.csv`, with one row per concrete Agent/provider call and its prompt/completion/total token usage
 - `control_experiment_summary.csv`
 - `forecaster/forecaster_artifact.json` for refit-free Agent-only handoff. It stores
   backend-specific inference state and known-future covariates; every proposed price
@@ -148,7 +149,7 @@ Companion outputs are:
 - `forecaster/context_snippets.json` for the no-leakage Agent handoff
 - forecast evaluation CSV/plots, separate from `control_results.json`
 
-Experiment matrices additionally aggregate these records into `experiment_agent_attempt_usage.csv` and `experiment_control_attempt_trace.csv`.
+Experiment matrices additionally aggregate these records into `experiment_agent_attempt_usage.csv`, `experiment_agent_step_token_usage.csv`, and `experiment_control_attempt_trace.csv`.
 
 The run is `success` only when every selected Zone and every 3-hour window is `Medium`; otherwise the third proposal produces `fail` with the final summaries and reforecast state.
 
@@ -158,4 +159,4 @@ The run is `success` only when every selected Zone and every 3-hour window is `M
 python -B -m unittest tests.test_refactor -v
 ```
 
-The refactor tests cover cache hit/invalidation/recovery, dataset-local cache layout, fixed-origin cross-Zone artifacts, artifact round-trip and price-scenario reuse, Agent no-leakage filtering, attempt-level timing/token accounting, frozen/revised price trajectories, and versioned authoritative output.
+The refactor tests cover cache hit/invalidation/recovery, dataset-local cache layout, fixed-origin cross-Zone artifacts, artifact round-trip and price-scenario reuse, Agent no-leakage filtering, step/attempt/global token accounting, discussion convergence, frozen/revised price trajectories, and versioned authoritative output.

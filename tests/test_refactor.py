@@ -48,6 +48,39 @@ def workspace_temporary_directory() -> Path:
     return path
 
 
+def discussion_test_context() -> dict:
+    return {
+        "zone_id": "a",
+        "category": "test",
+        "forecast_start": "2024-01-01 00:00:00",
+        "forecast_end": "2024-01-01 02:00:00",
+        "forecast_horizon_days": 1,
+        "forecast_total_kwh": 30.0,
+        "forecast_peak_kwh": 12.0,
+        "predicted_change_pct": 5.0,
+        "grid_stress_level": "High",
+        "weather": {"rain_hours": 1},
+        "hourly_shape": {
+            "night_20_6": 10.0,
+            "morning_7_10": 8.0,
+            "evening_17_22": 11.0,
+        },
+        "profile": {"poi_total": 3},
+        "pricing_windows_3h": [
+            {
+                "window_start": "2024-01-01 00:00:00",
+                "window_end": "2024-01-01 02:00:00",
+                "sum_predicted_kwh": 30.0,
+                "mean_predicted_kwh": 10.0,
+                "mean_energy_price": 1.0,
+                "mean_service_price": 0.5,
+                "load_range_position_pct": 85.0,
+                "load_stress_level": "High",
+            }
+        ],
+    }
+
+
 class OutputPathTests(unittest.TestCase):
     def test_agent_provider_profiles_are_selected_independently(self):
         temporary = workspace_temporary_directory()
@@ -210,6 +243,9 @@ agent:
             custom["experiment_dir"],
         )
         self.assertTrue(automatic["experiment_agent_attempt_usage_csv"].is_file())
+        self.assertTrue(
+            automatic["experiment_agent_step_token_usage_csv"].is_file()
+        )
         self.assertTrue(automatic["experiment_control_attempt_trace_csv"].is_file())
 
 
@@ -745,7 +781,6 @@ class ControlOutputTests(unittest.TestCase):
             stage="agent.grid",
             agent="Grid Analyst",
             zone_id="a",
-            elapsed_seconds=0.25,
             token_usage={
                 "prompt_tokens": 10,
                 "completion_tokens": 5,
@@ -756,7 +791,6 @@ class ControlOutputTests(unittest.TestCase):
             stage="agent.economist",
             agent="Market Economist",
             zone_id="a",
-            elapsed_seconds=0.5,
             token_usage={},
         )
         summary = summarize_agent_call_usage([complete, incomplete])
@@ -764,6 +798,8 @@ class ControlOutputTests(unittest.TestCase):
         self.assertEqual(15, summary["total_tokens"])
         self.assertFalse(summary["token_usage_complete"])
         self.assertFalse(incomplete["token_usage_complete"])
+        self.assertNotIn("elapsed_seconds", complete)
+        self.assertNotIn("elapsed_seconds", summary)
 
     def test_three_agents_exchange_information_for_three_rounds(self):
         class FakeDiscussionClient:
@@ -841,36 +877,7 @@ class ControlOutputTests(unittest.TestCase):
                 response["_agent_completion_usage"] = usage
                 return response
 
-        context = {
-            "zone_id": "a",
-            "category": "test",
-            "forecast_start": "2024-01-01 00:00:00",
-            "forecast_end": "2024-01-01 02:00:00",
-            "forecast_horizon_days": 1,
-            "forecast_total_kwh": 30.0,
-            "forecast_peak_kwh": 12.0,
-            "predicted_change_pct": 5.0,
-            "grid_stress_level": "High",
-            "weather": {"rain_hours": 1},
-            "hourly_shape": {
-                "night_20_6": 10.0,
-                "morning_7_10": 8.0,
-                "evening_17_22": 11.0,
-            },
-            "profile": {"poi_total": 3},
-            "pricing_windows_3h": [
-                {
-                    "window_start": "2024-01-01 00:00:00",
-                    "window_end": "2024-01-01 02:00:00",
-                    "sum_predicted_kwh": 30.0,
-                    "mean_predicted_kwh": 10.0,
-                    "mean_energy_price": 1.0,
-                    "mean_service_price": 0.5,
-                    "load_range_position_pct": 85.0,
-                    "load_stress_level": "High",
-                }
-            ],
-        }
+        context = discussion_test_context()
         client = FakeDiscussionClient()
         report = asyncio.run(
             run_zone_chain(
@@ -897,8 +904,106 @@ class ControlOutputTests(unittest.TestCase):
                 for item in report["agent_discussion_rounds"]
             ],
         )
+        self.assertFalse(report["agent_discussion_converged"])
+        self.assertEqual("max_rounds_reached", report["agent_discussion_stop_reason"])
+        self.assertTrue(
+            all(
+                len(item["agent_call_usage"]) == 3
+                for item in report["agent_discussion_rounds"]
+            )
+        )
 
-    def test_provider_retry_time_usage_is_marked_incomplete(self):
+    def test_discussion_stops_after_equal_first_and_second_decisions(self):
+        class StableDiscussionClient:
+            def __init__(self):
+                self.prompts = []
+
+            async def complete_json(self, prompt, *, temperature):
+                self.prompts.append(prompt)
+                call_index = len(self.prompts) - 1
+                discussion_round = call_index // 3 + 1
+                role_index = call_index % 3
+                if role_index == 0:
+                    response = {
+                        "reasoning_summary": f"grid explanation {discussion_round}",
+                        "adjustment_needed": True,
+                        "window_assessments": [
+                            {
+                                "window_start": "2024-01-01 00:00:00",
+                                "window_end": "2024-01-01 02:00:00",
+                                "predicted_load_kwh": 30.0,
+                                "load_range_position_pct": 85.0,
+                                "grid_stress_level": "High",
+                                "adjustment_needed": True,
+                                "reasoning_summary": (
+                                    f"grid window explanation {discussion_round}"
+                                ),
+                            }
+                        ],
+                    }
+                elif role_index == 1:
+                    response = {
+                        "reasoning_summary": (
+                            f"behavior explanation {discussion_round}"
+                        ),
+                        "demand_drivers": ["weather"],
+                        "elasticity_factor": 0.2,
+                        "window_elasticities": [0.2],
+                    }
+                else:
+                    response = {
+                        "reasoning_summary": (
+                            f"economist explanation {discussion_round}"
+                        ),
+                        "suggested_price_shift_pct": 10.0,
+                        "action_label": "Raise energy price",
+                        "price_rationale": f"rationale {discussion_round}",
+                        "price_change_windows_3h": [
+                            {
+                                "window_start": "2024-01-01 00:00:00",
+                                "window_end": "2024-01-01 02:00:00",
+                                "suggested_price_shift_pct": 10.0,
+                                "proposed_energy_price": 1.1,
+                                "action_label": "Raise energy price",
+                                "price_rationale": (
+                                    f"window rationale {discussion_round}"
+                                ),
+                            }
+                        ],
+                    }
+                response["_agent_completion_usage"] = {
+                    "prompt_tokens": 7,
+                    "completion_tokens": 3,
+                    "total_tokens": 10,
+                    "token_usage_complete": True,
+                }
+                return response
+
+        client = StableDiscussionClient()
+        report = asyncio.run(
+            run_zone_chain(
+                discussion_test_context(),
+                client=client,
+                chain_mode="multi_agent_discussion",
+            )
+        )
+        self.assertEqual(6, len(client.prompts))
+        self.assertEqual(2, report["agent_discussion_round_count"])
+        self.assertTrue(report["agent_discussion_converged"])
+        self.assertEqual(
+            "round_2_matches_round_1",
+            report["agent_discussion_stop_reason"],
+        )
+        self.assertFalse(
+            report["agent_discussion_rounds"][0]["matches_previous_round"]
+        )
+        self.assertTrue(
+            report["agent_discussion_rounds"][1]["matches_previous_round"]
+        )
+        self.assertEqual(6, report["agent_call_count"])
+        self.assertEqual(60, report["agent_total_tokens"])
+
+    def test_provider_retry_token_usage_is_marked_incomplete(self):
         class FakeCompletions:
             def __init__(self):
                 self.calls = 0
@@ -1056,7 +1161,6 @@ class ControlOutputTests(unittest.TestCase):
                 "stage": stage,
                 "agent": stage,
                 "zone_id": zone_id,
-                "elapsed_seconds": 0.1,
                 "prompt_tokens": total - 2,
                 "completion_tokens": 2,
                 "total_tokens": total,
@@ -1135,7 +1239,6 @@ class ControlOutputTests(unittest.TestCase):
                     price_change_reference=None,
                     forecast_parameters={},
                     scenario_artifacts={},
-                    initial_agent_batch_elapsed_seconds=0.25,
                 )
             )
 
@@ -1171,13 +1274,22 @@ class ControlOutputTests(unittest.TestCase):
             outputs["control_results_json"].read_text(encoding="utf-8")
         )
         self.assertEqual(2, len(payload["agent_round_usage"]))
-        self.assertEqual(
-            0.25,
-            payload["agent_round_usage"][0]["agent_batch_wall_time_seconds"],
-        )
         self.assertEqual(40, payload["agent_cumulative_usage"]["total_tokens"])
+        self.assertEqual(40, payload["agent_token_totals"]["total_tokens"])
+        self.assertEqual(3, len(payload["agent_step_token_usage"]))
+        self.assertNotIn("elapsed", json.dumps(payload))
+        self.assertNotIn("wall_time", json.dumps(payload))
         usage_frame = pd.read_csv(outputs["agent_attempt_usage_csv"])
         self.assertEqual(6, len(usage_frame))
+        self.assertNotIn("agent_elapsed_seconds", usage_frame.columns)
+        self.assertNotIn("agent_batch_wall_time_seconds", usage_frame.columns)
+        step_frame = pd.read_csv(outputs["agent_step_token_usage_csv"])
+        self.assertEqual(3, len(step_frame))
+        self.assertEqual(40, int(step_frame.total_tokens.sum()))
+        self.assertEqual(
+            ["agent.grid", "agent.grid", "agent.economist_retry"],
+            step_frame.stage.tolist(),
+        )
         self.assertEqual(
             1,
             int(
@@ -1268,12 +1380,14 @@ class ControlOutputTests(unittest.TestCase):
                 },
             )
         payload = json.loads(outputs["control_results_json"].read_text(encoding="utf-8"))
-        self.assertEqual(2, payload["schema_version"])
+        self.assertEqual(3, payload["schema_version"])
         self.assertEqual("success", payload["status"])
         self.assertEqual("abc", payload["dataset_fingerprint"])
         self.assertIn("agent_round_usage", payload)
         self.assertIn("agent_cumulative_usage", payload)
+        self.assertIn("agent_token_totals", payload)
         self.assertTrue(outputs["agent_attempt_usage_csv"].is_file())
+        self.assertTrue(outputs["agent_step_token_usage_csv"].is_file())
         self.assertNotIn("actual", json.dumps(payload))
 
 

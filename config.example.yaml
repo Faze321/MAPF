@@ -1,13 +1,22 @@
 agent:
-  api_key: "${OPENROUTER_API_KEY}"
-  base_url: "https://openrouter.ai/api/v1"
-  model: "qwen/qwen3-14b"
-  single_agent_model: "meta-llama/llama-3.3-70b-instruct"
-  reasoning_effort: "none" # required for JSON mode with Qwen3 thinking models
-  timeout_seconds: 90
-  max_concurrent_requests: 4
-  provider_json_retries: 2 # additional attempts for malformed/truncated provider HTTP JSON
-  provider_json_retry_backoff_seconds: 1.0
+  multi_agent:
+    api_key: "${MULTI_AGENT_API_KEY}"
+    base_url: "https://openrouter.ai/api/v1"
+    model: "qwen/qwen3-14b"
+    reasoning_effort: "none" # required for JSON mode with Qwen3 thinking models
+    timeout_seconds: 90
+    max_concurrent_requests: 4
+    provider_json_retries: 2 # additional attempts for malformed/truncated provider HTTP JSON
+    provider_json_retry_backoff_seconds: 1.0
+  single_agent:
+    api_key: "${SINGLE_AGENT_API_KEY}"
+    base_url: "https://openrouter.ai/api/v1"
+    model: "meta-llama/llama-3.3-70b-instruct"
+    reasoning_effort: "none"
+    timeout_seconds: 90
+    max_concurrent_requests: 4
+    provider_json_retries: 2
+    provider_json_retry_backoff_seconds: 1.0
 
 data:
   adapter: "urbanev" # options: "urbanev", "long_format"
@@ -60,6 +69,7 @@ run:
   agent_modes:
     - "multi_agent_economist_retry"
     # - "multi_agent_full_retry"
+    # - "multi_agent_discussion_3rounds"
     # - "single_agent_price_retry"
     # - "single_agent_full_retry"
 # TimesFM

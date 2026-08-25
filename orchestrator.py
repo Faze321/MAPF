@@ -23,6 +23,7 @@ from agents import (
 )
 from config import (
     AgentConfig,
+    agent_config_profile,
     normalize_agent_mode,
     normalize_forecast_model_name,
     normalize_pipeline_stage,
@@ -47,6 +48,7 @@ from load_policy import (
     load_range_position_pct,
 )
 from reporting import safe_filename, write_agent_outputs, write_forecaster_outputs
+from time_utils import normalize_datetime_series_24h, parse_datetime_24h
 from zone_selection import select_zone_categories
 
 
@@ -244,7 +246,13 @@ def run_pipeline(
     forecast_model = normalize_forecast_model_name(forecast_model)
     pipeline_stage = normalize_pipeline_stage(pipeline_stage)
     agent_mode = normalize_agent_mode(agent_mode)
-    chain_mode = "single_agent" if agent_mode.startswith("single_agent") else "multi_agent"
+    chain_mode = (
+        "single_agent"
+        if agent_mode.startswith("single_agent")
+        else "multi_agent_discussion"
+        if agent_mode == "multi_agent_discussion_3rounds"
+        else "multi_agent"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     dataset_spec = dataset_spec or DatasetSpec(
         path=data_dir,
@@ -475,10 +483,16 @@ def run_pipeline(
                     if dry_run:
                         heuristic_source = f"dry-run_{agent_mode}"
                     else:
-                        config = AgentConfig.from_file(config_path, model=model, required=True)
+                        config = AgentConfig.from_file(
+                            config_path,
+                            model=model,
+                            required=True,
+                            agent_mode=agent_mode,
+                        )
                         if not config.api_key:
                             raise RuntimeError(
-                                "agent.api_key is required in config.yaml, or pass --dry-run"
+                                f"agent.{config.profile}.api_key is required in config.yaml, "
+                                "or pass --dry-run"
                             )
                         config = select_agent_config_for_mode(
                             config,
@@ -786,8 +800,15 @@ def select_agent_config_for_mode(
     agent_mode: str,
     cli_model: str | None,
 ) -> AgentConfig:
-    if agent_mode.startswith("single_agent") and cli_model is None and config.single_agent_model:
-        return replace(config, model=config.single_agent_model)
+    expected_profile = agent_config_profile(agent_mode)
+    if config.profile == expected_profile:
+        return replace(config, model=cli_model) if cli_model else config
+    if expected_profile == "single_agent" and cli_model is None and config.single_agent_model:
+        return replace(
+            config,
+            model=config.single_agent_model,
+            profile="single_agent",
+        )
     return config
 
 
@@ -1225,13 +1246,28 @@ def classify_experiment_error(exc: Exception) -> dict[str, str]:
             source = source.original
 
     return {
-        "error_code": ERROR_CODE_BY_STAGE.get(stage, ERROR_CODE_BY_STAGE["unexpected"]),
+        "error_code": error_code_for_stage(stage),
         "error_stage": stage,
         "error_zone_id": zone_id,
         "error_agent": agent,
         "error_type": type(source).__name__,
         "error_message": str(source),
     }
+
+
+def error_code_for_stage(stage: str) -> str:
+    if stage in ERROR_CODE_BY_STAGE:
+        return ERROR_CODE_BY_STAGE[stage]
+    if stage.startswith("agent.discussion."):
+        if stage.endswith(".grid"):
+            return ERROR_CODE_BY_STAGE["agent.grid"]
+        if stage.endswith(".behavior"):
+            return ERROR_CODE_BY_STAGE["agent.behavior"]
+        if stage.endswith(".economist.schema_repair"):
+            return ERROR_CODE_BY_STAGE["agent.economist_repair"]
+        if stage.endswith(".economist"):
+            return ERROR_CODE_BY_STAGE["agent.economist"]
+    return ERROR_CODE_BY_STAGE["unexpected"]
 
 
 def format_failure_message(exc: Exception) -> str:
@@ -1515,7 +1551,7 @@ def load_precomputed_window_data(path: Path | str | None) -> pd.DataFrame:
     frame = frame.copy()
     frame["zone_id"] = frame["zone_id"].astype("string").str.strip()
     for column in ("window_start", "window_end"):
-        parsed = pd.to_datetime(frame[column], errors="coerce")
+        parsed = normalize_datetime_series_24h(frame[column], errors="coerce")
         if parsed.isna().any():
             bad_rows = parsed[parsed.isna()].index.tolist()[:5]
             raise ValueError(f"Invalid {column} value in precomputed window data at row(s): {bad_rows}")
@@ -1708,8 +1744,8 @@ def apply_precomputed_window_data(
 def precomputed_window_key(zone_id: Any, window_start: Any, window_end: Any) -> tuple[str, str, str]:
     return (
         str(zone_id).strip(),
-        pd.Timestamp(window_start).isoformat(),
-        pd.Timestamp(window_end).isoformat(),
+        parse_datetime_24h(window_start).isoformat(),
+        parse_datetime_24h(window_end).isoformat(),
     )
 
 
@@ -1984,7 +2020,11 @@ async def run_control_loop(
                 report,
                 attempt=attempt,
                 replace_forecast=agent_mode
-                in {"multi_agent_full_retry", "single_agent_full_retry"},
+                in {
+                    "multi_agent_full_retry",
+                    "multi_agent_discussion_3rounds",
+                    "single_agent_full_retry",
+                },
             )
             retry_jobs.append((retry_context, report, failed_keys))
 
@@ -2088,7 +2128,11 @@ async def revise_control_reports(
         previous: dict[str, Any],
         failed_keys: set[tuple[str, str]],
     ) -> tuple[dict[str, Any], set[tuple[str, str]]]:
-        if agent_mode in {"multi_agent_full_retry", "single_agent_full_retry"}:
+        if agent_mode in {
+            "multi_agent_full_retry",
+            "multi_agent_discussion_3rounds",
+            "single_agent_full_retry",
+        }:
             revision = await run_zone_chain(
                 context,
                 client=client,
@@ -2097,6 +2141,8 @@ async def revise_control_reports(
                 chain_mode=(
                     "single_agent"
                     if agent_mode == "single_agent_full_retry"
+                    else "multi_agent_discussion"
+                    if agent_mode == "multi_agent_discussion_3rounds"
                     else "multi_agent"
                 ),
             )
@@ -2287,6 +2333,13 @@ def control_attempt_snapshot(
         "failed_window_count": report.get("failed_window_count"),
         "agent_usage": usage,
         "agent_call_usage": usage_calls,
+        "agent_discussion_round_count": report.get(
+            "agent_discussion_round_count",
+            0,
+        ),
+        "agent_discussion_rounds": copy.deepcopy(
+            report.get("agent_discussion_rounds") or []
+        ),
         "grid_reasoning_summary": report.get("grid_reasoning_summary"),
         "behavior_reasoning_summary": report.get("behavior_reasoning_summary"),
         "economist_reasoning_summary": report.get("economist_reasoning_summary"),
@@ -2460,6 +2513,7 @@ def retry_proposal_phase(agent_mode: str) -> str:
     return {
         "multi_agent_economist_retry": "economist_retry",
         "multi_agent_full_retry": "full_multi_agent_retry",
+        "multi_agent_discussion_3rounds": "three_round_agent_discussion_retry",
         "single_agent_price_retry": "single_agent_price_retry",
         "single_agent_full_retry": "single_agent_full_retry",
     }.get(agent_mode, "price_retry")
@@ -2590,6 +2644,8 @@ def merge_failed_window_revision(
         "grid_output",
         "behavior_output",
         "economist_output",
+        "agent_discussion_round_count",
+        "agent_discussion_rounds",
         "source",
     ):
         if field in revision:
@@ -2622,8 +2678,8 @@ def energy_price_with_predicted_windows(
         predicted_price = predicted_energy_price(window)
         if predicted_price is None:
             continue
-        start = pd.Timestamp(window.get("window_start"))
-        end = pd.Timestamp(window.get("window_end"))
+        start = parse_datetime_24h(window.get("window_start"))
+        end = parse_datetime_24h(window.get("window_end"))
         mask = (frame["time"] >= start) & (frame["time"] <= end)
         frame.loc[mask, zone_id] = predicted_price
     return frame

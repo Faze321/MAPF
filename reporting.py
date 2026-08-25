@@ -404,6 +404,14 @@ def write_control_outputs(
                 ),
                 "agent_cumulative_usage": zone_cumulative_usage,
                 "agent_call_usage": zone_call_usage,
+                "final_agent_discussion_round_count": report.get(
+                    "agent_discussion_round_count",
+                    0,
+                ),
+                "final_agent_discussion_rounds": report.get(
+                    "agent_discussion_rounds"
+                )
+                or [],
                 "attempt_trace": attempts,
                 "final_windows": final_windows,
             }

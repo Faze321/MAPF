@@ -20,3 +20,6 @@ tmp/
 # Dataset-derived, reproducible feature caches.
 /data/cache/
 /data/**/cache/
+
+output/
+outputs/

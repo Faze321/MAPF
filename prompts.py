@@ -127,6 +127,100 @@ def economist_prompt(
     )
 
 
+def discussion_grid_prompt(
+    context: dict[str, Any],
+    *,
+    discussion_round: int,
+    previous_exchange: dict[str, Any] | None,
+) -> str:
+    return (
+        grid_prompt(context)
+        + collaborative_round_instruction(
+            role="Grid Analyst",
+            discussion_round=discussion_round,
+            previous_exchange=previous_exchange,
+            task=(
+                "Review the previous Behavioural Agent and Market Economist conclusions, "
+                "identify agreements or disagreements that affect grid stress, and revise "
+                "your structured assessment when justified. Do not change the forecaster's "
+                "numerical load values. Also return agreements, disagreements, "
+                "revisions_from_prior_round, and message_to_other_agents."
+            ),
+        )
+    )
+
+
+def discussion_behavior_prompt(
+    context: dict[str, Any],
+    grid_report: dict[str, Any],
+    *,
+    discussion_round: int,
+    previous_exchange: dict[str, Any] | None,
+) -> str:
+    return (
+        behavior_prompt(context, grid_report)
+        + collaborative_round_instruction(
+            role="Behavioural Agent",
+            discussion_round=discussion_round,
+            previous_exchange=previous_exchange,
+            task=(
+                "Review the previous Grid and Economist conclusions together with the "
+                "current Grid report. Reconcile demand drivers and elasticity estimates, "
+                "and explain any revision. Also return agreements, disagreements, "
+                "revisions_from_prior_round, and message_to_other_agents."
+            ),
+        )
+    )
+
+
+def discussion_economist_prompt(
+    context: dict[str, Any],
+    grid_report: dict[str, Any],
+    behavior_report: dict[str, Any],
+    *,
+    discussion_round: int,
+    previous_exchange: dict[str, Any] | None,
+) -> str:
+    return (
+        economist_prompt(context, grid_report, behavior_report)
+        + collaborative_round_instruction(
+            role="Market Economist",
+            discussion_round=discussion_round,
+            previous_exchange=previous_exchange,
+            task=(
+                "Review the previous round and the current Grid and Behavioural reports. "
+                "Resolve disagreements explicitly in the structured summary and revise "
+                "the price schedule when the shared evidence supports it. Preserve all "
+                "required economist pricing keys. Also return agreements, disagreements, "
+                "revisions_from_prior_round, and message_to_other_agents."
+            ),
+        )
+    )
+
+
+def collaborative_round_instruction(
+    *,
+    role: str,
+    discussion_round: int,
+    previous_exchange: dict[str, Any] | None,
+    task: str,
+) -> str:
+    previous = previous_exchange or {
+        "status": "No previous exchange; establish the round-1 position."
+    }
+    return (
+        f"""
+
+        Collaborative discussion round {discussion_round} of 3 / {role}.
+        {task}
+        Treat other agents' outputs as advice, not ground truth. Use only the supplied,
+        no-leakage forecast context. Return structured reasoning summaries only, never
+        hidden chain-of-thought.
+
+        Previous round exchange:\n{json.dumps(previous, ensure_ascii=False)}"""
+    )
+
+
 def single_agent_prompt(context: dict[str, Any]) -> str:
     horizon = horizon_label(context)
     economist_context = compact_economist_context(context)

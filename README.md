@@ -55,7 +55,29 @@ The cache is fingerprinted by adapter/schema version, source paths, sizes, mtime
 
 ## Running
 
-Copy `config.example.yaml` to `config.yaml`, configure the provider key or use `--dry-run`, then run:
+Copy `config.example.yaml` to `config.yaml`, configure the provider key or use `--dry-run`, then run.
+
+Multi-Agent and single-Agent provider settings are independent, so they may use
+different API keys, endpoints, models, timeouts, and concurrency limits:
+
+```yaml
+agent:
+  multi_agent:
+    api_key: "${MULTI_AGENT_API_KEY}"
+    base_url: "https://openrouter.ai/api/v1"
+    model: "qwen/qwen3-14b"
+  single_agent:
+    api_key: "${SINGLE_AGENT_API_KEY}"
+    base_url: "https://api.example.com/v1"
+    model: "example/single-agent-model"
+```
+
+Every `multi_agent_*` mode (including the three-round discussion mode) uses
+`agent.multi_agent`; every `single_agent_*` mode uses `agent.single_agent`.
+Only the active profile is loaded, so its counterpart's environment variables
+do not need to be set. The legacy flat `agent.api_key`/`agent.base_url` format and
+`single_agent_model` remain supported. `--model` overrides the model of the active
+profile for that run without changing the other profile.
 
 ```powershell
 python main.py --dry-run --forecast-model AR --agent-mode multi_agent_economist_retry
@@ -91,6 +113,7 @@ Supported control modes are:
 
 - `multi_agent_economist_retry`: Grid → Behaviour → Economist initially; only Economist revises failed windows.
 - `multi_agent_full_retry`: reruns all three Agents with the latest reforecast context.
+- `multi_agent_discussion_3rounds`: runs three internal Grid/Behaviour/Economist discussion rounds for every price proposal. Rounds 2 and 3 receive the previous structured exchange, and a failed outer control attempt reruns all three discussion rounds with the latest reforecast context.
 - `single_agent_price_retry`: one Agent performs all roles; failure retries revise prices only.
 - `single_agent_full_retry`: one Agent fully re-evaluates the updated context on failure.
 

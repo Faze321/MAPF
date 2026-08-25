@@ -12,10 +12,12 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from time_utils import normalize_datetime_series_24h
+
 
 DATASET_CACHE_SCHEMA_VERSION = 1
-URBAN_EV_ADAPTER_VERSION = 1
-LONG_FORMAT_ADAPTER_VERSION = 1
+URBAN_EV_ADAPTER_VERSION = 2
+LONG_FORMAT_ADAPTER_VERSION = 2
 CANONICAL_TIME_COLUMN = "timestamp"
 CANONICAL_ZONE_COLUMN = "zone_id"
 CANONICAL_LOAD_COLUMN = "load_kwh"
@@ -331,7 +333,9 @@ class UrbanEVDatasetAdapter(DatasetAdapter):
             weather = pd.read_csv(weather_path)
             time_column = discover_column(weather.columns, ["time", "timestamp", "datetime"], required=True)
             weather = weather.rename(columns={time_column: CANONICAL_TIME_COLUMN})
-            weather[CANONICAL_TIME_COLUMN] = pd.to_datetime(weather[CANONICAL_TIME_COLUMN])
+            weather[CANONICAL_TIME_COLUMN] = normalize_datetime_series_24h(
+                weather[CANONICAL_TIME_COLUMN]
+            )
             weather_aliases = {
                 "temperature": ["temperature", "temp", "T"],
                 "humidity": ["humidity", "relative_humidity", "U"],
@@ -441,7 +445,9 @@ class LongFormatDatasetAdapter(DatasetAdapter):
             if source is not None:
                 rename[str(source)] = semantic
         frame = frame.rename(columns=rename)
-        frame[CANONICAL_TIME_COLUMN] = pd.to_datetime(frame[CANONICAL_TIME_COLUMN])
+        frame[CANONICAL_TIME_COLUMN] = normalize_datetime_series_24h(
+            frame[CANONICAL_TIME_COLUMN]
+        )
         frame[CANONICAL_ZONE_COLUMN] = frame[CANONICAL_ZONE_COLUMN].astype(str)
         if (pd.to_numeric(frame[CANONICAL_ENERGY_PRICE_COLUMN], errors="coerce") <= 0).any():
             raise ValueError("Baseline energy price must be greater than zero")
@@ -520,7 +526,9 @@ def read_wide_matrix(path: Path, value_name: str) -> pd.DataFrame:
     frame = pd.read_csv(path)
     time_column = discover_column(frame.columns, ["time", "timestamp", "datetime"], required=True)
     frame = frame.rename(columns={time_column: CANONICAL_TIME_COLUMN})
-    frame[CANONICAL_TIME_COLUMN] = pd.to_datetime(frame[CANONICAL_TIME_COLUMN])
+    frame[CANONICAL_TIME_COLUMN] = normalize_datetime_series_24h(
+        frame[CANONICAL_TIME_COLUMN]
+    )
     zone_columns = [column for column in frame.columns if column != CANONICAL_TIME_COLUMN]
     if not zone_columns:
         raise ValueError(f"Wide matrix has no zone columns: {path}")
@@ -623,7 +631,9 @@ def validate_canonical_timeseries(frame: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError("Canonical dataset is missing required fields: " + ", ".join(sorted(missing)))
     result = frame.copy()
-    result[CANONICAL_TIME_COLUMN] = pd.to_datetime(result[CANONICAL_TIME_COLUMN])
+    result[CANONICAL_TIME_COLUMN] = normalize_datetime_series_24h(
+        result[CANONICAL_TIME_COLUMN]
+    )
     result[CANONICAL_ZONE_COLUMN] = result[CANONICAL_ZONE_COLUMN].astype(str)
     if result.duplicated([CANONICAL_TIME_COLUMN, CANONICAL_ZONE_COLUMN]).any():
         raise ValueError("Canonical dataset contains duplicate timestamp/zone observations")

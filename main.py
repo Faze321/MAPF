@@ -61,7 +61,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Forecast model: timesfm, chronos, lstm, or AR.",
     )
-    parser.add_argument("--model", default=None, help="Model id, for example openai/gpt-4o-mini.")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Override the model for the active agent profile only, for example "
+            "openai/gpt-4o-mini."
+        ),
+    )
     parser.add_argument(
         "--dry-run",
         action=argparse.BooleanOptionalAction,
@@ -144,14 +151,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Agent mode: multi_agent_economist_retry, multi_agent_full_retry, "
-            "single_agent_price_retry, or single_agent_full_retry."
+            "multi_agent_discussion_3rounds, single_agent_price_retry, or "
+            "single_agent_full_retry."
         ),
     )
     parser.add_argument(
         "--agent-modes",
         nargs="+",
         default=None,
-        help="One or more of the four control-loop agent modes.",
+        help="One or more supported control-loop agent modes.",
     )
     parser.add_argument(
         "--diurnal-blend-alpha",

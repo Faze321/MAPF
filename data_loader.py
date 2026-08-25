@@ -24,6 +24,7 @@ from load_policy import (
     MEDIUM_MAX_LOAD_PCT,
     load_threshold_kwh,
 )
+from time_utils import normalize_datetime_series_24h
 
 
 POI_COLUMNS = {
@@ -54,13 +55,13 @@ def read_time_matrix(path: Path, zones: Iterable[str] | None = None) -> pd.DataF
     if zones is not None:
         usecols = ["time", *[str(zone) for zone in zones]]
     frame = pd.read_csv(path, usecols=usecols)
-    frame["time"] = pd.to_datetime(frame["time"])
+    frame["time"] = normalize_datetime_series_24h(frame["time"])
     return frame
 
 
 def read_weather(path: Path) -> pd.DataFrame:
     frame = pd.read_csv(path)
-    frame["time"] = pd.to_datetime(frame["time"])
+    frame["time"] = normalize_datetime_series_24h(frame["time"])
     return frame
 
 

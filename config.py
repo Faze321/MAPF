@@ -211,6 +211,7 @@ class AgentConfig:
     api_key: str | None
     base_url: str
     model: str
+    profile: str = "multi_agent"
     single_agent_model: str | None = None
     reasoning_effort: str = "none"
     http_referer: str | None = None
@@ -227,40 +228,89 @@ class AgentConfig:
         *,
         model: str | None = None,
         required: bool = True,
+        agent_mode: str | None = None,
     ) -> "AgentConfig":
+        profile = agent_config_profile(agent_mode)
         if not path.exists():
             if required:
                 raise FileNotFoundError(
                     f"Config file not found: {path}. Copy config.example.yaml to config.yaml."
                 )
-            return cls.default(model=model)
+            return cls.default(model=model, profile=profile)
 
-        raw = read_config_mapping(path)
+        # Expand only the selected profile. This lets either provider use its own
+        # environment variables without requiring credentials for the inactive one.
+        raw = read_config_mapping(path, expand_env=False)
         settings = raw.get("agent")
         if not isinstance(settings, dict):
             raise ValueError('Config key "agent" must contain a mapping')
+
+        profile_settings = settings.get(profile, {})
+        if profile_settings is None:
+            profile_settings = {}
+        if not isinstance(profile_settings, dict):
+            raise ValueError(f'Config key "agent.{profile}" must contain a mapping')
+
+        setting_names = (
+            "api_key",
+            "base_url",
+            "model",
+            "reasoning_effort",
+            "http_referer",
+            "title",
+            "timeout_seconds",
+            "max_concurrent_requests",
+            "provider_json_retries",
+            "provider_json_retry_backoff_seconds",
+        )
+        resolved = {name: settings[name] for name in setting_names if name in settings}
+        resolved.update(profile_settings)
+
+        # A nested model wins over the legacy single_agent_model, while --model
+        # overrides only whichever profile is active for this run.
+        profile_model = profile_settings.get("model")
+        legacy_single_model = (
+            settings.get("single_agent_model") if profile == "single_agent" else None
+        )
+        flat_model = settings.get("model")
+        resolved["model"] = (
+            model
+            or (profile_model if optional_str(profile_model) else None)
+            or (legacy_single_model if optional_str(legacy_single_model) else None)
+            or (flat_model if optional_str(flat_model) else None)
+            or "meta-llama/llama-3.1-8b-instruct"
+        )
+        resolved = _expand_env_vars(resolved)
+
         return cls(
-            api_key=optional_str(settings.get("api_key")),
-            base_url=optional_str(settings.get("base_url")) or "https://openrouter.ai/api/v1",
-            model=model or optional_str(settings.get("model")) or "meta-llama/llama-3.1-8b-instruct",
+            api_key=optional_str(resolved.get("api_key")),
+            base_url=optional_str(resolved.get("base_url")) or "https://openrouter.ai/api/v1",
+            model=optional_str(resolved.get("model")) or "meta-llama/llama-3.1-8b-instruct",
+            profile=profile,
             single_agent_model=optional_str(settings.get("single_agent_model")),
-            reasoning_effort=optional_str(settings.get("reasoning_effort")) or "none",
-            http_referer=optional_str(settings.get("http_referer")),
-            title=optional_str(settings.get("title")) or "MAPF UrbanEV",
-            timeout_seconds=float(settings.get("timeout_seconds", 90)),
-            max_concurrent_requests=int(settings.get("max_concurrent_requests", 4)),
-            provider_json_retries=int(settings.get("provider_json_retries", 2)),
+            reasoning_effort=optional_str(resolved.get("reasoning_effort")) or "none",
+            http_referer=optional_str(resolved.get("http_referer")),
+            title=optional_str(resolved.get("title")) or "MAPF UrbanEV",
+            timeout_seconds=float(resolved.get("timeout_seconds", 90)),
+            max_concurrent_requests=int(resolved.get("max_concurrent_requests", 4)),
+            provider_json_retries=int(resolved.get("provider_json_retries", 2)),
             provider_json_retry_backoff_seconds=float(
-                settings.get("provider_json_retry_backoff_seconds", 1.0)
+                resolved.get("provider_json_retry_backoff_seconds", 1.0)
             ),
         )
 
     @classmethod
-    def default(cls, *, model: str | None = None) -> "AgentConfig":
+    def default(
+        cls,
+        *,
+        model: str | None = None,
+        profile: str = "multi_agent",
+    ) -> "AgentConfig":
         return cls(
             api_key=None,
             base_url="https://openrouter.ai/api/v1",
             model=model or "meta-llama/llama-3.1-8b-instruct",
+            profile=profile,
             title="MAPF UrbanEV",
         )
 
@@ -370,12 +420,22 @@ def normalize_agent_mode(value: str | None) -> str:
     supported = {
         "multi_agent_economist_retry": "multi_agent_economist_retry",
         "multi_agent_full_retry": "multi_agent_full_retry",
+        "multi_agent_discussion_3rounds": "multi_agent_discussion_3rounds",
+        "multi_agent_discussion": "multi_agent_discussion_3rounds",
+        "multi_agent_debate_3rounds": "multi_agent_discussion_3rounds",
+        "multi_agent_communication_3rounds": "multi_agent_discussion_3rounds",
         "single_agent_price_retry": "single_agent_price_retry",
         "single_agent_full_retry": "single_agent_full_retry",
     }
     if normalized in supported:
         return supported[normalized]
     raise ValueError(f"Unsupported agent_mode: {value}")
+
+
+def agent_config_profile(agent_mode: str | None) -> str:
+    """Return the independent provider profile used by a control mode."""
+    normalized = normalize_agent_mode(agent_mode)
+    return "single_agent" if normalized.startswith("single_agent_") else "multi_agent"
 
 
 def optional_int(value: Any) -> int | None:

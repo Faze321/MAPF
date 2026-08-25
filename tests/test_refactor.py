@@ -16,7 +16,7 @@ from dataset_adapter import (
     load_canonical_dataset,
     split_cache_key,
 )
-from config import RunConfig
+from config import AgentConfig, RunConfig, normalize_agent_mode
 from global_forecaster import GlobalForecaster, NativeForecasterArtifact
 from forecasting import chronos_forecast, lstm_forecast, timesfm_forecast
 from main import build_parser
@@ -24,6 +24,7 @@ from prompts import agent_safe_context
 from reporting import write_agent_outputs
 from orchestrator import (
     control_attempt_snapshot,
+    energy_price_with_predicted_windows,
     forecast_output_dir,
     revise_control_reports,
     run_control_loop,
@@ -31,7 +32,14 @@ from orchestrator import (
     run_pipeline,
 )
 from unittest.mock import patch
-from agents import AgentChatClient, agent_call_usage_record, summarize_agent_call_usage
+from agents import (
+    AgentChatClient,
+    agent_call_usage_record,
+    normalize_price_windows,
+    run_zone_chain,
+    summarize_agent_call_usage,
+)
+from time_utils import parse_datetime_24h
 
 
 def workspace_temporary_directory() -> Path:
@@ -41,6 +49,103 @@ def workspace_temporary_directory() -> Path:
 
 
 class OutputPathTests(unittest.TestCase):
+    def test_agent_provider_profiles_are_selected_independently(self):
+        temporary = workspace_temporary_directory()
+        config_path = temporary / "config.yaml"
+        config_path.write_text(
+            """
+agent:
+  multi_agent:
+    api_key: multi-key
+    base_url: https://multi.example/v1
+    model: multi-model
+    timeout_seconds: 31
+    max_concurrent_requests: 3
+  single_agent:
+    api_key: single-key
+    base_url: https://single.example/v1
+    model: single-model
+    timeout_seconds: 47
+    max_concurrent_requests: 1
+""".strip(),
+            encoding="utf-8",
+        )
+
+        multi = AgentConfig.from_file(
+            config_path,
+            agent_mode="multi_agent_discussion_3rounds",
+        )
+        single = AgentConfig.from_file(
+            config_path,
+            agent_mode="single_agent_full_retry",
+        )
+
+        self.assertEqual("multi_agent", multi.profile)
+        self.assertEqual("multi-key", multi.api_key)
+        self.assertEqual("https://multi.example/v1", multi.base_url)
+        self.assertEqual("multi-model", multi.model)
+        self.assertEqual(31, multi.timeout_seconds)
+        self.assertEqual(3, multi.max_concurrent_requests)
+        self.assertEqual("single_agent", single.profile)
+        self.assertEqual("single-key", single.api_key)
+        self.assertEqual("https://single.example/v1", single.base_url)
+        self.assertEqual("single-model", single.model)
+        self.assertEqual(47, single.timeout_seconds)
+        self.assertEqual(1, single.max_concurrent_requests)
+
+    def test_only_active_agent_profile_expands_environment_variables(self):
+        temporary = workspace_temporary_directory()
+        config_path = temporary / "config.yaml"
+        config_path.write_text(
+            """
+agent:
+  multi_agent:
+    api_key: multi-key
+  single_agent:
+    api_key: "${MAPF_TEST_MISSING_SINGLE_AGENT_KEY}"
+""".strip(),
+            encoding="utf-8",
+        )
+
+        multi = AgentConfig.from_file(
+            config_path,
+            agent_mode="multi_agent_economist_retry",
+        )
+        self.assertEqual("multi-key", multi.api_key)
+        with self.assertRaisesRegex(ValueError, "MAPF_TEST_MISSING_SINGLE_AGENT_KEY"):
+            AgentConfig.from_file(
+                config_path,
+                agent_mode="single_agent_price_retry",
+            )
+
+    def test_legacy_flat_agent_config_still_selects_single_model(self):
+        temporary = workspace_temporary_directory()
+        config_path = temporary / "config.yaml"
+        config_path.write_text(
+            """
+agent:
+  api_key: shared-key
+  base_url: https://shared.example/v1
+  model: legacy-multi-model
+  single_agent_model: legacy-single-model
+""".strip(),
+            encoding="utf-8",
+        )
+
+        single = AgentConfig.from_file(
+            config_path,
+            agent_mode="single_agent_price_retry",
+        )
+        overridden = AgentConfig.from_file(
+            config_path,
+            agent_mode="single_agent_price_retry",
+            model="cli-override",
+        )
+        self.assertEqual("shared-key", single.api_key)
+        self.assertEqual("https://shared.example/v1", single.base_url)
+        self.assertEqual("legacy-single-model", single.model)
+        self.assertEqual("cli-override", overridden.model)
+
     def test_config_separates_output_folder_and_experiment_name(self):
         configured = RunConfig.from_mapping(
             {"output_folder": "generated", "experiment_name": "trial_01"}
@@ -51,6 +156,15 @@ class OutputPathTests(unittest.TestCase):
         legacy = RunConfig.from_mapping({"output_dir": "legacy-output"})
         self.assertEqual("legacy-output", legacy.output_folder)
         self.assertIsNone(legacy.experiment_name)
+
+    def test_three_round_discussion_mode_and_aliases_are_supported(self):
+        canonical = "multi_agent_discussion_3rounds"
+        self.assertEqual(canonical, normalize_agent_mode(canonical))
+        self.assertEqual(canonical, normalize_agent_mode("multi-agent-discussion"))
+        self.assertEqual(
+            canonical,
+            normalize_agent_mode("multi_agent_communication_3rounds"),
+        )
 
     def test_parser_separates_output_folder_and_experiment_name(self):
         args = build_parser().parse_args(
@@ -171,6 +285,33 @@ class DatasetCacheTests(unittest.TestCase):
         spec = DatasetSpec(**{**spec.__dict__, "unit_conversions": {"load_kwh": 0.001}})
         canonical = load_canonical_dataset(spec)
         self.assertAlmostEqual(0.001, canonical.timeseries.loc[0, "load_kwh"])
+
+    def test_long_format_adapter_normalizes_24_hour_timestamp(self):
+        temporary = workspace_temporary_directory()
+        dataset = temporary / "dataset"
+        dataset.mkdir()
+        pd.DataFrame(
+            {
+                "timestamp": [
+                    "2022-09-09 23:00:00",
+                    "2022-09-09 24:00:00",
+                ],
+                "zone": ["a", "a"],
+                "load": [1.0, 2.0],
+                "energy_price": [1.0, 1.1],
+            }
+        ).to_csv(dataset / "series.csv", index=False)
+        canonical = load_canonical_dataset(
+            DatasetSpec(
+                path=dataset,
+                adapter="long_format",
+                timeseries_file="series.csv",
+            )
+        )
+        self.assertEqual(
+            pd.Timestamp("2022-09-10 00:00:00"),
+            canonical.timeseries["timestamp"].max(),
+        )
 
 
 class GlobalForecasterTests(unittest.TestCase):
@@ -561,7 +702,7 @@ class ControlOutputTests(unittest.TestCase):
         self.assertTrue((usage_frame["agent_call_count"] == 0).all())
         self.assertTrue(usage_frame["token_usage_complete"].all())
 
-    def test_four_modes_use_expected_retry_chain(self):
+    def test_supported_modes_use_expected_retry_chain(self):
         async def fake_chain(context, **kwargs):
             return {"zone_id": context["zone_id"], "source": "full"}
 
@@ -572,6 +713,7 @@ class ControlOutputTests(unittest.TestCase):
         expected = {
             "multi_agent_economist_retry": (0, 1),
             "multi_agent_full_retry": (1, 0),
+            "multi_agent_discussion_3rounds": (1, 0),
             "single_agent_price_retry": (0, 1),
             "single_agent_full_retry": (1, 0),
         }
@@ -592,6 +734,11 @@ class ControlOutputTests(unittest.TestCase):
                 )
                 self.assertEqual(counts, (chain.call_count, retry.call_count))
                 self.assertEqual("a", result[0][0]["zone_id"])
+                if mode == "multi_agent_discussion_3rounds":
+                    self.assertEqual(
+                        "multi_agent_discussion",
+                        chain.call_args.kwargs["chain_mode"],
+                    )
 
     def test_usage_marks_missing_provider_tokens_incomplete(self):
         complete = agent_call_usage_record(
@@ -617,6 +764,139 @@ class ControlOutputTests(unittest.TestCase):
         self.assertEqual(15, summary["total_tokens"])
         self.assertFalse(summary["token_usage_complete"])
         self.assertFalse(incomplete["token_usage_complete"])
+
+    def test_three_agents_exchange_information_for_three_rounds(self):
+        class FakeDiscussionClient:
+            def __init__(self):
+                self.prompts = []
+
+            async def complete_json(self, prompt, *, temperature):
+                self.prompts.append(prompt)
+                call_index = len(self.prompts) - 1
+                discussion_round = call_index // 3 + 1
+                role_index = call_index % 3
+                usage = {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "total_tokens": 15,
+                    "token_usage_complete": True,
+                }
+                if role_index == 0:
+                    response = {
+                        "reasoning_summary": f"grid round {discussion_round}",
+                        "adjustment_needed": True,
+                        "confidence": "medium",
+                        "message_to_other_agents": (
+                            f"grid message round {discussion_round}"
+                        ),
+                        "window_assessments": [
+                            {
+                                "window_start": "2024-01-01 00:00:00",
+                                "window_end": "2024-01-01 02:00:00",
+                                "predicted_load_kwh": 30.0,
+                                "load_range_position_pct": 85.0,
+                                "grid_stress_level": "High",
+                                "adjustment_needed": True,
+                                "reasoning_summary": "high forecast window",
+                            }
+                        ],
+                    }
+                elif role_index == 1:
+                    response = {
+                        "reasoning_summary": f"behavior round {discussion_round}",
+                        "demand_drivers": ["weather", "occupancy"],
+                        "elasticity_factor": 0.2,
+                        "window_elasticities": [0.2],
+                        "confidence": "medium",
+                        "message_to_other_agents": (
+                            f"behavior message round {discussion_round}"
+                        ),
+                    }
+                else:
+                    response = {
+                        "reasoning_summary": f"economist round {discussion_round}",
+                        "suggested_price_shift_pct": 10.0 + discussion_round,
+                        "action_label": "Raise energy price",
+                        "price_rationale": (
+                            f"shared conclusion round {discussion_round}"
+                        ),
+                        "message_to_other_agents": (
+                            f"economist message round {discussion_round}"
+                        ),
+                        "price_change_windows_3h": [
+                            {
+                                "window_start": "2024-01-01 00:00:00",
+                                "window_end": "2024-01-01 02:00:00",
+                                "suggested_price_shift_pct": 10.0
+                                + discussion_round,
+                                "proposed_energy_price": 1.1
+                                + discussion_round * 0.01,
+                                "action_label": "Raise energy price",
+                                "price_rationale": (
+                                    f"round {discussion_round} joint decision"
+                                ),
+                            }
+                        ],
+                    }
+                response["_agent_completion_usage"] = usage
+                return response
+
+        context = {
+            "zone_id": "a",
+            "category": "test",
+            "forecast_start": "2024-01-01 00:00:00",
+            "forecast_end": "2024-01-01 02:00:00",
+            "forecast_horizon_days": 1,
+            "forecast_total_kwh": 30.0,
+            "forecast_peak_kwh": 12.0,
+            "predicted_change_pct": 5.0,
+            "grid_stress_level": "High",
+            "weather": {"rain_hours": 1},
+            "hourly_shape": {
+                "night_20_6": 10.0,
+                "morning_7_10": 8.0,
+                "evening_17_22": 11.0,
+            },
+            "profile": {"poi_total": 3},
+            "pricing_windows_3h": [
+                {
+                    "window_start": "2024-01-01 00:00:00",
+                    "window_end": "2024-01-01 02:00:00",
+                    "sum_predicted_kwh": 30.0,
+                    "mean_predicted_kwh": 10.0,
+                    "mean_energy_price": 1.0,
+                    "mean_service_price": 0.5,
+                    "load_range_position_pct": 85.0,
+                    "load_stress_level": "High",
+                }
+            ],
+        }
+        client = FakeDiscussionClient()
+        report = asyncio.run(
+            run_zone_chain(
+                context,
+                client=client,
+                chain_mode="multi_agent_discussion",
+            )
+        )
+        self.assertEqual(9, len(client.prompts))
+        self.assertEqual("multi_agent_discussion_3rounds", report["source"])
+        self.assertEqual(3, report["agent_discussion_round_count"])
+        self.assertEqual(3, len(report["agent_discussion_rounds"]))
+        self.assertEqual(9, report["agent_call_count"])
+        self.assertEqual(135, report["agent_total_tokens"])
+        self.assertIn("economist round 1", client.prompts[3])
+        self.assertEqual(
+            "economist round 3",
+            report["economist_reasoning_summary"],
+        )
+        self.assertEqual(
+            [3, 3, 3],
+            [
+                item["agent_usage"]["agent_call_count"]
+                for item in report["agent_discussion_rounds"]
+            ],
+        )
 
     def test_provider_retry_time_usage_is_marked_incomplete(self):
         class FakeCompletions:
@@ -711,6 +991,53 @@ class ControlOutputTests(unittest.TestCase):
             triggered_by_attempt=2,
         )
         self.assertIsNone(third["windows"][0]["price_change_pct_vs_previous"])
+
+    def test_agent_cannot_rewrite_forecaster_window_identity_to_24_hour(self):
+        fallback = [
+            {
+                "window_start": "2022-09-09 21:00:00",
+                "window_end": "2022-09-09 23:00:00",
+                "mean_energy_price": 1.0,
+                "sum_predicted_kwh": 10.0,
+                "load_stress_level": "High",
+            }
+        ]
+        model_output = [
+            {
+                "window_start": "2022-09-09 21:00:00",
+                "window_end": "2022-09-09 24:00:00",
+                "suggested_price_shift_pct": 10.0,
+                "proposed_energy_price": 1.1,
+                "action_label": "Raise energy price",
+                "price_rationale": "high load",
+            }
+        ]
+        normalized = normalize_price_windows(model_output, fallback)
+        self.assertEqual("2022-09-09 23:00:00", normalized[0]["window_end"])
+
+    def test_control_boundary_accepts_external_24_hour_timestamp(self):
+        self.assertEqual(
+            pd.Timestamp("2022-09-10 00:00:00"),
+            parse_datetime_24h("2022-09-09 24:00:00"),
+        )
+        frame = pd.DataFrame(
+            {
+                "time": pd.date_range("2022-09-09 21:00:00", periods=4, freq="h"),
+                "a": [1.0, 1.0, 1.0, 1.0],
+            }
+        )
+        updated = energy_price_with_predicted_windows(
+            frame,
+            "a",
+            [
+                {
+                    "window_start": "2022-09-09 21:00:00",
+                    "window_end": "2022-09-09 24:00:00",
+                    "proposed_energy_price": 2.0,
+                }
+            ],
+        )
+        self.assertEqual([2.0, 2.0, 2.0, 2.0], updated["a"].tolist())
 
     def test_control_loop_accumulates_usage_and_keeps_frozen_window_trace(self):
         window = {

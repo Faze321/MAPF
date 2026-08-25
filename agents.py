@@ -21,6 +21,9 @@ from load_policy import (
 from prompts import (
     SYSTEM_MESSAGE,
     behavior_prompt,
+    discussion_behavior_prompt,
+    discussion_economist_prompt,
+    discussion_grid_prompt,
     economist_prompt,
     grid_prompt,
     price_retry_prompt,
@@ -35,6 +38,7 @@ ECONOMIST_AGENT_OUTPUT_KEY = "_economist_agent_output"
 AGENT_COMPLETION_USAGE_KEY = "_agent_completion_usage"
 MIN_ELASTICITY = 0.05
 MAX_ELASTICITY = 0.7
+MULTI_AGENT_DISCUSSION_ROUNDS = 3
 GRID_STRESS_LEVEL_BY_KEY = {level.lower(): level for level in GRID_STRESS_LEVELS}
 GRID_STRESS_LEVEL_BY_KEY.update(
     {
@@ -98,13 +102,22 @@ class AgentChatClient:
 
     def __post_init__(self) -> None:
         if not self.config.api_key:
-            raise ValueError("agent.api_key is required when dry-run is disabled")
+            raise ValueError(
+                f"agent.{self.config.profile}.api_key is required when dry-run is disabled"
+            )
         if self.config.max_concurrent_requests < 1:
-            raise ValueError("agent.max_concurrent_requests must be at least 1")
+            raise ValueError(
+                f"agent.{self.config.profile}.max_concurrent_requests must be at least 1"
+            )
         if self.config.provider_json_retries < 0:
-            raise ValueError("agent.provider_json_retries cannot be negative")
+            raise ValueError(
+                f"agent.{self.config.profile}.provider_json_retries cannot be negative"
+            )
         if self.config.provider_json_retry_backoff_seconds < 0:
-            raise ValueError("agent.provider_json_retry_backoff_seconds cannot be negative")
+            raise ValueError(
+                f"agent.{self.config.profile}.provider_json_retry_backoff_seconds "
+                "cannot be negative"
+            )
         from openai import AsyncOpenAI
 
         headers = {}
@@ -265,10 +278,21 @@ async def run_zone_chain(
     chain_mode: str = "multi_agent",
 ) -> dict[str, Any]:
     if client is None:
+        if chain_mode == "multi_agent_discussion":
+            return heuristic_discussion_zone_chain(
+                context,
+                source=f"{heuristic_source}_multi_agent_discussion_3rounds",
+            )
         return heuristic_zone_chain(context, source=heuristic_source)
 
     if chain_mode == "single_agent":
         return await run_single_agent_zone_chain(
+            context,
+            client=client,
+            temperature=temperature,
+        )
+    if chain_mode == "multi_agent_discussion":
+        return await run_multi_agent_discussion_zone_chain(
             context,
             client=client,
             temperature=temperature,
@@ -320,6 +344,153 @@ async def run_zone_chain(
         economist_debug=economist_debug,
         agent_call_usage=agent_call_usage,
     )
+
+
+async def run_multi_agent_discussion_zone_chain(
+    context: dict[str, Any],
+    *,
+    client: ChatClient,
+    temperature: float,
+) -> dict[str, Any]:
+    previous_exchange: dict[str, Any] | None = None
+    discussion_rounds: list[dict[str, Any]] = []
+    agent_call_usage: list[dict[str, Any]] = []
+    final_grid: dict[str, Any] = {}
+    final_behavior: dict[str, Any] = {}
+    final_economist: dict[str, Any] = {}
+
+    for discussion_round in range(1, MULTI_AGENT_DISCUSSION_ROUNDS + 1):
+        grid_result = await complete_agent_json(
+            client,
+            discussion_grid_prompt(
+                context,
+                discussion_round=discussion_round,
+                previous_exchange=previous_exchange,
+            ),
+            context=context,
+            temperature=temperature,
+            stage=f"agent.discussion.round_{discussion_round}.grid",
+            agent=f"Grid Analyst Discussion Round {discussion_round}",
+        )
+        grid = merge_grid_fallback(grid_result.content, context)
+
+        behavior_result = await complete_agent_json(
+            client,
+            discussion_behavior_prompt(
+                context,
+                grid,
+                discussion_round=discussion_round,
+                previous_exchange=previous_exchange,
+            ),
+            context=context,
+            temperature=temperature,
+            stage=f"agent.discussion.round_{discussion_round}.behavior",
+            agent=f"Behavioural Agent Discussion Round {discussion_round}",
+        )
+        behavior = merge_behavior_fallback(behavior_result.content, context)
+
+        economist_report, economist_usage = await complete_validated_economist_report(
+            client,
+            context,
+            grid,
+            behavior,
+            temperature=temperature,
+            prompt_override=discussion_economist_prompt(
+                context,
+                grid,
+                behavior,
+                discussion_round=discussion_round,
+                previous_exchange=previous_exchange,
+            ),
+            stage=f"agent.discussion.round_{discussion_round}.economist",
+            agent=f"Market Economist Discussion Round {discussion_round}",
+            repair_stage=(
+                f"agent.discussion.round_{discussion_round}.economist.schema_repair"
+            ),
+            repair_agent=(
+                f"Market Economist Discussion Round {discussion_round} Schema Repair"
+            ),
+        )
+        economist = merge_economist_fallback(economist_report, context)
+        economist_debug = economist_report.get(ECONOMIST_AGENT_OUTPUT_KEY)
+        round_usage = [grid_result.usage, behavior_result.usage, *economist_usage]
+        agent_call_usage.extend(round_usage)
+
+        exchange = discussion_round_record(
+            discussion_round=discussion_round,
+            grid=grid,
+            behavior=behavior,
+            economist=economist,
+            economist_debug=economist_debug,
+            agent_call_usage=round_usage,
+        )
+        discussion_rounds.append(exchange)
+        previous_exchange = discussion_exchange_for_prompt(exchange)
+        final_grid = grid
+        final_behavior = behavior
+        final_economist = economist
+
+    debug = {
+        "zone_id": context.get("zone_id"),
+        "discussion_round_count": MULTI_AGENT_DISCUSSION_ROUNDS,
+        "discussion_rounds": discussion_rounds,
+        "agent_call_usage": agent_call_usage,
+        "agent_usage_summary": summarize_agent_call_usage(agent_call_usage),
+    }
+    report = combine_reports(
+        context,
+        final_grid,
+        final_behavior,
+        final_economist,
+        source="multi_agent_discussion_3rounds",
+        economist_debug=debug,
+        agent_call_usage=agent_call_usage,
+    )
+    report["agent_discussion_round_count"] = MULTI_AGENT_DISCUSSION_ROUNDS
+    report["agent_discussion_rounds"] = discussion_rounds
+    return report
+
+
+def discussion_round_record(
+    *,
+    discussion_round: int,
+    grid: dict[str, Any],
+    behavior: dict[str, Any],
+    economist: dict[str, Any],
+    economist_debug: dict[str, Any] | None,
+    agent_call_usage: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "discussion_round": discussion_round,
+        "grid_output": grid,
+        "behavior_output": behavior,
+        "economist_output": {
+            key: value
+            for key, value in economist.items()
+            if key != ECONOMIST_AGENT_OUTPUT_KEY
+        },
+        "communication_summary": {
+            "grid_message": grid.get("message_to_other_agents")
+            or grid.get("reasoning_summary"),
+            "behavior_message": behavior.get("message_to_other_agents")
+            or behavior.get("reasoning_summary"),
+            "economist_message": economist.get("message_to_other_agents")
+            or economist.get("reasoning_summary")
+            or economist.get("price_rationale"),
+        },
+        "economist_validation": economist_debug,
+        "agent_usage": summarize_agent_call_usage(agent_call_usage),
+    }
+
+
+def discussion_exchange_for_prompt(exchange: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "discussion_round": exchange.get("discussion_round"),
+        "grid_output": exchange.get("grid_output"),
+        "behavior_output": exchange.get("behavior_output"),
+        "economist_output": exchange.get("economist_output"),
+        "communication_summary": exchange.get("communication_summary"),
+    }
 
 
 async def run_single_agent_zone_chain(
@@ -573,15 +744,20 @@ async def complete_validated_economist_report(
     behavior: dict[str, Any],
     *,
     temperature: float,
+    prompt_override: str | None = None,
+    stage: str = "agent.economist",
+    agent: str = "Market Economist",
+    repair_stage: str = "agent.economist_repair",
+    repair_agent: str = "Market Economist Repair",
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     expected_windows = context.get("pricing_windows_3h", [])
     initial_result = await complete_agent_json(
         client,
-        economist_prompt(context, grid, behavior),
+        prompt_override or economist_prompt(context, grid, behavior),
         context=context,
         temperature=temperature,
-        stage="agent.economist",
-        agent="Market Economist",
+        stage=stage,
+        agent=agent,
     )
     report = initial_result.content
     call_usage = [initial_result.usage]
@@ -610,8 +786,8 @@ async def complete_validated_economist_report(
         repair_economist_prompt(context, grid, behavior, report, errors),
         context=context,
         temperature=min(temperature, 0.1),
-        stage="agent.economist_repair",
-        agent="Market Economist Repair",
+        stage=repair_stage,
+        agent=repair_agent,
     )
     repaired = repair_result.content
     call_usage.append(repair_result.usage)
@@ -764,6 +940,54 @@ def heuristic_zone_chain(
     behavior = heuristic_behavior(context)
     economist = heuristic_economist(context, grid)
     return combine_reports(context, grid, behavior, economist, source=source)
+
+
+def heuristic_discussion_zone_chain(
+    context: dict[str, Any],
+    *,
+    source: str,
+) -> dict[str, Any]:
+    discussion_rounds: list[dict[str, Any]] = []
+    final_grid: dict[str, Any] = {}
+    final_behavior: dict[str, Any] = {}
+    final_economist: dict[str, Any] = {}
+    for discussion_round in range(1, MULTI_AGENT_DISCUSSION_ROUNDS + 1):
+        grid = heuristic_grid(context)
+        behavior = heuristic_behavior(context)
+        economist = heuristic_economist(context, grid)
+        grid["message_to_other_agents"] = (
+            f"Dry-run Grid summary for discussion round {discussion_round}."
+        )
+        behavior["message_to_other_agents"] = (
+            f"Dry-run Behaviour summary for discussion round {discussion_round}."
+        )
+        economist["message_to_other_agents"] = (
+            f"Dry-run Economist summary for discussion round {discussion_round}."
+        )
+        discussion_rounds.append(
+            discussion_round_record(
+                discussion_round=discussion_round,
+                grid=grid,
+                behavior=behavior,
+                economist=economist,
+                economist_debug=None,
+                agent_call_usage=[],
+            )
+        )
+        final_grid = grid
+        final_behavior = behavior
+        final_economist = economist
+    report = combine_reports(
+        context,
+        final_grid,
+        final_behavior,
+        final_economist,
+        source=source,
+        agent_call_usage=[],
+    )
+    report["agent_discussion_round_count"] = MULTI_AGENT_DISCUSSION_ROUNDS
+    report["agent_discussion_rounds"] = discussion_rounds
+    return report
 
 
 def heuristic_grid(context: dict[str, Any]) -> dict[str, Any]:
@@ -1162,8 +1386,11 @@ def normalize_price_windows(value: Any, fallback_windows: list[dict[str, Any]]) 
         shift = as_float(item.get("suggested_price_shift_pct"), 0)
         normalized.append(
             {
-                "window_start": item.get("window_start") or fallback.get("window_start"),
-                "window_end": item.get("window_end") or fallback.get("window_end"),
+                # Window identity is owned by the forecaster context. A model may
+                # restate midnight as "24:00:00" or otherwise alter an identifier;
+                # never let generated text change the time range being priced.
+                "window_start": fallback.get("window_start"),
+                "window_end": fallback.get("window_end"),
                 "hours": fallback.get("hours"),
                 "price_conditioned_baseline_load_kwh": first_present(
                     item.get("price_conditioned_baseline_load_kwh"),

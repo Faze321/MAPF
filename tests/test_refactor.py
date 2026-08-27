@@ -893,6 +893,14 @@ class ControlOutputTests(unittest.TestCase):
         self.assertEqual(9, report["agent_call_count"])
         self.assertEqual(135, report["agent_total_tokens"])
         self.assertIn("economist round 1", client.prompts[3])
+        for prompt_index in (3, 6):
+            compact_prompt = client.prompts[prompt_index]
+            self.assertIn('"conclusion_summary"', compact_prompt)
+            self.assertIn('"disagreements"', compact_prompt)
+            self.assertIn('"key_decisions"', compact_prompt)
+            self.assertNotIn('"grid_output"', compact_prompt)
+            self.assertNotIn('"behavior_output"', compact_prompt)
+            self.assertNotIn('"economist_output"', compact_prompt)
         self.assertEqual(
             "economist round 3",
             report["economist_reasoning_summary"],
@@ -911,6 +919,14 @@ class ControlOutputTests(unittest.TestCase):
                 len(item["agent_call_usage"]) == 3
                 for item in report["agent_discussion_rounds"]
             )
+        )
+        self.assertEqual(
+            {"conclusion_summary", "disagreements", "key_decisions"},
+            set(
+                report["agent_discussion_rounds"][0][
+                    "next_round_handoff"
+                ]
+            ),
         )
 
     def test_discussion_stops_after_equal_first_and_second_decisions(self):

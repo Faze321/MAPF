@@ -438,13 +438,16 @@ async def run_multi_agent_discussion_zone_chain(
         exchange["matches_previous_round"] = matches_previous_round
         discussion_rounds.append(exchange)
         previous_exchange = discussion_exchange_for_prompt(exchange)
+        exchange["next_round_handoff"] = previous_exchange
         previous_decision_signature = decision_signature
         final_grid = grid
         final_behavior = behavior
         final_economist = economist
-        if discussion_round == 2 and matches_previous_round:
+        if discussion_round >= 2 and matches_previous_round:
             discussion_converged = True
-            discussion_stop_reason = "round_2_matches_round_1"
+            discussion_stop_reason = (
+                f"round_{discussion_round}_matches_round_{discussion_round - 1}"
+            )
             break
 
     actual_round_count = len(discussion_rounds)
@@ -509,13 +512,97 @@ def discussion_round_record(
 
 
 def discussion_exchange_for_prompt(exchange: dict[str, Any]) -> dict[str, Any]:
+    grid = exchange.get("grid_output")
+    grid = grid if isinstance(grid, dict) else {}
+    behavior = exchange.get("behavior_output")
+    behavior = behavior if isinstance(behavior, dict) else {}
+    economist = exchange.get("economist_output")
+    economist = economist if isinstance(economist, dict) else {}
+    communication = exchange.get("communication_summary")
+    communication = communication if isinstance(communication, dict) else {}
     return {
-        "discussion_round": exchange.get("discussion_round"),
-        "grid_output": exchange.get("grid_output"),
-        "behavior_output": exchange.get("behavior_output"),
-        "economist_output": exchange.get("economist_output"),
-        "communication_summary": exchange.get("communication_summary"),
+        "conclusion_summary": {
+            "grid": grid.get("reasoning_summary")
+            or grid.get("forecast_summary")
+            or communication.get("grid_message"),
+            "behavior": behavior.get("reasoning_summary")
+            or communication.get("behavior_message"),
+            "economist": economist.get("reasoning_summary")
+            or economist.get("price_rationale")
+            or communication.get("economist_message"),
+        },
+        "disagreements": {
+            "grid": compact_discussion_list(grid.get("disagreements")),
+            "behavior": compact_discussion_list(behavior.get("disagreements")),
+            "economist": compact_discussion_list(
+                economist.get("disagreements")
+            ),
+        },
+        "key_decisions": discussion_key_decisions(grid, behavior, economist),
     }
+
+
+def discussion_key_decisions(
+    grid: dict[str, Any],
+    behavior: dict[str, Any],
+    economist: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "grid": {
+            "adjustment_needed": grid.get("adjustment_needed"),
+            "grid_stress_level": grid.get("grid_stress_level"),
+            "confidence": grid.get("confidence"),
+            "window_assessments": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "window_start",
+                        "window_end",
+                        "predicted_load_kwh",
+                        "load_range_position_pct",
+                        "grid_stress_level",
+                        "adjustment_needed",
+                    )
+                    if key in item
+                }
+                for item in grid.get("window_assessments") or []
+                if isinstance(item, dict)
+            ],
+        },
+        "behavior": {
+            "demand_drivers": behavior.get("demand_drivers"),
+            "elasticity_factor": behavior.get("elasticity_factor"),
+            "window_elasticities": behavior.get("window_elasticities"),
+            "confidence": behavior.get("confidence"),
+        },
+        "economist": {
+            "suggested_price_shift_pct": economist.get(
+                "suggested_price_shift_pct"
+            ),
+            "action_label": economist.get("action_label"),
+            "price_change_windows_3h": [
+                {
+                    key: item.get(key)
+                    for key in (
+                        "window_start",
+                        "window_end",
+                        "suggested_price_shift_pct",
+                        "proposed_energy_price",
+                        "action_label",
+                    )
+                    if key in item
+                }
+                for item in economist.get("price_change_windows_3h") or []
+                if isinstance(item, dict)
+            ],
+        },
+    }
+
+
+def compact_discussion_list(value: Any) -> list[Any]:
+    if value in (None, ""):
+        return []
+    return value if isinstance(value, list) else [value]
 
 
 def discussion_decision_signature(
@@ -525,57 +612,14 @@ def discussion_decision_signature(
 ) -> str:
     """Compare substantive decisions while ignoring free-form explanation text."""
 
-    grid_windows = [
-        {
-            key: item.get(key)
-            for key in (
-                "window_start",
-                "window_end",
-                "predicted_load_kwh",
-                "load_range_position_pct",
-                "grid_stress_level",
-                "adjustment_needed",
-            )
-            if key in item
-        }
-        for item in grid.get("window_assessments") or []
-        if isinstance(item, dict)
-    ]
-    price_windows = [
-        {
-            key: item.get(key)
-            for key in (
-                "window_start",
-                "window_end",
-                "suggested_price_shift_pct",
-                "proposed_energy_price",
-                "action_label",
-            )
-            if key in item
-        }
-        for item in economist.get("price_change_windows_3h") or []
-        if isinstance(item, dict)
-    ]
-    decision = {
-        "grid": {
-            "adjustment_needed": grid.get("adjustment_needed"),
-            "grid_stress_level": grid.get("grid_stress_level"),
-            "window_assessments": grid_windows,
-        },
-        "behavior": {
-            "elasticity_factor": behavior.get("elasticity_factor"),
-            "window_elasticities": behavior.get("window_elasticities"),
-        },
-        "economist": {
-            "suggested_price_shift_pct": economist.get(
-                "suggested_price_shift_pct"
-            ),
-            "action_label": economist.get("action_label"),
-            "price_change_windows_3h": price_windows,
-        },
-    }
+    key_decisions = discussion_key_decisions(grid, behavior, economist)
+    # Confidence and descriptive demand-driver labels do not change the control
+    # result; convergence is based on stress, elasticity, and price decisions.
+    key_decisions["grid"].pop("confidence", None)
+    key_decisions["behavior"].pop("confidence", None)
+    key_decisions["behavior"].pop("demand_drivers", None)
     return json.dumps(
-        canonical_discussion_decision(decision),
+        canonical_discussion_decision(key_decisions),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
@@ -1091,9 +1135,13 @@ def heuristic_discussion_zone_chain(
         final_grid = grid
         final_behavior = behavior
         final_economist = economist
-        if discussion_round == 2 and matches_previous_round:
+        previous_exchange = discussion_exchange_for_prompt(exchange)
+        exchange["next_round_handoff"] = previous_exchange
+        if discussion_round >= 2 and matches_previous_round:
             discussion_converged = True
-            discussion_stop_reason = "round_2_matches_round_1"
+            discussion_stop_reason = (
+                f"round_{discussion_round}_matches_round_{discussion_round - 1}"
+            )
             break
     report = combine_reports(
         context,

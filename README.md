@@ -113,7 +113,7 @@ Supported control modes are:
 
 - `multi_agent_economist_retry`: Grid → Behaviour → Economist initially; only Economist revises failed windows.
 - `multi_agent_full_retry`: reruns all three Agents with the latest reforecast context.
-- `multi_agent_discussion_3rounds`: runs up to three internal Grid/Behaviour/Economist discussion rounds for every price proposal. Rounds 2 and 3 receive the previous structured exchange. If the substantive Grid, Behaviour, and Economist decisions in round 2 match round 1, the discussion converges immediately and round 3 is skipped. A failed outer control attempt starts a fresh discussion with the latest reforecast context.
+- `multi_agent_discussion_3rounds`: runs up to three internal Grid/Behaviour/Economist discussion rounds for every price proposal. Rounds 2 and 3 receive only the previous round's conclusion summaries, disagreements, and compact key decisions; full prior Agent outputs are not repeated. If a new round's substantive stress, elasticity, and pricing decisions match the preceding round, the discussion stops immediately. A failed outer control attempt starts a fresh discussion with the latest reforecast context.
 - `single_agent_price_retry`: one Agent performs all roles; failure retries revise prices only.
 - `single_agent_full_retry`: one Agent fully re-evaluates the updated context on failure.
 

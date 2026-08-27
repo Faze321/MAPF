@@ -217,7 +217,11 @@ def collaborative_round_instruction(
         no-leakage forecast context. Return structured reasoning summaries only, never
         hidden chain-of-thought.
 
-        Previous round exchange:\n{json.dumps(previous, ensure_ascii=False)}"""
+        Previous round compact handoff contains only conclusion_summary,
+        disagreements, and key_decisions. Full prior Agent outputs are intentionally
+        omitted; do not ask for or reconstruct them.
+
+        Previous round compact handoff:\n{json.dumps(previous, ensure_ascii=False)}"""
     )
 
 

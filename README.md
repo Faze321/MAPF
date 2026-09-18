@@ -153,10 +153,51 @@ Experiment matrices additionally aggregate these records into `experiment_agent_
 
 The run is `success` only when every selected Zone and every 3-hour window is `Medium`; otherwise the third proposal produces `fail` with the final summaries and reforecast state.
 
+## Offline result analysis
+
+`evaluate.py` reads existing outputs independently of forecasting and control.
+It supports a single run or recursively scans an experiment matrix:
+
+```powershell
+python evaluate.py --input output/my_experiment
+python evaluate.py --input output/my_experiment --section forecaster
+python evaluate.py --input output/my_experiment --section agent --output output/my_analysis
+```
+
+The default destination is `<input>/analysis/`. `evaluation.json` includes metric
+definitions, coverage, per-run/Zone/window details, and the optional LLM analysis.
+CSV tables are `forecaster_global_metrics.csv`, `forecaster_run_metrics.csv`,
+`agent_summary.csv`, and `agent_run_metrics.csv` (only populated sections are written).
+
+Forecaster MAE, RMSE, RAE, MAPE and WAPE are calculated from pooled hourly samples
+across all Zones, not averaged from Zone metrics. Global comparisons are grouped
+by model and diurnal blend; identical forecast samples copied across Agent modes
+are deduplicated using dataset/forecast provenance. MAPE and WAPE use percentages
+(`MAPE_pct`, `WAPE_pct`); RAE is a ratio using the pooled actual mean. Non-finite
+pairs are excluded with coverage counts, zero actuals are excluded from MAPE,
+and undefined denominators produce null.
+
+Agent tables report first-proposal and final success counts/rates at run, Zone,
+and 3-hour-window levels, plus retained/gained/lost/never-success transitions.
+Success uses the recorded control outcome after reforecast, not observed demand.
+Missing first-round observations remain unknown. Calls and proposal rounds are
+separate: averages include failed runs and frozen Zones. Prompt/completion/total
+tokens are available per run, Zone and call; incomplete provider usage exposes
+known totals but leaves full totals and averages null. Global resource totals
+are counted once from `agent_cumulative_usage`.
+
+For future LLM review, pass `analyzer=callback` to `evaluate_agent` or
+`evaluate_directory`, or use `--agent-analyzer my_module:analyze`. The callable
+receives an independent dictionary with `control_result` and
+`quantitative_analysis`, and returns a JSON-serializable dictionary. By default,
+the hook is `not_configured` and makes no model calls. Its output is stored only
+in the evaluation report and must not enter control Agent context.
+
 ## Tests
 
 ```powershell
 python -B -m unittest tests.test_refactor -v
+python -B -m unittest discover -s tests -p test_evaluate.py -v
 ```
 
 The refactor tests cover cache hit/invalidation/recovery, dataset-local cache layout, fixed-origin cross-Zone artifacts, artifact round-trip and price-scenario reuse, Agent no-leakage filtering, step/attempt/global token accounting, discussion convergence, frozen/revised price trajectories, and versioned authoritative output.

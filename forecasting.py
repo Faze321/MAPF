@@ -1867,16 +1867,16 @@ def summarize_occupancy(occupancy: pd.DataFrame, zone_id: str, start: pd.Timesta
     }
 
 
-def summarize_weather(weather: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> dict[str, float | int]:
+def summarize_weather(weather: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp) -> dict[str, float | int | None]:
     frame = weather[(weather["time"] >= start) & (weather["time"] <= end)]
-    if frame.empty:
-        return {"mean_temp_c": 0.0, "mean_humidity": 0.0, "rain_hours": 0, "total_rain": 0.0}
-    return {
-        "mean_temp_c": round(float(frame["T"].mean()), 2),
-        "mean_humidity": round(float(frame["U"].mean()), 2),
-        "rain_hours": int((frame["nRAIN"] > 0).sum()),
-        "total_rain": round(float(frame["nRAIN"].sum()), 2),
-    }
+    result = {"mean_temp_c": None, "mean_humidity": None, "rain_hours": None, "total_rain": None}
+    for column, key in (("T", "mean_temp_c"), ("U", "mean_humidity")):
+        if column in frame and frame[column].notna().any():
+            result[key] = round(float(frame[column].mean()), 2)
+    if "nRAIN" in frame and frame["nRAIN"].notna().any():
+        result["rain_hours"] = int((frame["nRAIN"] > 0).sum())
+        result["total_rain"] = round(float(frame["nRAIN"].sum()), 2)
+    return result
 
 
 def daily_totals(frame: pd.DataFrame, value_col: str) -> list[dict[str, Any]]:

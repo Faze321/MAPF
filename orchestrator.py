@@ -32,7 +32,7 @@ from data_loader import (
     build_zone_profiles_from_canonical,
     load_pipeline_data,
 )
-from dataset_adapter import DatasetSpec, load_canonical_dataset, split_cache_key
+from dataset_adapter import DatasetSpec, load_canonical_dataset, split_cache_key, validate_forecaster_dataset_source
 from forecasting import ForecastResult, forecast_zone
 from global_forecaster import NATIVE_ARTIFACT_SCHEMA_VERSION, NativeForecasterArtifact
 from load_policy import (
@@ -314,6 +314,7 @@ def run_pipeline(
         forecast_parameters = bundle.forecast_parameters
         forecast_model = str(forecast_parameters["forecast_model"])
         source = bundle.manifest.get("data_source") or {}
+        validate_forecaster_dataset_source(dataset_spec, source)
         recorded_data_dir = source.get("data_dir")
         if recorded_data_dir:
             data_dir = Path(str(recorded_data_dir))
@@ -379,6 +380,8 @@ def run_pipeline(
     )
     if pipeline_stage != "agent":
         requested_zone_ids = normalize_zone_ids(zone_ids)
+        if not requested_zone_ids and (len(profiles) < 5 or "station_type" in profiles):
+            requested_zone_ids = profiles["zone_id"].astype(str).tolist()
         try:
             selected_zones = (
                 select_requested_zones(profiles, requested_zone_ids)
@@ -1477,6 +1480,8 @@ def select_representative_zone_ids(profiles: pd.DataFrame, *, count: int) -> lis
         raise ValueError("Cannot select representative zones from an empty profile table.")
     frame["zone_id"] = frame["zone_id"].astype(str)
     target = max(1, min(int(count), len(frame)))
+    if len(frame) < 5 or "station_type" in frame:
+        return frame.sort_values("zone_id")["zone_id"].head(target).tolist()
     selected: list[str] = []
     seen: set[str] = set()
 
@@ -3261,7 +3266,7 @@ def select_requested_zones(profiles: pd.DataFrame, zone_ids: Iterable[str]) -> p
         )
 
     selected = frame.set_index("zone_id", drop=False).loc[requested].reset_index(drop=True)
-    selected.insert(0, "category", "User-selected")
+    selected.insert(0, "category", selected["station_type"] if "station_type" in selected else "User-selected")
     selected.insert(2, "selection_score", None)
     selected.insert(3, "selection_reason", "User-specified zone for direct validation.")
 

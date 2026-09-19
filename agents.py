@@ -1225,7 +1225,7 @@ def heuristic_behavior(context: dict[str, Any]) -> dict[str, Any]:
         drivers.append(f"{change:+.1f}% load change versus comparable history")
     else:
         drivers.append("stable total load versus comparable history")
-    if weather["rain_hours"] > 0:
+    if (weather.get("rain_hours") or 0) > 0:
         drivers.append(f"{weather['rain_hours']} rainy hours")
     if shape["night_20_6"] >= shape["morning_7_10"]:
         drivers.append("night plateau")

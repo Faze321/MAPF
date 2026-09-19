@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import sys
 from pathlib import Path
 
@@ -15,20 +16,25 @@ from config import (
     normalize_string_list,
 )
 from dataset_adapter import DatasetSpec
+from dataset_profiles import apply_dataset_profile, output_lock, scoped_output
 from orchestrator import format_failure_message, run_experiment_matrix, run_pipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python main.py",
-        description="Run Multi-Agent Prescriptive Forecasting on UrbanEV data.",
+        description="Run Multi-Agent Prescriptive Forecasting on EV charging datasets.",
     )
     parser.add_argument("--config", default="config.yaml", help="YAML config file for run and model settings.")
+    parser.add_argument("--dataset", choices=["urbanev", "charged", "mp_evdata", "mp-evdata"], help="Select isolated dataset defaults and outputs; overrides data-specific settings of the base config.")
+    parser.add_argument("--city", choices=["AMS", "JHB", "LOA", "MEL", "SPO", "SZH"], help="CHARGED city (default JHB).")
+    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], help="Device override for LSTM and Chronos.")
+    parser.add_argument("--lstm-epochs", type=int, help="Override LSTM training epochs.")
     parser.add_argument("--data-dir", default=None, help="Directory containing UrbanEV CSV files.")
     parser.add_argument(
         "--dataset-adapter",
         default=None,
-        help="Dataset adapter: urbanev or long_format.",
+        help="Dataset adapter: urbanev, charged, mp_evdata or long_format. Use --dataset for date/path defaults.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -183,6 +189,18 @@ def main(argv: list[str] | None = None):
     app_config = AppConfig.from_file(config_path, required=False, load_agent=False)
     run_config = app_config.run
     data_config = app_config.data
+    if args.dataset:
+        run_config, data_config = apply_dataset_profile(run_config, data_config, args.dataset, args.city, config_path)
+        if args.dataset_adapter and args.dataset_adapter.replace("-", "_") != data_config.adapter:
+            raise ValueError("--dataset-adapter conflicts with --dataset")
+    elif args.city:
+        raise ValueError("--city requires --dataset charged")
+    if args.device:
+        run_config = replace(run_config, lstm_device=args.device, chronos_device=args.device)
+    if args.lstm_epochs is not None:
+        if args.lstm_epochs < 1:
+            raise ValueError("--lstm-epochs must be positive")
+        run_config = replace(run_config, lstm_epochs=args.lstm_epochs)
     pipeline_stage = normalize_pipeline_stage(
         args.pipeline_stage if args.pipeline_stage is not None else run_config.pipeline_stage
     )
@@ -282,7 +300,8 @@ def main(argv: list[str] | None = None):
         "data_dir": resolved_data_dir,
         "dataset_spec": dataset_spec,
         "cache_dir": dataset_spec.resolved_cache_dir,
-        "output_dir": Path(args.output_folder or run_config.output_folder),
+        "output_dir": scoped_output(Path(args.output_folder or run_config.output_folder), dataset_spec.adapter,
+                                    resolved_data_dir, explicit_dataset=bool(args.dataset)),
         "config_path": config_path,
         "model": args.model,
         "weather_file": args.weather_file or run_config.weather_file,
@@ -340,24 +359,25 @@ def main(argv: list[str] | None = None):
         common_kwargs["chronos_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
         common_kwargs["lstm_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
 
-    if run_matrix:
-        if not forecast_starts:
-            raise ValueError("Experiment matrix requires at least one forecast start.")
-        outputs = run_experiment_matrix(
-            experiment_name=experiment_name,
-            forecast_starts=forecast_starts,
-            forecast_models=forecast_models,
-            experiment_seeds=experiment_seeds,
-            agent_modes=agent_modes,
-            diurnal_blend_alphas=diurnal_blend_alphas,
-            **common_kwargs,
-        )
-    else:
-        outputs = run_pipeline(
-            forecast_start=forecast_starts[0] if forecast_starts else None,
-            forecast_model=forecast_models[0],
-            **common_kwargs,
-        )
+    with output_lock(Path(agent_output_dir) if agent_output_dir else common_kwargs["output_dir"]):
+        if run_matrix:
+            if not forecast_starts:
+                raise ValueError("Experiment matrix requires at least one forecast start.")
+            outputs = run_experiment_matrix(
+                experiment_name=experiment_name,
+                forecast_starts=forecast_starts,
+                forecast_models=forecast_models,
+                experiment_seeds=experiment_seeds,
+                agent_modes=agent_modes,
+                diurnal_blend_alphas=diurnal_blend_alphas,
+                **common_kwargs,
+            )
+        else:
+            outputs = run_pipeline(
+                forecast_start=forecast_starts[0] if forecast_starts else None,
+                forecast_model=forecast_models[0],
+                **common_kwargs,
+            )
     print("Generated outputs:")
     for name, path in outputs.items():
         print(f"- {name}: {path}")

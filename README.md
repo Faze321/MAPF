@@ -18,6 +18,13 @@ The load-policy bands use the position within each Zone's pre-origin historical 
 
 ## Dataset adapters and cache
 
+UrbanEV, CHARGED (six separate cities), and MP-EVData are supported. Use
+`--dataset urbanev`, `--dataset charged --city JHB`, or `--dataset mp_evdata`
+to switch dataset paths, forecast dates and isolated output namespaces.
+`python train_datasets.py --datasets urbanev charged:JHB mp_evdata --models lstm --max-workers 3 --device cpu`
+trains them in separate processes with individual logs and unique batch output.
+See [dataset setup, filtering rules and parallel training](docs/datasets.md).
+
 UrbanEV is the default adapter. A generic long-format dataset can be configured with explicit semantic mappings:
 
 ```yaml

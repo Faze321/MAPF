@@ -284,8 +284,8 @@ class NativeForecasterArtifact:
         if "time" not in known_future:
             raise ValueError("Reusable forecaster artifact has no future timestamps.")
 
-        price_by_time = scenario_price_series(energy_price_schedule, self.zone)
         timestamps = pd.DatetimeIndex(pd.to_datetime(known_future["time"]))
+        price_by_time = scenario_price_series(energy_price_schedule, self.zone, timestamps=timestamps)
         scenario_prices = price_by_time.reindex(timestamps)
         if scenario_prices.isna().any():
             missing = timestamps[scenario_prices.isna()]
@@ -463,7 +463,7 @@ def json_safe_value(value: Any) -> Any:
     return value
 
 
-def scenario_price_series(schedule: pd.DataFrame, zone: str) -> pd.Series:
+def scenario_price_series(schedule: pd.DataFrame, zone: str, *, timestamps: pd.DatetimeIndex | None = None) -> pd.Series:
     if not isinstance(schedule, pd.DataFrame):
         raise TypeError("Energy-price schedule must be a pandas DataFrame.")
     frame = schedule.copy()
@@ -472,6 +472,10 @@ def scenario_price_series(schedule: pd.DataFrame, zone: str) -> pd.Series:
     if "timestamp" not in frame:
         raise ValueError("Energy-price schedule has no timestamp column.")
     frame["timestamp"] = pd.to_datetime(frame["timestamp"], errors="raise")
+    if timestamps is not None:
+        # Sites can begin operation on different dates. Only the forecast-period
+        # schedule is needed for inference; unavailable pre-opening tariffs are not errors.
+        frame = frame[frame["timestamp"].isin(timestamps)]
     if zone in frame:
         values = frame[["timestamp", zone]].rename(columns={zone: "energy_price"})
     else:
@@ -491,7 +495,7 @@ def scenario_price_series(schedule: pd.DataFrame, zone: str) -> pd.Series:
     if values["timestamp"].duplicated().any():
         raise ValueError(f"Energy-price schedule has duplicate timestamps for zone {zone}.")
     numeric = pd.to_numeric(values["energy_price"], errors="coerce")
-    if numeric.isna().any():
+    if not np.isfinite(numeric).all():
         raise ValueError(f"Energy-price schedule contains non-numeric values for zone {zone}.")
     return pd.Series(
         numeric.to_numpy(dtype=np.float64),

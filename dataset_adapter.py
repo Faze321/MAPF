@@ -515,11 +515,31 @@ def adapter_for_spec(spec: DatasetSpec) -> DatasetAdapter:
         return UrbanEVDatasetAdapter()
     if normalized in {"long", "long_format", "generic"}:
         return LongFormatDatasetAdapter()
+    if normalized == "charged":
+        from extra_dataset_adapters import ChargedDatasetAdapter
+        return ChargedDatasetAdapter()
+    if normalized in {"mp_evdata", "mpevdata"}:
+        from extra_dataset_adapters import MPEVDataDatasetAdapter
+        return MPEVDataDatasetAdapter()
     raise ValueError(f"Unsupported dataset adapter: {spec.adapter}")
 
 
 def load_canonical_dataset(spec: DatasetSpec, *, force_cache: bool = False) -> CanonicalDataset:
     return adapter_for_spec(spec).load(spec, force_cache=force_cache)
+
+
+def validate_forecaster_dataset_source(spec: DatasetSpec, source: dict[str, Any]) -> None:
+    """Reject a handoff from a different adapter or native dataset/city directory."""
+    recorded_adapter = source.get("adapter")
+    if not recorded_adapter:
+        return  # Legacy manifests did not store adapter identity.
+    actual = adapter_for_spec(spec).name
+    recorded = adapter_for_spec(DatasetSpec(path=spec.path, adapter=str(recorded_adapter))).name
+    if actual != recorded:
+        raise ValueError(f"Forecaster belongs to adapter {recorded}, not {actual}; select the matching --dataset")
+    recorded_path = source.get("data_dir")
+    if actual in {"charged", "mp_evdata"} and recorded_path and Path(recorded_path).resolve() != spec.path.resolve():
+        raise ValueError("Forecaster belongs to a different dataset directory/city; select the matching --city or --data-dir")
 
 
 def read_wide_matrix(path: Path, value_name: str) -> pd.DataFrame:
@@ -726,7 +746,8 @@ def load_cached_dataset(
             return None
         if feature_manifest.get("dataset_fingerprint") != fingerprint:
             return None
-        timeseries = pd.read_csv(artifacts["canonical_timeseries"], parse_dates=[CANONICAL_TIME_COLUMN])
+        timeseries = pd.read_csv(artifacts["canonical_timeseries"], parse_dates=[CANONICAL_TIME_COLUMN],
+                                 dtype={CANONICAL_ZONE_COLUMN: str})
         static = pd.read_csv(
             artifacts["static_zone_features"],
             dtype={CANONICAL_ZONE_COLUMN: str},

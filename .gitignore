@@ -20,6 +20,8 @@ tmp/
 # Dataset-derived, reproducible feature caches.
 /data/cache/
 /data/**/cache/
+/data/CHARGED/
+/data/MP-EVData/
 
 output/
 outputs/

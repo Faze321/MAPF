@@ -1,2 +1,0 @@
-city,country,abbreviation,total_chargers,total_sites,DBSCAN_eps,total_duration,total_volume,avg_power
-SaoPaulo,Brazil,SPO,43,41,34.96669500667566,82869.69974872666,1330621.852850722,14.16290249605203

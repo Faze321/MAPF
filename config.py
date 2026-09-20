@@ -2,10 +2,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 import re
 import os
 import yaml
+
+BACKEND_PARAMETER_NAMES = (
+    "timesfm_repo",
+    "timesfm_context_hours",
+    "timesfm_step_horizon",
+    "timesfm_exog_cols",
+    "timesfm_diurnal_blend_alpha",
+    "timesfm_roll_actuals",
+    "ar_diurnal_blend_alpha",
+    "chronos_repo",
+    "chronos_context_hours",
+    "chronos_step_horizon",
+    "chronos_diurnal_blend_alpha",
+    "chronos_device",
+    "chronos_roll_actuals",
+    "lstm_context_hours",
+    "lstm_step_horizon",
+    "lstm_exog_cols",
+    "lstm_hidden_size",
+    "lstm_num_layers",
+    "lstm_epochs",
+    "lstm_learning_rate",
+    "lstm_batch_size",
+    "lstm_diurnal_blend_alpha",
+    "lstm_device",
+    "lstm_roll_actuals",
+    "lstm_seed",
+)
 
 PIPELINE_STAGES = {"full", "forecaster", "agent"}
 
@@ -138,31 +166,41 @@ class RunConfig:
         experiment_seeds = normalize_int_list(settings.get("experiment_seeds"))
         agent_modes = normalize_agent_mode_list(settings.get("agent_modes"))
         diurnal_blend_alphas = normalize_float_list(settings.get("diurnal_blend_alphas"))
-        horizon_days = optional_int(settings.get("horizon_days"))
-        history_days = optional_int(settings.get("history_days"))
-        validation_days = optional_int(settings.get("validation_days"))
-        experiment_zone_count = optional_int(settings.get("experiment_zone_count"))
         diurnal_blend_alpha = optional_float(settings.get("diurnal_blend_alpha"))
-        timesfm_context_hours = optional_int(settings.get("timesfm_context_hours"))
-        timesfm_step_horizon = optional_int(settings.get("timesfm_step_horizon"))
-        timesfm_diurnal_blend_alpha = optional_float(
-            settings.get("timesfm_diurnal_blend_alpha")
-        )
-        ar_diurnal_blend_alpha = optional_float(settings.get("ar_diurnal_blend_alpha"))
-        chronos_context_hours = optional_int(settings.get("chronos_context_hours"))
-        chronos_step_horizon = optional_int(settings.get("chronos_step_horizon"))
-        chronos_diurnal_blend_alpha = optional_float(settings.get("chronos_diurnal_blend_alpha"))
-        lstm_context_hours = optional_int(settings.get("lstm_context_hours"))
-        lstm_step_horizon = optional_int(settings.get("lstm_step_horizon"))
-        lstm_hidden_size = optional_int(settings.get("lstm_hidden_size"))
-        lstm_num_layers = optional_int(settings.get("lstm_num_layers"))
-        lstm_epochs = optional_int(settings.get("lstm_epochs"))
-        lstm_learning_rate = optional_float(settings.get("lstm_learning_rate"))
-        lstm_batch_size = optional_int(settings.get("lstm_batch_size"))
-        lstm_diurnal_blend_alpha = optional_float(settings.get("lstm_diurnal_blend_alpha"))
-        lstm_seed = optional_int(settings.get("lstm_seed"))
-        temperature = optional_float(settings.get("temperature"))
+        defaults = cls()
+        numeric_settings = {}
+        for convert, names in (
+            (optional_int, (
+                "horizon_days",
+                "history_days",
+                "validation_days",
+                "experiment_zone_count",
+                "timesfm_context_hours",
+                "timesfm_step_horizon",
+                "chronos_context_hours",
+                "chronos_step_horizon",
+                "lstm_context_hours",
+                "lstm_step_horizon",
+                "lstm_hidden_size",
+                "lstm_num_layers",
+                "lstm_epochs",
+                "lstm_batch_size",
+                "lstm_seed",
+            )),
+            (optional_float, (
+                "timesfm_diurnal_blend_alpha",
+                "ar_diurnal_blend_alpha",
+                "chronos_diurnal_blend_alpha",
+                "lstm_learning_rate",
+                "lstm_diurnal_blend_alpha",
+                "temperature",
+            )),
+        ):
+            for name in names:
+                value = convert(settings.get(name))
+                numeric_settings[name] = getattr(defaults, name) if value is None else value
         return cls(
+            **numeric_settings,
             data_dir=normalize_data_dirs(settings.get("data_dir")),
             max_parallel_datasets=positive_integer(settings.get("max_parallel_datasets", 2), "run.max_parallel_datasets"),
             output_dir=(
@@ -180,11 +218,7 @@ class RunConfig:
             precomputed_window_data=optional_str(settings.get("precomputed_window_data")),
             max_poi_rows=optional_int(settings.get("max_poi_rows")),
             forecast_start=optional_str(settings.get("forecast_start")),
-            horizon_days=horizon_days if horizon_days is not None else 4,
-            history_days=history_days if history_days is not None else 7,
-            validation_days=validation_days if validation_days is not None else 1,
             zone_ids=normalize_zone_id_list(zone_ids),
-            experiment_zone_count=experiment_zone_count if experiment_zone_count is not None else 12,
             forecast_model=normalize_forecast_model_name(optional_str(settings.get("forecast_model"))),
             forecast_starts=forecast_starts,
             forecast_models=forecast_models,
@@ -195,35 +229,14 @@ class RunConfig:
             diurnal_blend_alphas=diurnal_blend_alphas,
             timesfm_repo=optional_str(settings.get("timesfm_repo"))
             or "google/timesfm-2.5-200m-pytorch",
-            timesfm_context_hours=timesfm_context_hours if timesfm_context_hours is not None else 168,
-            timesfm_step_horizon=timesfm_step_horizon if timesfm_step_horizon is not None else 24,
             timesfm_exog_cols=normalize_zone_id_list(settings.get("timesfm_exog_cols")),
-            timesfm_diurnal_blend_alpha=(
-                timesfm_diurnal_blend_alpha if timesfm_diurnal_blend_alpha is not None else 1.0
-            ),
             timesfm_roll_actuals=False,
-            ar_diurnal_blend_alpha=ar_diurnal_blend_alpha if ar_diurnal_blend_alpha is not None else 0.0,
             chronos_repo=optional_str(settings.get("chronos_repo")) or "amazon/chronos-2",
-            chronos_context_hours=chronos_context_hours if chronos_context_hours is not None else 512,
-            chronos_step_horizon=chronos_step_horizon if chronos_step_horizon is not None else 24,
-            chronos_diurnal_blend_alpha=(
-                chronos_diurnal_blend_alpha if chronos_diurnal_blend_alpha is not None else 0.0
-            ),
             chronos_device="auto",
             chronos_roll_actuals=False,
-            lstm_context_hours=lstm_context_hours if lstm_context_hours is not None else 24,
-            lstm_step_horizon=lstm_step_horizon if lstm_step_horizon is not None else 24,
             lstm_exog_cols=normalize_zone_id_list(settings.get("lstm_exog_cols")),
-            lstm_hidden_size=lstm_hidden_size if lstm_hidden_size is not None else 64,
-            lstm_num_layers=lstm_num_layers if lstm_num_layers is not None else 1,
-            lstm_epochs=lstm_epochs if lstm_epochs is not None else 50,
-            lstm_learning_rate=lstm_learning_rate if lstm_learning_rate is not None else 0.001,
-            lstm_batch_size=lstm_batch_size if lstm_batch_size is not None else 32,
-            lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha if lstm_diurnal_blend_alpha is not None else 0.0,
             lstm_device="auto",
             lstm_roll_actuals=False,
-            lstm_seed=lstm_seed if lstm_seed is not None else 42,
-            temperature=temperature if temperature is not None else 0.2,
         )
 
 
@@ -503,60 +516,31 @@ def normalize_string_list(value: Any) -> list[str] | None:
     return values or None
 
 
+_ListItem = TypeVar("_ListItem")
+
+
+def normalize_typed_list(value: Any, convert: Callable[[str], _ListItem]) -> list[_ListItem] | None:
+    """Parse once, then deduplicate converted values while keeping input order."""
+    return list(dict.fromkeys(convert(item) for item in normalize_string_list(value) or [])) or None
+
+
 def normalize_int_list(value: Any) -> list[int] | None:
-    values = normalize_string_list(value)
-    if not values:
-        return None
-    normalized: list[int] = []
-    seen: set[int] = set()
-    for item in values:
-        number = int(item)
-        if number not in seen:
-            normalized.append(number)
-            seen.add(number)
-    return normalized or None
+    return normalize_typed_list(value, int)
 
 
 def normalize_float_list(value: Any) -> list[float] | None:
-    values = normalize_string_list(value)
-    if not values:
-        return None
-    normalized: list[float] = []
-    seen: set[float] = set()
-    for item in values:
+    def convert(item: str) -> float:
         number = float(item)
         if number < 0.0 or number > 1.0:
             raise ValueError(f"Diurnal blend alpha must be between 0 and 1: {item}")
-        rounded = round(number, 6)
-        if rounded not in seen:
-            normalized.append(rounded)
-            seen.add(rounded)
-    return normalized or None
+        return round(number, 6)
+
+    return normalize_typed_list(value, convert)
 
 
 def normalize_agent_mode_list(value: Any) -> list[str] | None:
-    values = normalize_string_list(value)
-    if not values:
-        return None
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in values:
-        mode = normalize_agent_mode(item)
-        if mode not in seen:
-            normalized.append(mode)
-            seen.add(mode)
-    return normalized or None
+    return normalize_typed_list(value, normalize_agent_mode)
 
 
 def normalize_forecast_model_list(value: Any) -> list[str] | None:
-    values = normalize_string_list(value)
-    if not values:
-        return None
-    normalized: list[str] = []
-    seen: set[str] = set()
-    for item in values:
-        model_name = normalize_forecast_model_name(item)
-        if model_name not in seen:
-            normalized.append(model_name)
-            seen.add(model_name)
-    return normalized or None
+    return normalize_typed_list(value, normalize_forecast_model_name)

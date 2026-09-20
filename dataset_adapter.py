@@ -128,13 +128,7 @@ class CanonicalDataset:
         selected = self.timeseries[
             self.timeseries[CANONICAL_ZONE_COLUMN].astype(str).isin(zone_ids)
         ][[CANONICAL_TIME_COLUMN, CANONICAL_ZONE_COLUMN, value_column]].copy()
-        wide = selected.pivot(
-            index=CANONICAL_TIME_COLUMN,
-            columns=CANONICAL_ZONE_COLUMN,
-            values=value_column,
-        ).reset_index()
-        wide.columns.name = None
-        wide = wide.rename(columns={CANONICAL_TIME_COLUMN: "time"})
+        wide = pivot_timeseries(selected, value_column)
         for zone_id in zone_ids:
             if zone_id not in wide:
                 wide[zone_id] = np.nan
@@ -148,6 +142,15 @@ class CanonicalDataset:
         frame = self.timeseries[[CANONICAL_TIME_COLUMN, *columns]].copy()
         frame = frame.groupby(CANONICAL_TIME_COLUMN, as_index=False)[columns].first()
         return frame.rename(columns={CANONICAL_TIME_COLUMN: "time"})
+
+
+def pivot_timeseries(frame: pd.DataFrame, value_column: str) -> pd.DataFrame:
+    """Convert canonical records to the existing time-by-zone matrix format."""
+    wide = frame.pivot(
+        index=CANONICAL_TIME_COLUMN, columns=CANONICAL_ZONE_COLUMN, values=value_column,
+    ).reset_index().rename(columns={CANONICAL_TIME_COLUMN: "time"})
+    wide.columns.name = None
+    return wide
 
 
 class DatasetAdapter(ABC):
@@ -895,18 +898,24 @@ def replace_cache_file(temporary: Path, path: Path) -> None:
 
 
 @contextmanager
-def cache_manifest_lock(path: Path):
-    """Serialize the short read/merge/write transaction across processes."""
+def process_file_lock(path: Path, *, blocking: bool, conflict_message: str | None = None):
+    """Hold an OS-released lock; the caller selects waiting or fail-fast behavior."""
     path.parent.mkdir(parents=True, exist_ok=True)
     # Both lock APIs permit ranges beyond EOF; no initialization write is needed.
-    with path.with_suffix(".lock").open("a+b", buffering=0) as handle:
+    with path.open("a+b", buffering=0) as handle:
         handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                flags = fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB)
+                fcntl.flock(handle.fileno(), flags)
+        except OSError as exc:
+            if conflict_message is not None:
+                raise RuntimeError(conflict_message) from exc
+            raise
         try:
             yield
         finally:
@@ -915,6 +924,11 @@ def cache_manifest_lock(path: Path):
                 msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def cache_manifest_lock(path: Path):
+    """Serialize the short read/merge/write transaction across processes."""
+    return process_file_lock(path.with_suffix(".lock"), blocking=True)
 
 
 def merge_cache_manifest(path: Path, update: dict[str, Any]) -> None:

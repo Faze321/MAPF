@@ -6,6 +6,10 @@ import re
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from usage import (
+    optional_int_usage, call_token_usage_complete, sum_token_usage, summarize_agent_call_usage,
+)
+
 from config import AgentConfig
 from load_policy import (
     EXTREMELY_HIGH_STRESS,
@@ -1038,46 +1042,6 @@ def agent_call_usage_record(
         "token_usage_complete": token_usage_complete,
         "provider_attempt_count": provider_attempt_count,
     }
-
-
-def summarize_agent_call_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "agent_invoked": bool(records),
-        "agent_call_count": len(records),
-        "prompt_tokens": sum_token_usage(records, "prompt_tokens"),
-        "completion_tokens": sum_token_usage(records, "completion_tokens"),
-        "total_tokens": sum_token_usage(records, "total_tokens"),
-        "token_usage_complete": all(
-            call_token_usage_complete(record)
-            for record in records
-        ),
-    }
-
-
-def call_token_usage_complete(record: dict[str, Any]) -> bool:
-    explicit = record.get("token_usage_complete")
-    if explicit is not None:
-        return bool(explicit)
-    return all(
-        optional_int_usage(record.get(field)) is not None
-        for field in ("prompt_tokens", "completion_tokens", "total_tokens")
-    )
-
-
-def sum_token_usage(records: list[dict[str, Any]], field: str) -> int:
-    total = 0
-    for record in records:
-        value = optional_int_usage(record.get(field))
-        if value is not None:
-            total += value
-    return total
-
-
-def optional_int_usage(value: Any) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def heuristic_zone_chain(

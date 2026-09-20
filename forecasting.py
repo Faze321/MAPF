@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 import pandas as pd
@@ -388,6 +388,26 @@ def forecast_load(
     raise ValueError(f"Unsupported forecast_model: {model_name}")
 
 
+def forecast_chunks(
+    full_frame: pd.DataFrame,
+    forecast_start: pd.Timestamp,
+    horizon_hours: int,
+    step: int,
+) -> Iterator[tuple[int, pd.DatetimeIndex, pd.DataFrame]]:
+    """Yield aligned forecast chunks, building the shared time index only once."""
+    if horizon_hours <= 0:
+        return
+    indexed = full_frame.set_index("time")
+    remaining, offset = horizon_hours, 0
+    while remaining > 0:
+        size = min(step, remaining)
+        times = pd.date_range(forecast_start + pd.Timedelta(hours=offset), periods=size, freq="h")
+        frame = indexed.reindex(times).rename_axis("time").reset_index()
+        yield size, times, frame
+        remaining -= size
+        offset += size
+
+
 def timesfm_forecast(
     history: pd.DataFrame,
     validation: pd.DataFrame,
@@ -470,18 +490,9 @@ def timesfm_forecast(
     fitted_rolling_exog = rolling_exog.copy()
 
     rows: list[pd.DataFrame] = []
-    remaining = horizon_hours
-    offset = 0
-    while remaining > 0:
-        chunk_horizon = min(step, remaining)
-        chunk_start = forecast_start + pd.Timedelta(hours=offset)
-        chunk_times = pd.date_range(chunk_start, periods=chunk_horizon, freq="h")
-        chunk_frame = (
-            full_frame.set_index("time")
-            .reindex(chunk_times)
-            .rename_axis("time")
-            .reset_index()
-        )
+    for chunk_horizon, chunk_times, chunk_frame in forecast_chunks(
+        full_frame, forecast_start, horizon_hours, step
+    ):
         chunk_exog = align_exog(build_exog_matrix(chunk_frame, exog_cols), chunk_horizon)
         raw, q10, q90 = run_timesfm_prediction(
             model,
@@ -525,8 +536,6 @@ def timesfm_forecast(
             roll_values = point
         rolling_load = np.concatenate([rolling_load, roll_values])
         rolling_exog = np.vstack([rolling_exog, chunk_exog])
-        remaining -= chunk_horizon
-        offset += chunk_horizon
 
     result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["time", "predicted_kwh"])
     result.attrs["calibration"] = calibration
@@ -629,18 +638,9 @@ def chronos_forecast(
     fitted_rolling_exog = rolling_exog.copy()
 
     rows: list[pd.DataFrame] = []
-    remaining = horizon_hours
-    offset = 0
-    while remaining > 0:
-        chunk_horizon = min(step, remaining)
-        chunk_start = forecast_start + pd.Timedelta(hours=offset)
-        chunk_times = pd.date_range(chunk_start, periods=chunk_horizon, freq="h")
-        chunk_frame = (
-            full_frame.set_index("time")
-            .reindex(chunk_times)
-            .rename_axis("time")
-            .reset_index()
-        )
+    for chunk_horizon, chunk_times, chunk_frame in forecast_chunks(
+        full_frame, forecast_start, horizon_hours, step
+    ):
         chunk_exog = align_exog(build_exog_matrix(chunk_frame, exog_cols), chunk_horizon)
         raw, raw_q10, raw_q90 = run_chronos_prediction(
             pipeline,
@@ -680,8 +680,6 @@ def chronos_forecast(
             roll_values = point
         rolling_load = np.concatenate([rolling_load, roll_values])
         rolling_exog = np.vstack([rolling_exog, chunk_exog])
-        remaining -= chunk_horizon
-        offset += chunk_horizon
 
     result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["time", "predicted_kwh"])
     result.attrs["calibration"] = calibration
@@ -809,18 +807,9 @@ def lstm_forecast(
     fitted_rolling_exog = rolling_exog.copy()
 
     rows: list[pd.DataFrame] = []
-    remaining = horizon_hours
-    offset = 0
-    while remaining > 0:
-        chunk_horizon = min(step, remaining)
-        chunk_start = forecast_start + pd.Timedelta(hours=offset)
-        chunk_times = pd.date_range(chunk_start, periods=chunk_horizon, freq="h")
-        chunk_frame = (
-            full_frame.set_index("time")
-            .reindex(chunk_times)
-            .rename_axis("time")
-            .reset_index()
-        )
+    for chunk_horizon, chunk_times, chunk_frame in forecast_chunks(
+        full_frame, forecast_start, horizon_hours, step
+    ):
         chunk_exog = build_lstm_exog_matrix(chunk_frame, exog_cols)
         raw = run_lstm_prediction(bundle, rolling_load, rolling_exog, chunk_exog, chunk_horizon)
         bias = align_vector(bias_vec, chunk_horizon)
@@ -853,8 +842,6 @@ def lstm_forecast(
             roll_values = point
         rolling_load = np.concatenate([rolling_load, roll_values])
         rolling_exog = np.vstack([rolling_exog, chunk_exog])
-        remaining -= chunk_horizon
-        offset += chunk_horizon
 
     result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["time", "predicted_kwh"])
     result.attrs["calibration"] = calibration

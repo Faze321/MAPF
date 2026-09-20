@@ -61,6 +61,7 @@ class ForecasterArtifact:
         predictions: list[dict[str, Any]] = []
         history = {zone: list(values) for zone, values in self.history_values.items()}
         zone_index = {zone: idx for idx, zone in enumerate(self.zones)}
+        zone_offsets = dict.fromkeys(self.zones, 0)
         for timestamp, timestamp_rows in future.groupby("timestamp", sort=True):
             for _, row in timestamp_rows.sort_values("zone").iterrows():
                 zone = str(row["zone"])
@@ -77,7 +78,8 @@ class ForecasterArtifact:
                     lag_24=prior[-24] if len(prior) >= 24 else (prior[-1] if prior else 0.0),
                 )
                 raw = float(np.dot(np.asarray(self.coefficients), vector))
-                offset = len(predictions_for_zone(predictions, zone))
+                offset = zone_offsets[zone]
+                zone_offsets[zone] += 1
                 bias = self.validation_bias.get(zone, ())
                 calibrated = raw + (bias[offset % len(bias)] if bias else 0.0)
                 predicted = max(0.0, calibrated)

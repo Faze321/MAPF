@@ -15,6 +15,7 @@ from dataset_adapter import (
     CanonicalDataset,
     PriceChangeReference,
     atomic_write_dataframe,
+    pivot_timeseries,
 )
 
 from load_policy import (
@@ -200,21 +201,11 @@ def build_zone_profiles_from_canonical(
     ].copy()
     if history.empty:
         raise ValueError(f"No historical observations exist before forecast_start={cutoff}")
-    load = history.pivot(
-        index=CANONICAL_TIME_COLUMN,
-        columns=CANONICAL_ZONE_COLUMN,
-        values=CANONICAL_LOAD_COLUMN,
-    ).reset_index().rename(columns={CANONICAL_TIME_COLUMN: "time"})
-    load.columns.name = None
+    load = pivot_timeseries(history, CANONICAL_LOAD_COLUMN)
     zone_ids = [str(column) for column in load.columns if column != "time"]
     load_features = compute_load_features(load, zone_ids)
 
-    price = history.pivot(
-        index=CANONICAL_TIME_COLUMN,
-        columns=CANONICAL_ZONE_COLUMN,
-        values=CANONICAL_ENERGY_PRICE_COLUMN,
-    ).reset_index().rename(columns={CANONICAL_TIME_COLUMN: "time"})
-    price.columns.name = None
+    price = pivot_timeseries(history, CANONICAL_ENERGY_PRICE_COLUMN)
     energy_features = compute_price_features(price, zone_ids, price_type="energy")
 
     profiles = pd.DataFrame({"zone_id": zone_ids})
@@ -225,12 +216,7 @@ def build_zone_profiles_from_canonical(
     profiles = profiles.merge(energy_features, on="zone_id", how="left")
 
     if "service_price" in history:
-        service = history.pivot(
-            index=CANONICAL_TIME_COLUMN,
-            columns=CANONICAL_ZONE_COLUMN,
-            values="service_price",
-        ).reset_index().rename(columns={CANONICAL_TIME_COLUMN: "time"})
-        service.columns.name = None
+        service = pivot_timeseries(history, "service_price")
         profiles = profiles.merge(
             compute_price_features(service, zone_ids, price_type="service"),
             on="zone_id",

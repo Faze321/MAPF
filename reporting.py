@@ -3,12 +3,17 @@ from __future__ import annotations
 import json
 import hashlib
 import os
-from contextlib import contextmanager
 import re
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from dataset_adapter import process_file_lock
+from usage import (
+    aggregate_usage, cumulative_global_agent_usage as derive_global_cumulative_usage,
+    token_total_summary as token_total_payload, usage_integer as reporting_usage_integer,
+)
 
 from global_forecaster import NATIVE_ARTIFACT_SCHEMA_VERSION, NativeForecasterArtifact
 
@@ -680,25 +685,7 @@ def normalized_zone_cumulative_usage(
             "agent_invoked": any(
                 bool(item.get("agent_invoked")) for item in usage_rows
             ),
-            "agent_call_count": sum(
-                reporting_usage_integer(item.get("agent_call_count"))
-                for item in usage_rows
-            ),
-            "prompt_tokens": sum(
-                reporting_usage_integer(item.get("prompt_tokens"))
-                for item in usage_rows
-            ),
-            "completion_tokens": sum(
-                reporting_usage_integer(item.get("completion_tokens"))
-                for item in usage_rows
-            ),
-            "total_tokens": sum(
-                reporting_usage_integer(item.get("total_tokens"))
-                for item in usage_rows
-            ),
-            "token_usage_complete": all(
-                bool(item.get("token_usage_complete")) for item in usage_rows
-            ),
+            **aggregate_usage(usage_rows),
         }
     calls = [
         call
@@ -765,60 +752,11 @@ def derive_global_agent_round_usage(
                 else None,
                 "agent_invoked": bool(invoked),
                 "agent_invoked_zone_count": len(invoked),
-                "agent_call_count": sum(
-                    reporting_usage_integer(item.get("agent_call_count"))
-                    for item in usage_rows
-                ),
-                "prompt_tokens": sum(
-                    reporting_usage_integer(item.get("prompt_tokens"))
-                    for item in usage_rows
-                ),
-                "completion_tokens": sum(
-                    reporting_usage_integer(item.get("completion_tokens"))
-                    for item in usage_rows
-                ),
-                "total_tokens": sum(
-                    reporting_usage_integer(item.get("total_tokens"))
-                    for item in usage_rows
-                ),
-                "token_usage_complete": all(
-                    bool(item.get("token_usage_complete")) for item in usage_rows
-                ),
+                **aggregate_usage(usage_rows),
                 "invoked_zone_ids": [item.get("zone_id") for item in invoked],
             }
         )
     return rounds
-
-
-def derive_global_cumulative_usage(
-    rounds: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "agent_round_count": len(rounds),
-        "agent_invoked_round_count": sum(
-            bool(item.get("agent_invoked")) for item in rounds
-        ),
-        "agent_invoked": any(bool(item.get("agent_invoked")) for item in rounds),
-        "agent_invoked_zone_count": sum(
-            reporting_usage_integer(item.get("agent_invoked_zone_count"))
-            for item in rounds
-        ),
-        "agent_call_count": sum(
-            reporting_usage_integer(item.get("agent_call_count")) for item in rounds
-        ),
-        "prompt_tokens": sum(
-            reporting_usage_integer(item.get("prompt_tokens")) for item in rounds
-        ),
-        "completion_tokens": sum(
-            reporting_usage_integer(item.get("completion_tokens")) for item in rounds
-        ),
-        "total_tokens": sum(
-            reporting_usage_integer(item.get("total_tokens")) for item in rounds
-        ),
-        "token_usage_complete": all(
-            bool(item.get("token_usage_complete")) for item in rounds
-        ),
-    }
 
 
 def agent_attempt_usage_row(
@@ -950,25 +888,6 @@ def token_only_cumulative_usage(value: dict[str, Any]) -> dict[str, Any]:
         "token_usage_complete",
     )
     return {key: value.get(key) for key in allowed if key in value}
-
-
-def token_total_payload(value: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "agent_call_count": reporting_usage_integer(value.get("agent_call_count")),
-        "prompt_tokens": reporting_usage_integer(value.get("prompt_tokens")),
-        "completion_tokens": reporting_usage_integer(
-            value.get("completion_tokens")
-        ),
-        "total_tokens": reporting_usage_integer(value.get("total_tokens")),
-        "token_usage_complete": bool(value.get("token_usage_complete")),
-    }
-
-
-def reporting_usage_integer(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 
 def split_agent_debug_outputs(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1568,26 +1487,9 @@ def scoped_output(root: Path, adapter: str, data_path: Path) -> Path:
     return root / adapter / dataset_folder_key(data_path)
 
 
-@contextmanager
 def output_lock(directory: Path):
     """An OS-released process lock prevents simultaneous writers to one output root."""
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / ".mapf-run.lock").open("a+b", buffering=0) as handle:
-        handle.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise RuntimeError(f"Another run is writing to {directory}; use a different --output-folder") from exc
-        try:
-            yield
-        finally:
-            handle.seek(0)
-            if os.name == "nt":
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return process_file_lock(
+        directory / ".mapf-run.lock", blocking=False,
+        conflict_message=f"Another run is writing to {directory}; use a different --output-folder",
+    )

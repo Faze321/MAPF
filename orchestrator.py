@@ -18,6 +18,8 @@ from typing import Any
 
 import pandas as pd
 
+from usage import aggregate_usage, cumulative_global_agent_usage, token_total_summary, usage_integer
+
 from agents import (
     AgentChatClient,
     AgentStageError,
@@ -28,6 +30,7 @@ from agents import (
 )
 from config import (
     AgentConfig,
+    BACKEND_PARAMETER_NAMES,
     agent_config_profile,
     normalize_agent_mode,
     normalize_forecast_model_name,
@@ -180,36 +183,12 @@ MAX_CONTROL_ATTEMPTS = 3
 CONTROL_AGENT_USAGE_KEY = "_control_agent_usage"
 FORECASTER_MANIFEST_SCHEMA_VERSION = 3
 FORECAST_PARAMETER_NAMES = (
-    "forecast_start",
-    "horizon_days",
-    "history_days",
-    "validation_days",
-    "forecast_model",
-    "timesfm_repo",
-    "timesfm_context_hours",
-    "timesfm_step_horizon",
-    "timesfm_exog_cols",
-    "timesfm_diurnal_blend_alpha",
-    "timesfm_roll_actuals",
-    "ar_diurnal_blend_alpha",
-    "chronos_repo",
-    "chronos_context_hours",
-    "chronos_step_horizon",
-    "chronos_diurnal_blend_alpha",
-    "chronos_device",
-    "chronos_roll_actuals",
-    "lstm_context_hours",
-    "lstm_step_horizon",
-    "lstm_exog_cols",
-    "lstm_hidden_size",
-    "lstm_num_layers",
-    "lstm_epochs",
-    "lstm_learning_rate",
-    "lstm_batch_size",
-    "lstm_diurnal_blend_alpha",
-    "lstm_device",
-    "lstm_roll_actuals",
-    "lstm_seed",
+    'forecast_start',
+    'horizon_days',
+    'history_days',
+    'validation_days',
+    'forecast_model',
+    *BACKEND_PARAMETER_NAMES,
 )
 PRICE_CONDITIONED_PARAMETER_NAMES = tuple(
     name
@@ -957,6 +936,15 @@ def run_experiment_matrix(
     agent_attempt_usage_frames: list[pd.DataFrame] = []
     agent_step_token_usage_frames: list[pd.DataFrame] = []
     control_attempt_trace_frames: list[pd.DataFrame] = []
+    experiment_tables = {
+        "forecast_metrics_csv": (metrics_frames, metrics_path),
+        "price_comparison_summary_csv": (price_frames, price_path),
+        "rationale_trace_csv": (rationale_frames, rationale_path),
+        "explainability_review_packet_csv": (explainability_frames, explainability_path),
+        "agent_attempt_usage_csv": (agent_attempt_usage_frames, agent_attempt_usage_path),
+        "agent_step_token_usage_csv": (agent_step_token_usage_frames, agent_step_token_usage_path),
+        "control_attempt_trace_csv": (control_attempt_trace_frames, control_attempt_trace_path),
+    }
     cache_attempted = False
     add_seed_folder = len(seeds) > 1
     add_mode_folder = len(modes) > 1
@@ -1041,41 +1029,8 @@ def run_experiment_matrix(
                                 "diurnal_blend_alpha": blend_alpha,
                                 "run_output_dir": str(run_output_dir),
                             }
-                            append_experiment_frame(
-                                metrics_frames,
-                                outputs.get("forecast_metrics_csv"),
-                                metadata,
-                            )
-                            append_experiment_frame(
-                                price_frames,
-                                outputs.get("price_comparison_summary_csv"),
-                                metadata,
-                            )
-                            append_experiment_frame(
-                                rationale_frames,
-                                outputs.get("rationale_trace_csv"),
-                                metadata,
-                            )
-                            append_experiment_frame(
-                                explainability_frames,
-                                outputs.get("explainability_review_packet_csv"),
-                                metadata,
-                            )
-                            append_experiment_frame(
-                                agent_attempt_usage_frames,
-                                outputs.get("agent_attempt_usage_csv"),
-                                metadata,
-                            )
-                            append_experiment_frame(
-                                agent_step_token_usage_frames,
-                                outputs.get("agent_step_token_usage_csv"),
-                                metadata,
-                            )
-                            append_experiment_frame(
-                                control_attempt_trace_frames,
-                                outputs.get("control_attempt_trace_csv"),
-                                metadata,
-                            )
+                            for output_key, (frames, _) in experiment_tables.items():
+                                append_experiment_frame(frames, outputs.get(output_key), metadata)
                         except Exception as exc:
                             record["status"] = "failed"
                             record["completed_at"] = pd.Timestamp.now().isoformat()
@@ -1093,16 +1048,13 @@ def run_experiment_matrix(
                             run_records.append(record)
                             pd.DataFrame(run_records).to_csv(runs_path, index=False)
 
-    metrics = write_experiment_summary(metrics_frames, metrics_path)
-    prices = write_experiment_summary(price_frames, price_path)
-    rationales = write_experiment_summary(rationale_frames, rationale_path)
-    write_experiment_summary(explainability_frames, explainability_path)
-    write_experiment_summary(agent_attempt_usage_frames, agent_attempt_usage_path)
-    write_experiment_summary(
-        agent_step_token_usage_frames,
-        agent_step_token_usage_path,
-    )
-    write_experiment_summary(control_attempt_trace_frames, control_attempt_trace_path)
+    summaries = {
+        key: write_experiment_summary(frames, path)
+        for key, (frames, path) in experiment_tables.items()
+    }
+    metrics = summaries["forecast_metrics_csv"]
+    prices = summaries["price_comparison_summary_csv"]
+    rationales = summaries["rationale_trace_csv"]
     write_numeric_summary(
         metrics,
         forecast_summary_path,
@@ -2461,21 +2413,7 @@ def build_global_agent_round_usage(
         "triggered_by_attempt": triggered_by_attempt,
         "agent_invoked": bool(invoked),
         "agent_invoked_zone_count": len(invoked),
-        "agent_call_count": sum(
-            usage_integer(item.get("agent_call_count")) for item in zone_usage
-        ),
-        "prompt_tokens": sum(
-            usage_integer(item.get("prompt_tokens")) for item in zone_usage
-        ),
-        "completion_tokens": sum(
-            usage_integer(item.get("completion_tokens")) for item in zone_usage
-        ),
-        "total_tokens": sum(
-            usage_integer(item.get("total_tokens")) for item in zone_usage
-        ),
-        "token_usage_complete": all(
-            bool(item.get("token_usage_complete")) for item in zone_usage
-        ),
+        **aggregate_usage(zone_usage),
         "invoked_zone_ids": [item.get("zone_id") for item in invoked],
     }
 
@@ -2515,47 +2453,6 @@ def cumulative_zone_agent_usage(
     )
 
 
-def cumulative_global_agent_usage(
-    rounds: list[dict[str, Any]],
-) -> dict[str, Any]:
-    return {
-        "agent_round_count": len(rounds),
-        "agent_invoked_round_count": sum(
-            bool(item.get("agent_invoked")) for item in rounds
-        ),
-        "agent_invoked": any(bool(item.get("agent_invoked")) for item in rounds),
-        "agent_invoked_zone_count": sum(
-            usage_integer(item.get("agent_invoked_zone_count")) for item in rounds
-        ),
-        "agent_call_count": sum(
-            usage_integer(item.get("agent_call_count")) for item in rounds
-        ),
-        "prompt_tokens": sum(
-            usage_integer(item.get("prompt_tokens")) for item in rounds
-        ),
-        "completion_tokens": sum(
-            usage_integer(item.get("completion_tokens")) for item in rounds
-        ),
-        "total_tokens": sum(
-            usage_integer(item.get("total_tokens")) for item in rounds
-        ),
-        "token_usage_complete": all(
-            bool(item.get("token_usage_complete")) for item in rounds
-        ),
-    }
-
-
-def token_total_summary(usage: dict[str, Any]) -> dict[str, Any]:
-    """Expose a compact final token-only total without timing fields."""
-    return {
-        "agent_call_count": usage_integer(usage.get("agent_call_count")),
-        "prompt_tokens": usage_integer(usage.get("prompt_tokens")),
-        "completion_tokens": usage_integer(usage.get("completion_tokens")),
-        "total_tokens": usage_integer(usage.get("total_tokens")),
-        "token_usage_complete": bool(usage.get("token_usage_complete")),
-    }
-
-
 def retry_proposal_phase(agent_mode: str) -> str:
     return {
         "multi_agent_economist_retry": "economist_retry",
@@ -2576,13 +2473,6 @@ def numeric_value_changed(previous: float | None, current: float | None) -> bool
     if previous is None or current is None:
         return previous is not None or current is not None
     return not math.isclose(previous, current, rel_tol=0.0, abs_tol=1e-9)
-
-
-def usage_integer(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 
 def build_retry_context(

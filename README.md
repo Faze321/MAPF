@@ -220,8 +220,12 @@ in the evaluation report and must not enter control Agent context.
 ## Tests
 
 ```powershell
-python -B -m unittest tests.test_refactor -v
-python -B -m unittest discover -s tests -p test_evaluate.py -v
+python -B -m unittest discover -s tests -v
 ```
 
-The refactor tests cover cache hit/invalidation/recovery, dataset-local cache layout, fixed-origin cross-Zone artifacts, artifact round-trip and price-scenario reuse, Agent no-leakage filtering, step/attempt/global token accounting, discussion convergence, frozen/revised price trajectories, and versioned authoritative output.
+The tests cover dataset formats and filtering, cache consistency and process locks,
+config-only switching and parallel dispatch, token accounting and evaluation,
+fixed-origin prediction without future-load leakage, and fitted-state reuse.
+TimesFM/Chronos/LSTM control-flow tests use deterministic backend doubles so they
+run without downloading model weights or calling provider APIs.
+See [shared code and regression validation](docs/refactoring.md) for the refactor boundaries.

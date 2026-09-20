@@ -53,11 +53,44 @@ run:
 `station-level load Profile 1h.xlsx` 和 `price.xlsx`。缺失或混合格式会明确报错。
 自定义长表继续使用 `data.adapter: long_format` 和原有字段映射。
 
-`forecast_start`、`forecast_starts` 都留空时，使用当前数据最后 `horizon_days` 天
-作为预测窗口，此前数据作为训练历史。`zones: null` 从当前数据自动选站。
+`forecast_start`、`forecast_starts` 都留空且 `forecast_start_count: 1`（默认）时，
+使用当前数据最后 `horizon_days` 天作为预测窗口，此前数据作为训练历史。
+`zones: null` 从当前数据自动选站。
 显式填写日期或站点时会按你的配置执行，因此跨数据集切换时需使用该数据集的日期和编号。
 模型、轮数、Agent 模式和其他训练参数仍使用原有 `run` 字段。
 无需设置设备；后端自动选择可用设备。
+
+每个数据集随机选择 5 个区域，可设置：
+
+```yaml
+run:
+  zones: null
+  experiment_zone_count: 5
+  experiment_zone_selection: random
+  experiment_zone_seed: 42
+```
+
+每个数据集先抽样一次，所有模型、Agent 模式和训练种子共用这组区域。
+更改 `experiment_zone_seed` 可重新抽样；区域不重复，最多选择当前数据集的可用区域数。
+显式 `zones` 或 `--zones` 优先于自动抽样。默认 `representative` 保持按代表性评分选区。
+
+每个数据集自动选择两个均匀分布的预测起点，可增加：
+
+```yaml
+run:
+  forecast_start: null
+  forecast_starts: null
+  forecast_start_count: 2
+```
+
+程序按天筛选有效起点：起点之前必须包含 `history_days + validation_days` 天的
+连续小时记录，之后必须包含完整的 `horizon_days` 天预测序列，再取候选日期中约 1/3 和 2/3
+位置的两个起点（均为 00:00）。这里的天数均按每天 24 小时计算。
+随机选区时先固定区域，再按这些区域共同覆盖的时间筛选，两次实验共用同一组区域。
+显式选区也按选中区域筛选；代表性选区则先按全部可用区域的共同覆盖筛选日期，
+再使用第一个起点之前的数据选区。存在缺失小时的窗口不会作为候选，候选不足会明确报错。
+`forecast_start_count` 可设为更大的正整数；手动指定 `forecast_start`、`forecast_starts`
+或对应 CLI 日期时，手动日期优先，不再自动取点。
 
 原先新增的 `--dataset`、`--city`、`--device` 和 `datasets` 配置块已移除，
 不再需要 `train_datasets.py`。原有模型、阶段等 CLI 参数仍可覆盖配置；
@@ -140,8 +173,9 @@ Agent 阶段校验适配器、数据目录和数据指纹，拒绝混用其他�
 - A4、A9：电价表为空，站点元数据标为 Free。
 - A5：1 月、12 月缺少 21:00–22:00 电价，保守地排除整个站点，不填补未知价格。
 - A7、A8：`session_count` 是换电次数，不是电量。
-- A10：实测记录从 2024-09-27 开始。自动日期使用数据尾部的预测窗口；
-  如果手动指定更早起点，需通过 `run.zones` 排除尚未投运的站点。
+- A10：实测记录从 2024-09-27 开始。自动选择多个起点且选中 A10 时，日期受其
+  覆盖范围约束，并预留训练与验证历史；如果手动指定更早起点，需通过 `run.zones`
+  排除尚未投运的站点。
 - 不使用有歧义的合并容量单元格或全年的订单总数；保留真实站点类型。
 - 没有天气数据时天气摘要为缺失，不伪造温湿度或降雨。
 

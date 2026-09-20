@@ -116,8 +116,11 @@ class RunConfig:
     validation_days: int = 1
     zone_ids: list[str] | None = None
     experiment_zone_count: int = 12
+    experiment_zone_selection: str = "representative"
+    experiment_zone_seed: int = 42
     forecast_model: str = "timesfm"
     forecast_starts: list[str] | None = None
+    forecast_start_count: int = 1
     forecast_models: list[str] | None = None
     experiment_seeds: list[int] | None = None
     agent_mode: str = "multi_agent_economist_retry"
@@ -175,6 +178,7 @@ class RunConfig:
                 "history_days",
                 "validation_days",
                 "experiment_zone_count",
+                "experiment_zone_seed",
                 "timesfm_context_hours",
                 "timesfm_step_horizon",
                 "chronos_context_hours",
@@ -219,8 +223,10 @@ class RunConfig:
             max_poi_rows=optional_int(settings.get("max_poi_rows")),
             forecast_start=optional_str(settings.get("forecast_start")),
             zone_ids=normalize_zone_id_list(zone_ids),
+            experiment_zone_selection=normalize_zone_selection(settings.get("experiment_zone_selection")),
             forecast_model=normalize_forecast_model_name(optional_str(settings.get("forecast_model"))),
             forecast_starts=forecast_starts,
+            forecast_start_count=positive_integer(settings.get("forecast_start_count", 1), "run.forecast_start_count"),
             forecast_models=forecast_models,
             experiment_seeds=experiment_seeds,
             agent_mode=normalize_agent_mode(optional_str(settings.get("agent_mode"))),
@@ -347,6 +353,13 @@ class AgentConfig:
             profile=profile,
             title="MAPF UrbanEV",
         )
+
+
+def normalize_zone_selection(value: Any) -> str:
+    selection = str(value or "representative").strip().lower()
+    if selection not in {"representative", "random"}:
+        raise ValueError("run.experiment_zone_selection must be representative or random")
+    return selection
 
 
 def normalize_pipeline_stage(value: Any) -> str:

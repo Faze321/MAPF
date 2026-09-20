@@ -20,7 +20,7 @@ class ConfigAndUsageTests(unittest.TestCase):
     def test_numeric_defaults_nulls_and_explicit_zero(self):
         defaults = RunConfig()
         fields = {key: value for key, value in asdict(defaults).items()
-                  if type(value) in (int, float) and key != "max_parallel_datasets"}
+                  if type(value) in (int, float) and key not in {"max_parallel_datasets", "forecast_start_count"}}
         for empty in (None, ""):
             parsed = RunConfig.from_mapping(dict.fromkeys(fields, empty))
             for key, expected in fields.items():

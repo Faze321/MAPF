@@ -41,8 +41,9 @@ run:
   agent_output_dir: null # optional override; normally written beside forecaster/
   precomputed_window_data: null # path to a previous window_load_price_cache.csv
   max_poi_rows: null
-  forecast_start: null # latest complete forecast window in this dataset
-  forecast_starts: null # optional explicit dates; null follows forecast_start
+  forecast_start: null # null: automatic dates controlled by forecast_start_count
+  forecast_starts: null # explicit dates override automatic selection
+  forecast_start_count: 1 # 1: latest window; 2+: evenly spaced valid origins per dataset
   horizon_days: 2
   history_days: 7
   validation_days: 1
@@ -109,4 +110,7 @@ run:
   lstm_roll_actuals: false
   lstm_seed: 42
   zones: null # automatically select sites from the current dataset
+  experiment_zone_count: 12
+  experiment_zone_selection: representative # random samples distinct sites once per dataset
+  experiment_zone_seed: 42 # fixed seed keeps the same sites across models and Agent modes
   temperature: 0.2

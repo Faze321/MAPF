@@ -16,9 +16,11 @@ from config import (
     normalize_pipeline_stage,
     normalize_string_list,
 )
-from dataset_adapter import DatasetSpec, default_forecast_start, resolve_dataset_spec
+from dataset_adapter import (DatasetSpec, default_forecast_start, evenly_spaced_forecast_starts,
+                             load_canonical_dataset, resolve_dataset_spec)
 from reporting import output_lock, scoped_output
-from orchestrator import format_failure_message, run_dataset_batch, run_experiment_matrix, run_pipeline
+from orchestrator import (format_failure_message, run_dataset_batch, run_experiment_matrix,
+                          run_pipeline, select_experiment_zone_ids)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -282,6 +284,8 @@ def main(argv: list[str] | None = None):
         or bool(agent_modes and len(agent_modes) > 1)
         or bool(diurnal_blend_alphas and len(diurnal_blend_alphas) > 1)
         or bool(experiment_name)
+        or run_config.experiment_zone_selection == "random"
+        or (not forecast_starts and run_config.forecast_start_count > 1)
     )
 
     if args.agent_mode:
@@ -354,9 +358,26 @@ def main(argv: list[str] | None = None):
     with output_lock(Path(agent_output_dir) if agent_output_dir else common_kwargs["output_dir"]):
         if run_matrix:
             if not forecast_starts:
-                forecast_starts = [default_forecast_start(dataset_spec, common_kwargs["horizon_days"])]
+                if run_config.forecast_start_count == 1:
+                    forecast_starts = [default_forecast_start(dataset_spec, common_kwargs["horizon_days"])]
+                else:
+                    dataset = load_canonical_dataset(dataset_spec, force_cache=common_kwargs["force_cache"])
+                    if common_kwargs["zone_ids"] is None and run_config.experiment_zone_selection == "random":
+                        common_kwargs["zone_ids"] = select_experiment_zone_ids(
+                            dataset.static_zone_features, count=common_kwargs["experiment_zone_count"],
+                            selection="random", seed=run_config.experiment_zone_seed,
+                        )
+                    forecast_starts = evenly_spaced_forecast_starts(
+                        dataset.timeseries, count=run_config.forecast_start_count,
+                        history_days=common_kwargs["history_days"],
+                        validation_days=common_kwargs["validation_days"],
+                        horizon_days=common_kwargs["horizon_days"], zone_ids=common_kwargs["zone_ids"],
+                    )
+                    del dataset
             outputs = run_experiment_matrix(
                 experiment_name=experiment_name,
+                experiment_zone_selection=run_config.experiment_zone_selection,
+                experiment_zone_seed=run_config.experiment_zone_seed,
                 forecast_starts=forecast_starts,
                 forecast_models=forecast_models,
                 experiment_seeds=experiment_seeds,

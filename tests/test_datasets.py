@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 from pathlib import Path
 import subprocess
 import sys
@@ -16,16 +17,63 @@ import yaml
 from config import DataConfig, RunConfig
 from dataset_adapter import (DatasetSpec, load_canonical_dataset, validate_forecaster_dataset_source,
                              MPEVDataDatasetAdapter, tou_schedule, resolve_dataset_spec, merge_cache_manifest,
-                             replace_cache_file)
+                             replace_cache_file, evenly_spaced_forecast_starts)
 from reporting import output_lock, scoped_output
 from forecasting import summarize_weather
 from global_forecaster import scenario_price_series
 from main import main
-from orchestrator import run_dataset_batch
+from orchestrator import run_dataset_batch, select_experiment_zone_ids
 
 
 def tariff_frame(rows):
     return pd.DataFrame(rows, columns=["Month", "Period", "Electricity Price(RMB)", "Service Price(RMB)"])
+
+
+class ForecastOriginTests(unittest.TestCase):
+    def series(self, start="2024-01-01", zone="A"):
+        return pd.DataFrame({"timestamp": pd.date_range(start, "2024-01-31 23:00", freq="h"),
+                             "zone_id": zone})
+
+    def origins(self, frame, **kwargs):
+        return evenly_spaced_forecast_starts(
+            frame, count=2, history_days=7, validation_days=1, horizon_days=2, **kwargs)
+
+    def test_two_interior_origins_keep_complete_windows(self):
+        frame = self.series()
+        starts = self.origins(frame)
+        self.assertEqual(starts, ["2024-01-16T00:00:00", "2024-01-23T00:00:00"])
+        for start in map(pd.Timestamp, starts):
+            window = frame[frame.timestamp.between(start - pd.Timedelta(days=8),
+                                                  start + pd.Timedelta(days=2), inclusive="left")]
+            self.assertEqual(len(window), 240)
+
+    def test_late_site_limits_common_coverage_only_when_selected(self):
+        frame = pd.concat([self.series(), self.series("2024-01-10", "B")], ignore_index=True)
+        self.assertEqual(self.origins(frame), ["2024-01-22T00:00:00", "2024-01-26T00:00:00"])
+        self.assertEqual(self.origins(frame, zone_ids=["A"]), self.origins(self.series()))
+        with self.assertRaisesRegex(ValueError, "missing zones"):
+            self.origins(frame, zone_ids=["unknown"])
+
+    def test_gaps_exclude_affected_windows(self):
+        frame = self.series()
+        frame = frame[frame.timestamp != pd.Timestamp("2024-01-16 12:00")]
+        self.assertEqual(self.origins(frame), ["2024-01-13T00:00:00", "2024-01-27T00:00:00"])
+
+    def test_insufficient_or_invalid_hourly_coverage_fails(self):
+        frame = self.series()
+        with self.assertRaisesRegex(ValueError, "Only 0 complete"):
+            self.origins(frame.tail(24))
+        with self.assertRaisesRegex(ValueError, "unique whole-hour"):
+            self.origins(pd.concat([frame, frame.iloc[:1]]))
+        with self.assertRaisesRegex(ValueError, "unique whole-hour"):
+            self.origins(frame.assign(timestamp=frame.timestamp + pd.Timedelta(minutes=30)))
+
+    def test_forecast_start_count_requires_positive_integer(self):
+        self.assertEqual(RunConfig.from_mapping({}).forecast_start_count, 1)
+        self.assertEqual(RunConfig.from_mapping({"forecast_start_count": 2}).forecast_start_count, 2)
+        for value in [0, -1, 1.5, True]:
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "forecast_start_count"):
+                RunConfig.from_mapping({"forecast_start_count": value})
 
 
 class DatasetTests(unittest.TestCase):
@@ -36,11 +84,11 @@ class DatasetTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def charged(self):
+    def charged(self, days=2):
         folder = self.root / "LOA"
         folder.mkdir()
-        times = pd.date_range("2023-04-01", periods=48, freq="h")
-        pd.DataFrame({"Unnamed: 0": times, "001": np.arange(48), "002": 5}).to_csv(folder / "volume.csv", index=False)
+        times = pd.date_range("2023-04-01", periods=days * 24, freq="h")
+        pd.DataFrame({"Unnamed: 0": times, "001": np.arange(len(times)), "002": 5}).to_csv(folder / "volume.csv", index=False)
         pd.DataFrame({"time": times, "001": 0.4, "002": 0.0}).to_csv(folder / "e_price.csv", index=False)
         pd.DataFrame({"site_id": ["001", "002"], "longitude": [1, 2], "latitude": [1, 2],
                       "total_volume": [100000, 100000], "avg_power": [999, 999]}).to_csv(folder / "sites.csv", index=False)
@@ -128,6 +176,34 @@ class DatasetTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 RunConfig.from_mapping({"max_parallel_datasets": value})
 
+    def test_random_zones_reproducible_distinct_and_independent_of_model_rng(self):
+        profiles = pd.DataFrame({"zone_id": [str(i) for i in range(20)]})
+        state = random.getstate()
+        selected = select_experiment_zone_ids(profiles, count=5, selection="random", seed=42)
+        self.assertEqual(len(set(selected)), 5)
+        self.assertEqual(random.getstate(), state)
+        reordered = profiles.iloc[::-1]
+        self.assertEqual(selected, select_experiment_zone_ids(reordered, count=5, selection="random", seed=42))
+        self.assertNotEqual(selected, select_experiment_zone_ids(profiles, count=5, selection="random", seed=43))
+        self.assertEqual(set(select_experiment_zone_ids(profiles.head(3), count=5, selection="random")), {"0", "1", "2"})
+
+    def test_random_zone_config_reaches_experiment_matrix(self):
+        spec = self.charged()
+        config = self.root / "random.yaml"
+        config.write_text(yaml.safe_dump({"agent": {}, "run": {
+            "data_dir": str(spec.path), "output_folder": str(self.root / "out"),
+            "forecast_model": "AR", "forecast_start": "2023-04-02", "experiment_zone_count": 5,
+            "experiment_zone_selection": "random", "experiment_zone_seed": 123,
+        }}), encoding="utf-8")
+        with patch("main.run_experiment_matrix", return_value={}) as matrix:
+            main(["--config", str(config)])
+        self.assertEqual(matrix.call_args.kwargs["experiment_zone_count"], 5)
+        self.assertEqual(matrix.call_args.kwargs["experiment_zone_selection"], "random")
+        self.assertEqual(matrix.call_args.kwargs["experiment_zone_seed"], 123)
+        self.assertEqual(RunConfig.from_mapping({}).experiment_zone_selection, "representative")
+        with self.assertRaisesRegex(ValueError, "experiment_zone_selection"):
+            RunConfig.from_mapping({"experiment_zone_selection": "unknown"})
+
     def test_outputs_are_isolated_even_for_identically_named_folders(self):
         root = self.root / "output"
         paths = {scoped_output(root, name, self.root / folder)
@@ -209,6 +285,48 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(kwargs["forecast_models"], ["AR", "lstm"])
         self.assertIsNone(kwargs["zone_ids"])
         self.assertEqual(kwargs["lstm_device"], "auto")
+
+    def test_two_automatic_origins_share_random_sites_across_runs(self):
+        spec = self.charged(days=31)
+        config = self.root / "two_starts.yaml"
+        settings = {"agent": {}, "run": {
+            "data_dir": str(spec.path), "output_folder": str(self.root / "out"),
+            "forecast_model": "AR", "pipeline_stage": "forecaster", "forecast_start_count": 2,
+            "history_days": 7, "validation_days": 1, "horizon_days": 2,
+            "experiment_zone_selection": "random", "experiment_zone_count": 1,
+            "experiment_zone_seed": 42,
+        }}
+        config.write_text(yaml.safe_dump(settings), encoding="utf-8")
+        with patch("orchestrator.run_pipeline", return_value={}) as pipeline:
+            main(["--config", str(config)])
+        calls = [call.kwargs for call in pipeline.call_args_list]
+        self.assertEqual([pd.Timestamp(call["forecast_start"]) for call in calls],
+                         [pd.Timestamp("2023-04-16"), pd.Timestamp("2023-04-23")])
+        self.assertTrue(all(call["zone_ids"] == ["001"] for call in calls))
+        # Count alone also activates the matrix when representative selection is retained.
+        settings["run"]["experiment_zone_selection"] = "representative"
+        config.write_text(yaml.safe_dump(settings), encoding="utf-8")
+        with patch("main.run_experiment_matrix", return_value={}) as matrix:
+            main(["--config", str(config)])
+        self.assertEqual(matrix.call_args.kwargs["forecast_starts"],
+                         ["2023-04-16T00:00:00", "2023-04-23T00:00:00"])
+
+    def test_explicit_forecast_origins_override_automatic_count(self):
+        spec = self.charged()
+        config = self.root / "explicit.yaml"
+        settings = {"agent": {}, "run": {
+            "data_dir": str(spec.path), "output_folder": str(self.root / "out"),
+            "forecast_models": ["AR", "lstm"], "forecast_start_count": 2,
+            "forecast_starts": ["2023-04-02"], "horizon_days": 1,
+        }}
+        config.write_text(yaml.safe_dump(settings), encoding="utf-8")
+        with patch("main.evenly_spaced_forecast_starts") as automatic, \
+                patch("main.run_experiment_matrix", return_value={}) as matrix:
+            main(["--config", str(config)])
+            self.assertEqual(matrix.call_args.kwargs["forecast_starts"], ["2023-04-02"])
+            main(["--config", str(config), "--forecast-start", "2023-04-01"])
+            self.assertEqual(matrix.call_args.kwargs["forecast_starts"], ["2023-04-01"])
+            automatic.assert_not_called()
 
     def test_parallel_forwards_config_and_reports_each_failure(self):
         folders = [self.root / "one", self.root / "two"]

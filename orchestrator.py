@@ -5,6 +5,7 @@ import copy
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import traceback
@@ -35,6 +36,7 @@ from config import (
     normalize_agent_mode,
     normalize_forecast_model_name,
     normalize_pipeline_stage,
+    normalize_zone_selection,
 )
 from data_loader import (
     build_zone_3h_load_policy_thresholds,
@@ -850,6 +852,8 @@ def run_experiment_matrix(
     forecast_models: Iterable[str],
     zone_ids: str | Iterable[str] | None = None,
     experiment_zone_count: int = 12,
+    experiment_zone_selection: str = "representative",
+    experiment_zone_seed: int = 42,
     experiment_seeds: Iterable[int] | None = None,
     agent_modes: Iterable[str] | None = None,
     diurnal_blend_alphas: Iterable[float] | None = None,
@@ -899,9 +903,11 @@ def run_experiment_matrix(
             forecast_start=selection_start,
             force_cache=base_force_cache,
         )
-        selected_zone_ids = select_representative_zone_ids(
+        selected_zone_ids = select_experiment_zone_ids(
             profiles,
             count=experiment_zone_count,
+            selection=experiment_zone_selection,
+            seed=experiment_zone_seed,
         )
     resolved_experiment_name = normalize_experiment_name(
         experiment_name,
@@ -1483,6 +1489,18 @@ def long_metric_frame(frame: pd.DataFrame, *, metrics: list[str], metric_family:
                 }
             )
     return pd.DataFrame(rows)
+
+
+def select_experiment_zone_ids(
+    profiles: pd.DataFrame, *, count: int, selection: str = "representative", seed: int = 42,
+) -> list[str]:
+    """Select once for all model/mode combinations without changing model RNG state."""
+    if normalize_zone_selection(selection) == "representative":
+        return select_representative_zone_ids(profiles, count=count)
+    candidates = sorted(profiles["zone_id"].astype(str).unique())
+    if not candidates:
+        raise ValueError("Cannot select random zones from an empty profile table.")
+    return random.Random(seed).sample(candidates, k=max(1, min(int(count), len(candidates))))
 
 
 def select_representative_zone_ids(profiles: pd.DataFrame, *, count: int) -> list[str]:

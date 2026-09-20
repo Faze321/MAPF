@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from config import DataConfig, RunConfig
-from dataset_adapter import DatasetSpec, load_canonical_dataset, validate_forecaster_dataset_source
-from dataset_profiles import apply_dataset_profile, output_lock, scoped_output
-from extra_dataset_adapters import MPEVDataDatasetAdapter, tou_schedule
+from dataset_adapter import (DatasetSpec, load_canonical_dataset, validate_forecaster_dataset_source,
+                             MPEVDataDatasetAdapter, tou_schedule, resolve_dataset_spec, merge_cache_manifest,
+                             replace_cache_file)
+from reporting import output_lock, scoped_output
 from forecasting import summarize_weather
 from global_forecaster import scenario_price_series
-from train_datasets import dataset_job
+from main import main
+from orchestrator import run_dataset_batch
 
 
 def tariff_frame(rows):
@@ -107,27 +112,33 @@ class DatasetTests(unittest.TestCase):
         self.assertIn("A7", data.feature_manifest["excluded_sites"])
         self.assertNotIn("Total Orders", data.static_zone_features)
 
-    def test_switch_drops_previous_dataset_specific_inputs(self):
-        run = RunConfig(data_dir="old", forecast_start="2022-01-01", forecast_starts=["2022-01-01"],
-                        zone_ids=["115"], precomputed_window_data="old.csv", forecaster_output_dir="old-model", lstm_epochs=7)
-        run, data = apply_dataset_profile(run, DataConfig(cache_dir="old-cache"), "mp-evdata", None, self.root / "none.yaml")
-        self.assertEqual(run.data_dir, "data/MP-EVData")
-        self.assertEqual(run.forecast_start, "2024-11-01 00:00:00")
-        self.assertIsNone(run.forecast_starts)
+    def test_folder_config_and_automatic_defaults(self):
+        folder = str(self.root / "folder with spaces,commas")
+        self.assertEqual(RunConfig.from_mapping({"data_dir": folder}).data_dir, folder)
+        run = RunConfig.from_mapping({"data_dir": [folder, str(self.root / "other")]})
+        self.assertEqual(len(run.data_dir), 2)
+        self.assertEqual(DataConfig.from_mapping({}).adapter, "auto")
+        self.assertIsNone(run.forecast_start)
         self.assertIsNone(run.zone_ids)
-        self.assertIsNone(run.forecaster_output_dir)
-        self.assertIsNone(data.cache_dir)
-        self.assertEqual(run.lstm_epochs, 7)
+        self.assertEqual(run.lstm_device, "auto")
+        for value in [[], "", 4, [None], [folder, folder]]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RunConfig.from_mapping({"data_dir": value})
+        for value in [0, -1, 1.5, True]:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                RunConfig.from_mapping({"max_parallel_datasets": value})
 
-    def test_outputs_are_isolated_and_legacy_preserved(self):
+    def test_outputs_are_isolated_even_for_identically_named_folders(self):
         root = self.root / "output"
-        self.assertEqual(scoped_output(root, "urbanev", self.root, explicit_dataset=False), root)
-        paths = {scoped_output(root, name, Path(city), explicit_dataset=True)
-                 for name, city in [("urbanev", "UrbanEV"), ("charged", "LOA"), ("charged", "JHB"), ("mp_evdata", "MP-EVData")]}
+        paths = {scoped_output(root, name, self.root / folder)
+                 for name, folder in [("urbanev", "UrbanEV"), ("charged", "one/JHB"), ("charged", "two/JHB"), ("mp_evdata", "MP-EVData")]}
         self.assertEqual(len(paths), 4)
+        self.assertNotIn(root, paths)
+        self.assertEqual(scoped_output(root, "charged", self.root / "one/JHB"),
+                         scoped_output(root, "charged", self.root / "one/JHB/../JHB"))
 
     def test_run_lock_blocks_other_process_and_releases(self):
-        code = "from pathlib import Path; from dataset_profiles import output_lock; import sys\nwith output_lock(Path(sys.argv[1])): pass"
+        code = "from pathlib import Path; from reporting import output_lock; import sys\nwith output_lock(Path(sys.argv[1])): pass"
         with output_lock(self.root):
             result = subprocess.run([sys.executable, "-c", code, str(self.root)], capture_output=True)
             self.assertNotEqual(result.returncode, 0)
@@ -135,22 +146,128 @@ class DatasetTests(unittest.TestCase):
         result = subprocess.run([sys.executable, "-c", code, str(self.root)], capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_concurrent_cache_index_updates_keep_all_entries(self):
+        path = self.root / "cache_manifest.json"
+        code = ("from pathlib import Path; from dataset_adapter import merge_cache_manifest; import sys\n"
+                "for i in range(20): merge_cache_manifest(Path(sys.argv[1]), {'datasets': {sys.argv[2] + str(i): {}}})")
+        workers = [subprocess.Popen([sys.executable, "-c", code, str(path), str(i)],
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE) for i in range(3)]
+        try:
+            results = [worker.communicate(timeout=30) for worker in workers]
+        finally:
+            for worker in workers:
+                if worker.poll() is None:
+                    worker.kill()
+                    worker.communicate()
+        for worker, (_, stderr) in zip(workers, results):
+            self.assertEqual(worker.returncode, 0, stderr)
+        self.assertEqual(len(json.loads(path.read_text())["datasets"]), 60)
+        with patch("dataset_adapter.atomic_write_json") as write:
+            merge_cache_manifest(path, {"datasets": {"00": {}}})
+        write.assert_not_called()
+
+    def test_cache_replace_retries_only_transient_windows_file_locks(self):
+        error = PermissionError("file in use")
+        error.winerror = 32
+        with patch("dataset_adapter.os.name", "nt"), patch("dataset_adapter.os.replace", side_effect=[error, None]) as replace, patch("dataset_adapter.time.sleep"):
+            replace_cache_file("source", "target")
+        self.assertEqual(replace.call_count, 2)
+        with patch("dataset_adapter.os.replace", side_effect=PermissionError("denied")), self.assertRaises(PermissionError):
+            replace_cache_file("source", "target")
+
     def test_missing_weather_is_not_reported_as_zero_weather(self):
         times = pd.date_range("2024-01-01", periods=24, freq="h")
         summary = summarize_weather(pd.DataFrame({"time": times}), times.min(), times.max())
         self.assertTrue(all(value is None for value in summary.values()))
 
-    def test_parallel_job_parsing(self):
-        self.assertEqual(dataset_job("charged:loa"), ("charged", "LOA"))
-        self.assertEqual(dataset_job("mp-evdata"), ("mp_evdata", None))
-        with self.assertRaises(ValueError):
-            dataset_job("urbanev:LOA")
+    def test_auto_detection_uses_files_not_folder_name(self):
+        spec = self.charged()
+        folder = spec.path.with_name("arbitrary folder")
+        spec.path.rename(folder)
+        self.assertEqual(resolve_dataset_spec(DatasetSpec(folder, adapter="auto")).adapter, "charged")
+        (folder / "inf.csv").write_text("TAZID\n1\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "unambiguously"):
+            resolve_dataset_spec(DatasetSpec(folder, adapter="auto"))
+        (folder / "sites.csv").unlink()
+        self.assertEqual(resolve_dataset_spec(DatasetSpec(folder, adapter="auto")).adapter, "urbanev")
+        for name in [MPEVDataDatasetAdapter.load_filename, "price.xlsx"]:
+            (self.root / name).touch()
+        self.assertEqual(resolve_dataset_spec(DatasetSpec(self.root, adapter="auto")).adapter, "mp_evdata")
+
+    def test_config_only_entrypoint_resolves_matrix_date_from_data(self):
+        spec = self.charged()
+        config = self.root / "config.yaml"
+        config.write_text(yaml.safe_dump({"agent": {}, "run": {
+            "data_dir": str(spec.path), "output_folder": str(self.root / "out"),
+            "forecast_models": ["AR", "lstm"], "horizon_days": 1, "dry_run": True,
+        }}), encoding="utf-8")
+        with patch("main.run_experiment_matrix", return_value={}) as run:
+            main(["--config", str(config)])
+        kwargs = run.call_args.kwargs
+        self.assertEqual(kwargs["dataset_spec"].adapter, "charged")
+        self.assertEqual(kwargs["forecast_starts"], ["2023-04-02T00:00:00"])
+        self.assertEqual(kwargs["forecast_models"], ["AR", "lstm"])
+        self.assertIsNone(kwargs["zone_ids"])
+        self.assertEqual(kwargs["lstm_device"], "auto")
+
+    def test_parallel_forwards_config_and_reports_each_failure(self):
+        folders = [self.root / "one", self.root / "two"]
+        for folder in folders:
+            folder.mkdir()
+        argv = ["--config", "config with spaces.yaml", "--forecast-model", "lstm"]
+        def execute(command, **kwargs):
+            self.assertEqual(command[2:6], argv)
+            self.assertEqual(command[6], "--data-dir")
+            self.assertNotIn("--device", command)
+            return subprocess.CompletedProcess(command, 1 if str(folders[0]) in command else 0)
+        with patch("orchestrator.subprocess.run", side_effect=execute), self.assertRaisesRegex(RuntimeError, "dataset runs failed"):
+            run_dataset_batch(folders, argv=argv, output_dir=self.root / "out", max_workers=2)
+        manifest = json.loads(next((self.root / "out").glob("*/batch_manifest.json")).read_text())
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(sorted(job["returncode"] for job in manifest["jobs"]), [0, 1])
+        self.assertEqual(len({job["log"] for job in manifest["jobs"]}), 2)
+
+    def test_config_list_dispatch_and_single_folder_override(self):
+        spec = self.charged()
+        config = self.root / "config.yaml"
+        content = {"agent": {}, "run": {
+            "data_dir": [str(spec.path)], "output_folder": str(self.root / "out"),
+            "forecast_model": "AR", "pipeline_stage": "forecaster", "max_parallel_datasets": 3,
+        }}
+        config.write_text(yaml.safe_dump(content), encoding="utf-8")
+        with patch("main.run_dataset_batch", return_value={}) as batch:
+            main(["--config", str(config)])
+        self.assertEqual(batch.call_args.args[0], [spec.path])
+        self.assertEqual(batch.call_args.kwargs["max_workers"], 3)
+        self.assertFalse(batch.call_args.kwargs["reuse_outputs"])
+        with patch("main.run_pipeline", return_value={}) as run, patch("main.run_dataset_batch") as batch:
+            main(["--config", str(config), "--data-dir", str(spec.path)])
+        batch.assert_not_called()
+        self.assertEqual(run.call_args.kwargs["pipeline_stage"], "forecaster")
+        with patch("main.run_dataset_batch", return_value={}) as batch:
+            main(["--config", str(config), "--stage", "agent"])
+        self.assertTrue(batch.call_args.kwargs["reuse_outputs"])
+        content["run"]["forecaster_output_dir"] = "shared"
+        config.write_text(yaml.safe_dump(content), encoding="utf-8")
+        with patch("main.run_dataset_batch") as batch, self.assertRaisesRegex(ValueError, "forecaster_output_dir"):
+            main(["--config", str(config)])
+        batch.assert_not_called()
+
+    def test_parallel_agent_reuses_the_selected_output_root(self):
+        folder = self.root / "dataset"
+        folder.mkdir()
+        output = self.root / "previous-batch"
+        with patch("orchestrator.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            result = run_dataset_batch([folder], argv=[], output_dir=output, max_workers=1, reuse_outputs=True)
+        self.assertEqual(run.call_args.args[0][-2:], ["--output-folder", str(output.resolve())])
+        manifest = json.loads(result["batch_manifest_json"].read_text())
+        self.assertEqual(manifest["status"], "success")
 
     def test_forecaster_handoff_rejects_wrong_dataset_and_city(self):
         spec = DatasetSpec(self.root / "JHB", adapter="charged")
         with self.assertRaisesRegex(ValueError, "adapter"):
             validate_forecaster_dataset_source(spec, {"adapter": "mp_evdata"})
-        with self.assertRaisesRegex(ValueError, "different dataset directory/city"):
+        with self.assertRaisesRegex(ValueError, "different dataset directory"):
             validate_forecaster_dataset_source(spec, {"adapter": "charged", "data_dir": str(self.root / "LOA")})
         validate_forecaster_dataset_source(spec, {"adapter": "charged", "data_dir": str(spec.path)})
         validate_forecaster_dataset_source(DatasetSpec(self.root, adapter="mp-evdata"), {"adapter": "mp_evdata", "data_dir": str(self.root)})

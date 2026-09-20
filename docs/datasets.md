@@ -1,7 +1,7 @@
 # 多数据集训练
 
-项目支持 UrbanEV、CHARGED 和 MP-EVData。原有不带 `--dataset` 的命令和
-UrbanEV 数据保持兼容；使用 `--dataset` 可启用独立路径与合适的预测日期。
+项目支持 UrbanEV、CHARGED 和 MP-EVData。数据读取统一在 `dataset_adapter.py`，
+并行调度统一在 `orchestrator.py`，训练入口统一为 `python main.py`。
 
 ## 下载和来源
 
@@ -25,77 +25,98 @@ MP-EVData 的发布许可为 CC BY 4.0。CHARGED 的数据和辅助来源使用�
 官方发布说明；引用数据论文：[CHARGED](https://www.nature.com/articles/s41597-025-05584-7)、
 [MP-EVData](https://www.nature.com/articles/s41597-026-07273-5)。
 
-## 切换训练
+## 修改配置切换数据集
 
-```powershell
-python main.py --dataset urbanev --forecast-model AR --diurnal-blend-alpha 0 --pipeline-stage forecaster
-python main.py --dataset charged --city JHB --forecast-model AR --diurnal-blend-alpha 0 --pipeline-stage forecaster
-python main.py --dataset mp_evdata --forecast-model AR --diurnal-blend-alpha 0 --pipeline-stage forecaster
-```
-
-`--dataset mp-evdata` 也是合法写法。CHARGED 支持 AMS/JHB/LOA/MEL/SPO/SZH，默认 JHB。
-将 `AR` 换成 `lstm`、`chronos` 或 `timesfm` 使用其他现有后端。
-`--device cpu/cuda/auto` 覆盖 LSTM/Chronos 设备，`--lstm-epochs N` 覆盖训练轮数。
-TimesFM 沿用它自身的设备选择逻辑。
-
-| 数据集 | 原始文件目录 | 默认预测起点 | 默认输出目录 |
-|---|---|---|---|
-| UrbanEV | `data/UrbanEV` | 2022-10-14 | `output/urbanev` |
-| CHARGED | `data/CHARGED/<city>` | 2023-06-01 | `output/charged/<city>` |
-| MP-EVData | `data/MP-EVData` | 2024-11-01 | `output/mp_evdata` |
-
-每个数据目录的 `cache/` 保存自己的指纹缓存、特征和时间划分；模型及评估输出
-保存在对应输出目录内。`--output-folder` 指定的是公共根目录，仍会追加数据集/
-城市子目录。直接使用新适配器 `--dataset-adapter charged/mp_evdata` 也会隔离输出，
-但不会自动切换路径、时间或站点；通常应使用 `--dataset`。
-
-配置优先级：基础 `run` 的模型训练参数 → 数据集默认路径/日期 →
-`datasets.<name>.run/data` → CLI 参数。切换会清除旧数据集的区域列表、日期列表、
-数据映射、缓存路径及旧模型/窗口文件引用。可在 `config.yaml` 中显式覆盖，例如：
+在 `config.yaml` 的现有 `data`、`run` 段中修改这些字段，然后运行 `python main.py`：
 
 ```yaml
-datasets:
-  mp_evdata:
-    run:
-      forecast_start: "2024-11-01 00:00:00"
-      zones: ["A1", "A2", "A3", "A6", "A10"]
-      horizon_days: 2
-      lstm_epochs: 50
+data:
+  adapter: auto
+run:
+  data_dir: data/MP-EVData
+  forecast_start: null
+  forecast_starts: null
+  zones: null
 ```
 
-没有 `--dataset` 的原有 UrbanEV 命令沿用原先输出路径；新命令不会复用或覆盖旧输出。
-直接配置 `--forecaster-output-dir` 或 `--agent-output-dir` 是显式路径覆盖，应为不同
-数据集设置不同目录。Agent 阶段检查适配器和数据指纹，拒绝混用其他数据集的模型。
+只需更改 `run.data_dir` 即可切换：
+
+| 数据集 | 文件夹 |
+|---|---|
+| UrbanEV | `data/UrbanEV` |
+| CHARGED | `data/CHARGED/AMS`、`JHB`、`LOA`、`MEL`、`SPO`、`SZH` 对应的城市目录 |
+| MP-EVData | `data/MP-EVData` |
+
+也可以填写其他绝对路径或相对于当前工作目录的路径。识别依据是原始文件布局，
+文件夹可以改名。CHARGED 必须指向包含 `volume.csv`、`e_price.csv`、`sites.csv` 的
+城市文件夹；UrbanEV 使用 `volume.csv`、`e_price.csv`、`inf.csv`；MP-EVData 使用
+`station-level load Profile 1h.xlsx` 和 `price.xlsx`。缺失或混合格式会明确报错。
+自定义长表继续使用 `data.adapter: long_format` 和原有字段映射。
+
+`forecast_start`、`forecast_starts` 都留空时，使用当前数据最后 `horizon_days` 天
+作为预测窗口，此前数据作为训练历史。`zones: null` 从当前数据自动选站。
+显式填写日期或站点时会按你的配置执行，因此跨数据集切换时需使用该数据集的日期和编号。
+模型、轮数、Agent 模式和其他训练参数仍使用原有 `run` 字段。
+无需设置设备；后端自动选择可用设备。
+
+原先新增的 `--dataset`、`--city`、`--device` 和 `datasets` 配置块已移除，
+不再需要 `train_datasets.py`。原有模型、阶段等 CLI 参数仍可覆盖配置；
+`--data-dir` 可临时指定单个文件夹。
 
 ## 并行训练
 
-```powershell
-python train_datasets.py --datasets urbanev charged:JHB mp_evdata --models lstm --max-workers 3 --device cpu
-# 多城市；每个数据集进程内部依次运行所列模型
-python train_datasets.py --datasets charged:JHB charged:LOA mp_evdata --models AR lstm --max-workers 2
+将同一个 `run.data_dir` 改为列表，仍然运行 `python main.py`：
+
+```yaml
+data:
+  adapter: auto
+run:
+  data_dir:
+    - data/UrbanEV
+    - data/CHARGED/JHB
+    - data/MP-EVData
+  max_parallel_datasets: 2
+  output_folder: output
+  forecast_start: null
+  forecast_starts: null
+  zones: null
+  forecast_models: [lstm]
+  pipeline_stage: forecaster
 ```
 
-每个数据集/城市用独立 Python 子进程。默认只训练 forecaster，不调用 Agent API。
-默认模型是 AR；`--models` 可指定多个后端。每批创建唯一的
-`output/parallel/<UTC时间>_<随机ID>/`，包含各数据集日志和 `batch_manifest.json`，
-后者记录命令、退出码和整批状态。单个任务失败会记录非零退出码，其他任务继续完成。
-重复的数据集/城市任务会拒绝启动，输出目录也有进程锁，防止同时覆盖。
+每个文件夹用独立 Python 子进程，最多同时运行 `max_parallel_datasets` 个任务。
+各进程共享配置中的训练参数；一个数据集内部依次执行模型/种子/模式矩阵。
+`pipeline_stage: forecaster` 只训练预测模型；`full` 执行完整闭环；
+`dry_run: true` 使用确定性离线 Agent，不调用 API。
+单任务出错时其他任务继续执行，最终进程返回失败并在清单中记录各自退出码。
 
-`--max-workers` 控制同时运行的数据集数量。多个 GPU 模型会共享显存；单卡显存不足时
-降低并发数或用 `--device cpu`。这不是多 GPU 自动分配器。
+多模型共用机器资源，`max_parallel_datasets` 可调整并发数量。
+设备选择仍由各模型自动完成。
 
-完整闭环离线验证：
+## 缓存与结果隔离
 
-```powershell
-python train_datasets.py --datasets urbanev charged:LOA mp_evdata --models AR --max-workers 3 --pipeline-stage full --dry-run
+每个数据目录的 `cache/` 保存指纹缓存、特征和时间划分。
+单个数据集的结果写入：
+
+```text
+<output_folder>/<adapter>/<folder>_<path-hash>/<原有实验和模型目录>
 ```
 
-正式 Agent 实验去掉 `--dry-run`，使用已有 `config.yaml` 的 Agent 配置。
-单独重用某数据集 forecaster 时保持相同的模型、起点、区域和输出根目录，例如：
+路径散列保证不同位置的同名文件夹也不会混用结果。
+并行训练在上述结构外再增加 `<UTC时间>_<随机ID>/` 批次目录，
+其中的 `batch_manifest.json` 记录数据路径、启动命令、日志和退出码。
+旧结果保留在原位置，新运行采用上述目录结构。
+每个输出目录都有进程锁，防止两个进程同时写入。
 
-```powershell
-python main.py --dataset mp_evdata --forecast-model AR --diurnal-blend-alpha 0 --pipeline-stage agent --dry-run
-```
+列表运行时，`data.cache_dir`、`run.forecaster_output_dir`、
+`run.agent_output_dir`、`run.precomputed_window_data` 保持 `null`，
+避免多个数据集共用显式覆盖路径；程序会检查这一点。
+
+单个数据集重用模型时，将 `pipeline_stage` 改为 `agent`，其他实验设置保持一致。
+并行批次重用模型时，还需将 `output_folder` 指向之前的批次目录；
+子进程会从该目录下各自的数据集输出中读取，新的调度日志放在独立子目录。
+也可以使用单个 `data_dir`，并通过 `forecaster_output_dir` 精确指定旧模型目录。
+Agent 阶段校验适配器、数据目录和数据指纹，拒绝混用其他数据集的模型。
 
 ## 数据语义和质量策略
 
@@ -119,8 +140,8 @@ python main.py --dataset mp_evdata --forecast-model AR --diurnal-blend-alpha 0 -
 - A4、A9：电价表为空，站点元数据标为 Free。
 - A5：1 月、12 月缺少 21:00–22:00 电价，保守地排除整个站点，不填补未知价格。
 - A7、A8：`session_count` 是换电次数，不是电量。
-- A10：实测记录从 2024-09-27 开始。默认起点设为 11 月以保证历史窗口可用；
-  如果使用更早起点，需通过 `--zones` 排除尚未投运的站点。
+- A10：实测记录从 2024-09-27 开始。自动日期使用数据尾部的预测窗口；
+  如果手动指定更早起点，需通过 `run.zones` 排除尚未投运的站点。
 - 不使用有歧义的合并容量单元格或全年的订单总数；保留真实站点类型。
 - 没有天气数据时天气摘要为缺失，不伪造温湿度或降雨。
 

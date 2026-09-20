@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+from contextlib import contextmanager
 import re
 from pathlib import Path
 from typing import Any
@@ -1552,3 +1555,39 @@ def markdown_table(frame: pd.DataFrame) -> str:
         for _, row in display.iterrows()
     ]
     return "\n".join([header, separator, *rows]) + "\n"
+
+
+def dataset_folder_key(data_path: Path) -> str:
+    resolved = data_path.resolve()
+    digest = hashlib.sha256(os.path.normcase(str(resolved)).encode("utf-8")).hexdigest()[:10]
+    return f"{safe_filename(resolved.name)}_{digest}"
+
+
+def scoped_output(root: Path, adapter: str, data_path: Path) -> Path:
+    """Distinct physical dataset folders never share model/Agent output."""
+    return root / adapter / dataset_folder_key(data_path)
+
+
+@contextmanager
+def output_lock(directory: Path):
+    """An OS-released process lock prevents simultaneous writers to one output root."""
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / ".mapf-run.lock").open("a+b", buffering=0) as handle:
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError(f"Another run is writing to {directory}; use a different --output-folder") from exc
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

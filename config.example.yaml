@@ -19,7 +19,7 @@ agent:
     provider_json_retry_backoff_seconds: 1.0
 
 data:
-  adapter: "urbanev" # options: "urbanev", "charged", "mp_evdata", "long_format"
+  adapter: "auto" # detects the format from files in run.data_dir
   cache_dir: null # defaults to <run.data_dir>/cache
   timeseries_file: null # required for long_format
   column_mapping: {} # semantic field -> source column
@@ -29,6 +29,8 @@ data:
 
 run:
   data_dir: "data/UrbanEV"
+  # A list of folders runs datasets in parallel; see docs/datasets.md.
+  max_parallel_datasets: 2
   output_folder: "output" # root folder for generated outputs
   experiment_name: null # optional; null keeps the automatic experiment-matrix name
   weather_file: "weather_central.csv"
@@ -39,12 +41,8 @@ run:
   agent_output_dir: null # optional override; normally written beside forecaster/
   precomputed_window_data: null # path to a previous window_load_price_cache.csv
   max_poi_rows: null
-  forecast_start: "2022-09-09 00:00:00"
-  forecast_starts:
-    - "2022-09-09 00:00:00"
-    - "2022-10-14 00:00:00"
-    - "2022-12-16 00:00:00"
-    - "2023-02-10 00:00:00"
+  forecast_start: null # latest complete forecast window in this dataset
+  forecast_starts: null # optional explicit dates; null follows forecast_start
   horizon_days: 2
   history_days: 7
   validation_days: 1
@@ -90,7 +88,6 @@ run:
   chronos_repo: "amazon/chronos-2"
   chronos_context_hours: 168
   chronos_step_horizon: 24
-  chronos_device: "auto"
   chronos_roll_actuals: false
 
 # LSTM
@@ -109,42 +106,7 @@ run:
   lstm_epochs: 50
   lstm_learning_rate: 0.001
   lstm_batch_size: 32
-  lstm_device: "auto"
   lstm_roll_actuals: false
   lstm_seed: 42
-  zones:
-    - "115"
-    - "215"
-    - "328"
-    - "512"
-    - "576"
-    - "633"
-    - "686"
-    - "705"
-    - "732"
-    - "783"
-    - "855"
-    - "883"
-    - "903"
-    - "972"
-    - "988"
-    - "1011"
-    - "1074"
-    - "1095"
-    - "1112"
-    - "1135"
+  zones: null # automatically select sites from the current dataset
   temperature: 0.2
-
-# Optional overrides applied only when --dataset selects this profile.
-# CLI flags have final precedence. Model/provider settings above are shared.
-datasets:
-  urbanev:
-    run:
-      forecast_start: "2022-10-14 00:00:00"
-  charged:
-    run:
-      forecast_start: "2023-06-01 00:00:00"
-  mp_evdata:
-    run:
-      forecast_start: "2024-11-01 00:00:00"
-      zones: ["A1", "A2", "A3", "A6", "A10"]

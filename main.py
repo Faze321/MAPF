@@ -15,9 +15,9 @@ from config import (
     normalize_pipeline_stage,
     normalize_string_list,
 )
-from dataset_adapter import DatasetSpec
-from dataset_profiles import apply_dataset_profile, output_lock, scoped_output
-from orchestrator import format_failure_message, run_experiment_matrix, run_pipeline
+from dataset_adapter import DatasetSpec, default_forecast_start, resolve_dataset_spec
+from reporting import output_lock, scoped_output
+from orchestrator import format_failure_message, run_dataset_batch, run_experiment_matrix, run_pipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -26,15 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run Multi-Agent Prescriptive Forecasting on EV charging datasets.",
     )
     parser.add_argument("--config", default="config.yaml", help="YAML config file for run and model settings.")
-    parser.add_argument("--dataset", choices=["urbanev", "charged", "mp_evdata", "mp-evdata"], help="Select isolated dataset defaults and outputs; overrides data-specific settings of the base config.")
-    parser.add_argument("--city", choices=["AMS", "JHB", "LOA", "MEL", "SPO", "SZH"], help="CHARGED city (default JHB).")
-    parser.add_argument("--device", choices=["auto", "cpu", "cuda"], help="Device override for LSTM and Chronos.")
     parser.add_argument("--lstm-epochs", type=int, help="Override LSTM training epochs.")
-    parser.add_argument("--data-dir", default=None, help="Directory containing UrbanEV CSV files.")
+    parser.add_argument("--data-dir", default=None, help="Dataset folder; overrides run.data_dir for one run.")
     parser.add_argument(
         "--dataset-adapter",
         default=None,
-        help="Dataset adapter: urbanev, charged, mp_evdata or long_format. Use --dataset for date/path defaults.",
+        help="Dataset adapter: auto (default), urbanev, charged, mp_evdata or long_format.",
     )
     parser.add_argument(
         "--cache-dir",
@@ -131,7 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=None,
         help=(
-            "UrbanEV zone id(s) to validate directly. If omitted, the pipeline keeps the automatic five-zone category selection."
+            "Dataset zone/site id(s). If omitted, select from the current dataset automatically."
         ),
     )
     parser.add_argument(
@@ -184,19 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = build_parser().parse_args(argv)
     config_path = Path(args.config)
     app_config = AppConfig.from_file(config_path, required=False, load_agent=False)
     run_config = app_config.run
     data_config = app_config.data
-    if args.dataset:
-        run_config, data_config = apply_dataset_profile(run_config, data_config, args.dataset, args.city, config_path)
-        if args.dataset_adapter and args.dataset_adapter.replace("-", "_") != data_config.adapter:
-            raise ValueError("--dataset-adapter conflicts with --dataset")
-    elif args.city:
-        raise ValueError("--city requires --dataset charged")
-    if args.device:
-        run_config = replace(run_config, lstm_device=args.device, chronos_device=args.device)
     if args.lstm_epochs is not None:
         if args.lstm_epochs < 1:
             raise ValueError("--lstm-epochs must be positive")
@@ -204,6 +194,31 @@ def main(argv: list[str] | None = None):
     pipeline_stage = normalize_pipeline_stage(
         args.pipeline_stage if args.pipeline_stage is not None else run_config.pipeline_stage
     )
+    data_dirs = args.data_dir if args.data_dir is not None else run_config.data_dir
+    if isinstance(data_dirs, list):
+        # A shared explicit artifact/cache path would defeat dataset isolation.
+        for key, configured in (
+            ("forecaster_output_dir", run_config.forecaster_output_dir),
+            ("agent_output_dir", run_config.agent_output_dir),
+            ("precomputed_window_data", run_config.precomputed_window_data),
+            ("cache_dir", data_config.cache_dir),
+        ):
+            if getattr(args, key) or configured:
+                raise ValueError(f"Keep {key} null when run.data_dir is a list; each dataset uses its own directory")
+        # Validate every folder before launching any training process.
+        for folder in data_dirs:
+            resolve_dataset_spec(DatasetSpec(Path(folder), adapter=args.dataset_adapter or data_config.adapter,
+                                            timeseries_file=args.timeseries_file or data_config.timeseries_file))
+        outputs = run_dataset_batch(
+            [Path(folder) for folder in data_dirs], argv=argv,
+            output_dir=Path(args.output_folder or run_config.output_folder),
+            max_workers=run_config.max_parallel_datasets,
+            reuse_outputs=pipeline_stage == "agent",
+        )
+        print("Generated outputs:")
+        for name, path in outputs.items():
+            print(f"- {name}: {path}")
+        return outputs
     forecaster_output_dir = (
         args.forecaster_output_dir
         if args.forecaster_output_dir is not None
@@ -282,8 +297,8 @@ def main(argv: list[str] | None = None):
         else run_config.diurnal_blend_alpha
     )
 
-    resolved_data_dir = Path(args.data_dir or run_config.data_dir)
-    dataset_spec = DatasetSpec(
+    resolved_data_dir = Path(data_dirs)
+    dataset_spec = resolve_dataset_spec(DatasetSpec(
         path=resolved_data_dir,
         adapter=args.dataset_adapter or data_config.adapter,
         weather_file=args.weather_file or run_config.weather_file,
@@ -295,13 +310,13 @@ def main(argv: list[str] | None = None):
         static_file=data_config.static_file,
         static_mapping=data_config.static_mapping,
         unit_conversions=data_config.unit_conversions,
-    )
+    ))
     common_kwargs = {
         "data_dir": resolved_data_dir,
         "dataset_spec": dataset_spec,
         "cache_dir": dataset_spec.resolved_cache_dir,
         "output_dir": scoped_output(Path(args.output_folder or run_config.output_folder), dataset_spec.adapter,
-                                    resolved_data_dir, explicit_dataset=bool(args.dataset)),
+                                    resolved_data_dir),
         "config_path": config_path,
         "model": args.model,
         "weather_file": args.weather_file or run_config.weather_file,
@@ -362,7 +377,7 @@ def main(argv: list[str] | None = None):
     with output_lock(Path(agent_output_dir) if agent_output_dir else common_kwargs["output_dir"]):
         if run_matrix:
             if not forecast_starts:
-                raise ValueError("Experiment matrix requires at least one forecast start.")
+                forecast_starts = [default_forecast_start(dataset_spec, common_kwargs["horizon_days"])]
             outputs = run_experiment_matrix(
                 experiment_name=experiment_name,
                 forecast_starts=forecast_starts,
@@ -381,6 +396,7 @@ def main(argv: list[str] | None = None):
     print("Generated outputs:")
     for name, path in outputs.items():
         print(f"- {name}: {path}")
+    return outputs
 
 
 def cli(argv: list[str] | None = None) -> int:

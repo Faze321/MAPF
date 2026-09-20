@@ -1,0 +1,32 @@
+{
+  "dataset": "mp_evdata",
+  "doi": "10.6084/m9.figshare.29882366.v3",
+  "license": {
+    "value": 1,
+    "name": "CC BY 4.0",
+    "url": "https://creativecommons.org/licenses/by/4.0/"
+  },
+  "files": [
+    {
+      "path": "data\\MP-EVData\\station-level load Profile 1h.xlsx",
+      "size": 1357733,
+      "algorithm": "md5",
+      "checksum": "ef44311080071c9a2473c41e53043346",
+      "url": "https://ndownloader.figshare.com/files/57103439"
+    },
+    {
+      "path": "data\\MP-EVData\\price.xlsx",
+      "size": 32754,
+      "algorithm": "md5",
+      "checksum": "91f731775f4c4d6b82c6b872babee4f7",
+      "url": "https://ndownloader.figshare.com/files/57103421"
+    },
+    {
+      "path": "data\\MP-EVData\\README.md",
+      "size": 3125,
+      "algorithm": "md5",
+      "checksum": "19ff20b81a82f6dc243eafc23eff799c",
+      "url": "https://ndownloader.figshare.com/files/57105062"
+    }
+  ]
+}

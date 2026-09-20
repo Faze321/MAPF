@@ -9,6 +9,25 @@ import yaml
 
 PIPELINE_STAGES = {"full", "forecaster", "agent"}
 
+
+def positive_integer(value: Any, key: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f'{key} must be a positive integer')
+    return value
+
+
+def normalize_data_dirs(value: Any) -> str | list[str]:
+    if value is None:
+        return "data/UrbanEV"
+    paths = value if isinstance(value, list) else [value]
+    if not paths or any(not isinstance(path, str) or not path.strip() for path in paths):
+        raise ValueError('run.data_dir must be a folder path or a non-empty list of folder paths')
+    paths = [path.strip() for path in paths]
+    resolved = [os.path.normcase(str(Path(path).resolve())) for path in paths]
+    if len(set(resolved)) != len(resolved):
+        raise ValueError('run.data_dir contains duplicate dataset folders')
+    return paths if isinstance(value, list) else paths[0]
+
 _ENV_REF_RE = re.compile(r"""
                          \$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\} 
                          |\$(?P<plain>[A-Za-z_][A-Za-z0-9_]*) 
@@ -18,7 +37,7 @@ _ENV_REF_RE = re.compile(r"""
 
 @dataclass(frozen=True)
 class DataConfig:
-    adapter: str = "urbanev"
+    adapter: str = "auto"
     cache_dir: str | None = None
     timeseries_file: str | None = None
     column_mapping: dict[str, str] = field(default_factory=dict)
@@ -39,7 +58,7 @@ class DataConfig:
         if not isinstance(unit_conversions, dict):
             raise ValueError('Config key "data.unit_conversions" must contain a mapping')
         return cls(
-            adapter=optional_str(settings.get("adapter")) or "urbanev",
+            adapter=optional_str(settings.get("adapter")) or "auto",
             cache_dir=optional_str(settings.get("cache_dir")),
             timeseries_file=optional_str(settings.get("timeseries_file")),
             column_mapping={str(key): str(value) for key, value in column_mapping.items()},
@@ -51,7 +70,8 @@ class DataConfig:
 
 @dataclass(frozen=True)
 class RunConfig:
-    data_dir: str = "data"
+    data_dir: str | list[str] = "data/UrbanEV"
+    max_parallel_datasets: int = 2
     output_dir: str = "output"
     experiment_name: str | None = None
     weather_file: str = "weather_airport.csv"
@@ -143,7 +163,8 @@ class RunConfig:
         lstm_seed = optional_int(settings.get("lstm_seed"))
         temperature = optional_float(settings.get("temperature"))
         return cls(
-            data_dir=optional_str(settings.get("data_dir")) or "data",
+            data_dir=normalize_data_dirs(settings.get("data_dir")),
+            max_parallel_datasets=positive_integer(settings.get("max_parallel_datasets", 2), "run.max_parallel_datasets"),
             output_dir=(
                 optional_str(settings.get("output_folder"))
                 or optional_str(settings.get("output_dir"))
@@ -188,7 +209,7 @@ class RunConfig:
             chronos_diurnal_blend_alpha=(
                 chronos_diurnal_blend_alpha if chronos_diurnal_blend_alpha is not None else 0.0
             ),
-            chronos_device=optional_str(settings.get("chronos_device")) or "auto",
+            chronos_device="auto",
             chronos_roll_actuals=False,
             lstm_context_hours=lstm_context_hours if lstm_context_hours is not None else 24,
             lstm_step_horizon=lstm_step_horizon if lstm_step_horizon is not None else 24,
@@ -199,7 +220,7 @@ class RunConfig:
             lstm_learning_rate=lstm_learning_rate if lstm_learning_rate is not None else 0.001,
             lstm_batch_size=lstm_batch_size if lstm_batch_size is not None else 32,
             lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha if lstm_diurnal_blend_alpha is not None else 0.0,
-            lstm_device=optional_str(settings.get("lstm_device")) or "auto",
+            lstm_device="auto",
             lstm_roll_actuals=False,
             lstm_seed=lstm_seed if lstm_seed is not None else 42,
             temperature=temperature if temperature is not None else 0.2,

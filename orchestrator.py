@@ -4,7 +4,13 @@ import asyncio
 import copy
 import json
 import math
+import os
+import subprocess
+import sys
 import traceback
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -46,9 +52,62 @@ from load_policy import (
     classify_load_percentage,
     load_range_position_pct,
 )
-from reporting import safe_filename, write_agent_outputs, write_forecaster_outputs
+from reporting import dataset_folder_key, safe_filename, write_agent_outputs, write_forecaster_outputs
 from time_utils import normalize_datetime_series_24h, parse_datetime_24h
 from zone_selection import select_zone_categories
+
+
+def run_dataset_batch(data_dirs: list[Path], *, argv: list[str], output_dir: Path, max_workers: int,
+                      reuse_outputs: bool = False):
+    """Run the same config for each folder in bounded, independent Python processes."""
+    if max_workers < 1:
+        raise ValueError("run.max_parallel_datasets must be positive")
+    paths = [path.resolve() for path in data_dirs]
+    if not paths or len(set(paths)) != len(paths):
+        raise ValueError("Dataset folders must be non-empty and distinct")
+    batch = output_dir / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
+    batch.mkdir(parents=True)
+    child_output = output_dir if reuse_outputs else batch
+    jobs = []
+    for path in paths:
+        key = dataset_folder_key(path)
+        command = [sys.executable, str(Path(__file__).resolve().with_name("main.py")), *argv,
+                   "--data-dir", str(path), "--output-folder", str(child_output.resolve())]
+        jobs.append({"data_dir": str(path), "command": command, "log": str(batch / f"{key}.log")})
+    manifest = {"status": "running", "max_workers": max_workers,
+                "output_folder": str(child_output.resolve()), "jobs": jobs}
+    manifest_path = batch / "batch_manifest.json"
+
+    def save():
+        temporary = manifest_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        temporary.replace(manifest_path)
+
+    def execute(job):
+        print(f"Starting {job['data_dir']}; log: {job['log']}", flush=True)
+        env = {**os.environ, "PYTHONUNBUFFERED": "1", "MPLBACKEND": "Agg"}
+        env.setdefault("OMP_NUM_THREADS", "1")
+        env.setdefault("MKL_NUM_THREADS", "1")
+        with Path(job["log"]).open("w", encoding="utf-8") as log:
+            result = subprocess.run(job["command"], stdout=log, stderr=subprocess.STDOUT, env=env, check=False)
+        return result.returncode
+
+    save()
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pending = {pool.submit(execute, job): job for job in jobs}
+        for future in as_completed(pending):
+            job = pending[future]
+            try:
+                job["returncode"] = future.result()
+            except Exception as exc:
+                job["returncode"], job["error"] = 1, str(exc)
+            print(f"Finished {job['data_dir']}: exit={job['returncode']}", flush=True)
+            save()
+    manifest["status"] = "success" if all(job["returncode"] == 0 for job in jobs) else "failed"
+    save()
+    if manifest["status"] == "failed":
+        raise RuntimeError(f"One or more dataset runs failed; see {manifest_path} and the individual logs")
+    return {"batch_dir": batch, "batch_manifest_json": manifest_path}
 
 
 STRESS_LEVEL_ORDER = {

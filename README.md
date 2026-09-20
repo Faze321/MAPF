@@ -4,7 +4,7 @@ MAPF separates forecasting from price control and keeps forecast-period ground t
 
 ## Architecture
 
-1. **Dataset adapter and cache** converts UrbanEV or a mapped long-format dataset to a canonical schema. Reusable dataset features are stored under `<dataset_path>/cache/`.
+1. **Dataset adapter and cache** converts UrbanEV, CHARGED, MP-EVData, or a mapped long-format dataset to a canonical schema. Reusable dataset features are stored under `<dataset_path>/cache/`.
 2. **Global forecaster** fits once at a fixed origin, calibrates validation bias, and persists a reusable artifact. Price proposals reuse this artifact; no control attempt retrains the model.
 3. **Control engine** runs either Grid → Behaviour → Economist or a single Agent, proposes one energy price per continuous 3-hour window, reforecasts, and accepts a run only when every Zone/window is `Medium`.
 4. **Evaluation** is kept separate from the no-leakage handoff and authoritative control result.
@@ -18,14 +18,31 @@ The load-policy bands use the position within each Zone's pre-origin historical 
 
 ## Dataset adapters and cache
 
-UrbanEV, CHARGED (six separate cities), and MP-EVData are supported. Use
-`--dataset urbanev`, `--dataset charged --city JHB`, or `--dataset mp_evdata`
-to switch dataset paths, forecast dates and isolated output namespaces.
-`python train_datasets.py --datasets urbanev charged:JHB mp_evdata --models lstm --max-workers 3 --device cpu`
-trains them in separate processes with individual logs and unique batch output.
+Set `run.data_dir` in `config.yaml`, then run `python main.py`. The default
+`data.adapter: auto` recognizes UrbanEV, CHARGED, and MP-EVData from their files.
+Use a single folder to switch datasets, or a list to train in separate processes:
+
+```yaml
+data:
+  adapter: auto
+run:
+  data_dir: data/MP-EVData # or data/UrbanEV, data/CHARGED/JHB
+  # For parallel training, replace the value above with:
+  # data_dir: [data/UrbanEV, data/CHARGED/JHB, data/MP-EVData]
+  max_parallel_datasets: 2
+  forecast_start: null
+  forecast_starts: null
+  zones: null
+```
+
+Null dates select the dataset's last complete forecast window; null zones select
+sites from that dataset. Explicit dates and sites remain supported for controlled
+experiments. Devices are selected automatically by the existing model backends.
+Outputs use `<output_folder>/<adapter>/<folder>_<path-hash>/`; parallel batches
+add a unique parent folder, individual logs, and `batch_manifest.json`.
 See [dataset setup, filtering rules and parallel training](docs/datasets.md).
 
-UrbanEV is the default adapter. A generic long-format dataset can be configured with explicit semantic mappings:
+A generic long-format dataset can be configured with explicit semantic mappings:
 
 ```yaml
 data:
@@ -106,8 +123,8 @@ python main.py --output-folder output --experiment-name my_experiment
 
 `experiment_name` identifies one complete experiment matrix; it does not rename
 ordinary single-model output. An unnamed matrix keeps the existing descriptive
-name, for example `output/3zonesx4timesx4modes_2blends`. A custom name is
-written as `output/my_experiment`.
+name, for example `<dataset-output>/3zonesx4timesx4modes_2blends`. A custom name is
+written as `<dataset-output>/my_experiment`, inside the dataset's isolated output folder.
 
 Stages can be separated without changing the fitted state:
 

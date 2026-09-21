@@ -8,6 +8,7 @@ __pycache__/
 .pytest_cache/
 
 test/
+tests/
 test.py
 test.ipynb
 config.yaml
@@ -16,6 +17,8 @@ config.yaml
 tmp/
 .agents/
 .codex/
+
+docs/
 
 # Dataset
 data/

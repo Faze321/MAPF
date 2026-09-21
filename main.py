@@ -20,7 +20,7 @@ from dataset_adapter import (DatasetSpec, default_forecast_start, evenly_spaced_
                              load_canonical_dataset, resolve_dataset_spec)
 from reporting import output_lock, scoped_output
 from orchestrator import (format_failure_message, run_dataset_batch, run_experiment_matrix,
-                          run_pipeline, select_experiment_zone_ids)
+                          run_pipeline)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -362,11 +362,6 @@ def main(argv: list[str] | None = None):
                     forecast_starts = [default_forecast_start(dataset_spec, common_kwargs["horizon_days"])]
                 else:
                     dataset = load_canonical_dataset(dataset_spec, force_cache=common_kwargs["force_cache"])
-                    if common_kwargs["zone_ids"] is None and run_config.experiment_zone_selection == "random":
-                        common_kwargs["zone_ids"] = select_experiment_zone_ids(
-                            dataset.static_zone_features, count=common_kwargs["experiment_zone_count"],
-                            selection="random", seed=run_config.experiment_zone_seed,
-                        )
                     forecast_starts = evenly_spaced_forecast_starts(
                         dataset.timeseries, count=run_config.forecast_start_count,
                         history_days=common_kwargs["history_days"],

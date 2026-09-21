@@ -31,6 +31,7 @@ from agents import (
 )
 from config import (
     AgentConfig,
+    RunConfig,
     BACKEND_PARAMETER_NAMES,
     agent_config_profile,
     normalize_agent_mode,
@@ -60,6 +61,7 @@ from load_policy import (
 from reporting import dataset_folder_key, safe_filename, write_agent_outputs, write_forecaster_outputs
 from time_utils import normalize_datetime_series_24h, parse_datetime_24h
 from zone_selection import select_zone_categories
+from zone_eligibility import load_zone_eligibility
 
 
 def run_dataset_batch(data_dirs: list[Path], *, argv: list[str], output_dir: Path, max_workers: int,
@@ -876,6 +878,7 @@ def run_experiment_matrix(
     shared_cache_dir = Path(pipeline_kwargs.pop("cache_dir", data_dir / "cache"))
     shared_cache_dir.mkdir(parents=True, exist_ok=True)
     base_force_cache = bool(pipeline_kwargs.pop("force_cache", False))
+    selection_artifacts: dict[str, Path] = {}
     if not selected_zone_ids:
         matrix_dataset_spec = pipeline_kwargs.get("dataset_spec") or DatasetSpec(
             path=data_dir,
@@ -886,29 +889,54 @@ def run_experiment_matrix(
             matrix_dataset_spec,
             force_cache=base_force_cache,
         )
-        selection_start = pd.Timestamp(min(starts))
-        selection_split_key = split_cache_key(
-            canonical_dataset.dataset_fingerprint,
-            selection_start,
-            window_hours=3,
-            policy_id="historical_3h_min_max_range_35_80_90",
-        )
-        profiles = build_zone_profiles_from_canonical(
-            canonical_dataset,
-            shared_cache_dir
-            / "datasets"
-            / canonical_dataset.dataset_fingerprint
-            / "splits"
-            / selection_split_key,
-            forecast_start=selection_start,
-            force_cache=base_force_cache,
-        )
+        if normalize_zone_selection(experiment_zone_selection) == "random":
+            eligibility = load_zone_eligibility(
+                canonical_dataset,
+                forecast_starts=starts,
+                history_days=pipeline_kwargs.get("history_days", RunConfig.history_days),
+                validation_days=pipeline_kwargs.get("validation_days", RunConfig.validation_days),
+                force_cache=base_force_cache,
+            )
+            selection_artifacts = {
+                "zone_eligibility_json": Path(eligibility["cache_path"]),
+                "zone_eligibility_csv": Path(eligibility["csv_path"]),
+            }
+            eligible_ids = eligibility["eligible_zone_ids"]
+            requested_count = max(1, int(experiment_zone_count))
+            if len(eligible_ids) < requested_count:
+                raise ValueError(
+                    f"Only {len(eligible_ids)} eligible zones remain for {requested_count} requested random zones. "
+                    "Both load and electricity price must vary in history before the first validation period, "
+                    "and all training windows must be complete. "
+                    "Choose another dataset/date or reduce run.experiment_zone_count. "
+                    f"See eligibility reasons: {eligibility['cache_path']}"
+                )
+            profiles = pd.DataFrame({"zone_id": eligible_ids})
+        else:
+            selection_start = pd.Timestamp(min(starts))
+            selection_split_key = split_cache_key(
+                canonical_dataset.dataset_fingerprint,
+                selection_start,
+                window_hours=3,
+                policy_id="historical_3h_min_max_range_35_80_90",
+            )
+            profiles = build_zone_profiles_from_canonical(
+                canonical_dataset,
+                shared_cache_dir
+                / "datasets"
+                / canonical_dataset.dataset_fingerprint
+                / "splits"
+                / selection_split_key,
+                forecast_start=selection_start,
+                force_cache=base_force_cache,
+            )
         selected_zone_ids = select_experiment_zone_ids(
             profiles,
             count=experiment_zone_count,
             selection=experiment_zone_selection,
             seed=experiment_zone_seed,
         )
+        del canonical_dataset
     resolved_experiment_name = normalize_experiment_name(
         experiment_name,
         default=experiment_slug(
@@ -1002,6 +1030,7 @@ def run_experiment_matrix(
                             "diurnal_blend_alpha": blend_alpha,
                             "zone_count": len(selected_zone_ids),
                             "zone_ids": ",".join(selected_zone_ids),
+                            "zone_eligibility_cache": str(selection_artifacts.get("zone_eligibility_json", "")),
                             "run_output_dir": str(run_output_dir),
                             "status": "running",
                             "error": "",
@@ -1082,6 +1111,7 @@ def run_experiment_matrix(
     )
     write_decision_quality_summary(prices, rationales, decision_summary_path)
     return {
+        **selection_artifacts,
         "experiment_dir": experiment_dir,
         "experiment_runs_csv": runs_path,
         "experiment_forecast_metrics_csv": metrics_path,

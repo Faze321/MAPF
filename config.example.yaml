@@ -111,6 +111,6 @@ run:
   lstm_seed: 42
   zones: null # automatically select sites from the current dataset
   experiment_zone_count: 12
-  experiment_zone_selection: representative # random samples distinct sites once per dataset
+  experiment_zone_selection: representative # random samples cached eligible sites with varying load AND energy price
   experiment_zone_seed: 42 # fixed seed keeps the same sites across models and Agent modes
   temperature: 0.2

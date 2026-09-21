@@ -9,7 +9,6 @@ import random
 import subprocess
 import sys
 import traceback
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from collections.abc import Iterable
@@ -44,7 +43,8 @@ from data_loader import (
     build_zone_profiles_from_canonical,
     load_pipeline_data,
 )
-from dataset_adapter import DatasetSpec, load_canonical_dataset, split_cache_key, validate_forecaster_dataset_source
+from dataset_adapter import (DatasetSpec, load_canonical_dataset, split_cache_key,
+                             validate_forecaster_dataset_source, process_file_lock, atomic_write_json)
 from forecasting import ForecastResult, forecast_zone
 from global_forecaster import NATIVE_ARTIFACT_SCHEMA_VERSION, NativeForecasterArtifact
 from load_policy import (
@@ -65,30 +65,34 @@ from zone_eligibility import load_zone_eligibility
 
 
 def run_dataset_batch(data_dirs: list[Path], *, argv: list[str], output_dir: Path, max_workers: int,
-                      reuse_outputs: bool = False):
+                      experiment_name: str | None = None, reuse_outputs: bool = False):
     """Run the same config for each folder in bounded, independent Python processes."""
     if max_workers < 1:
         raise ValueError("run.max_parallel_datasets must be positive")
     paths = [path.resolve() for path in data_dirs]
     if not paths or len(set(paths)) != len(paths):
         raise ValueError("Dataset folders must be non-empty and distinct")
-    batch = output_dir / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "_" + uuid.uuid4().hex[:8])
-    batch.mkdir(parents=True)
-    child_output = output_dir if reuse_outputs else batch
+    resolved_name = normalize_experiment_name(experiment_name, default="experiment")
+    batch = output_dir / resolved_name
+    log_dir = batch / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
     jobs = []
     for path in paths:
         key = dataset_folder_key(path)
         command = [sys.executable, str(Path(__file__).resolve().with_name("main.py")), *argv,
-                   "--data-dir", str(path), "--output-folder", str(child_output.resolve())]
-        jobs.append({"data_dir": str(path), "command": command, "log": str(batch / f"{key}.log")})
+                   "--data-dir", str(path)]
+        if experiment_name:
+            command.extend(["--experiment-name", resolved_name])
+        command.extend(["--output-folder", str(output_dir.resolve())])
+        jobs.append({"data_dir": str(path), "command": command, "log": str(log_dir / f"{key}.log")})
     manifest = {"status": "running", "max_workers": max_workers,
-                "output_folder": str(child_output.resolve()), "jobs": jobs}
+                "output_folder": str(output_dir.resolve()), "experiment_name": resolved_name,
+                "experiment_dir": str(batch.resolve()), "reuse_outputs": reuse_outputs,
+                "started_at": datetime.now(timezone.utc).isoformat(), "jobs": jobs}
     manifest_path = batch / "batch_manifest.json"
 
     def save():
-        temporary = manifest_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-        temporary.replace(manifest_path)
+        atomic_write_json(manifest_path, manifest)
 
     def execute(job):
         print(f"Starting {job['data_dir']}; log: {job['log']}", flush=True)
@@ -99,21 +103,24 @@ def run_dataset_batch(data_dirs: list[Path], *, argv: list[str], output_dir: Pat
             result = subprocess.run(job["command"], stdout=log, stderr=subprocess.STDOUT, env=env, check=False)
         return result.returncode
 
-    save()
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        pending = {pool.submit(execute, job): job for job in jobs}
-        for future in as_completed(pending):
-            job = pending[future]
-            try:
-                job["returncode"] = future.result()
-            except Exception as exc:
-                job["returncode"], job["error"] = 1, str(exc)
-            print(f"Finished {job['data_dir']}: exit={job['returncode']}", flush=True)
-            save()
-    manifest["status"] = "success" if all(job["returncode"] == 0 for job in jobs) else "failed"
-    save()
-    if manifest["status"] == "failed":
-        raise RuntimeError(f"One or more dataset runs failed; see {manifest_path} and the individual logs")
+    with process_file_lock(batch / ".mapf-batch.lock", blocking=False,
+                           conflict_message=f"Another dataset batch is writing to {batch}; use a different experiment_name"):
+        save()
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            pending = {pool.submit(execute, job): job for job in jobs}
+            for future in as_completed(pending):
+                job = pending[future]
+                try:
+                    job["returncode"] = future.result()
+                except Exception as exc:
+                    job["returncode"], job["error"] = 1, str(exc)
+                print(f"Finished {job['data_dir']}: exit={job['returncode']}", flush=True)
+                save()
+        manifest["status"] = "success" if all(job["returncode"] == 0 for job in jobs) else "failed"
+        manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
+        save()
+        if manifest["status"] == "failed":
+            raise RuntimeError(f"One or more dataset runs failed; see {manifest_path} and the individual logs")
     return {"batch_dir": batch, "batch_manifest_json": manifest_path}
 
 
@@ -937,16 +944,9 @@ def run_experiment_matrix(
             seed=experiment_zone_seed,
         )
         del canonical_dataset
-    resolved_experiment_name = normalize_experiment_name(
-        experiment_name,
-        default=experiment_slug(
-            zone_count=len(selected_zone_ids),
-            time_count=len(starts),
-            mode_count=len(requested_modes),
-            blend_count=len(blend_alphas),
-        ),
-    )
-    experiment_dir = output_dir / resolved_experiment_name
+    resolved_experiment_name = normalize_experiment_name(experiment_name, default="experiment")
+    # main resolves <output_folder>/<experiment_name>/<dataset> once for every stage.
+    experiment_dir = output_dir
     experiment_dir.mkdir(parents=True, exist_ok=True)
 
     runs_path = experiment_dir / "experiment_runs.csv"
@@ -1016,13 +1016,17 @@ def run_experiment_matrix(
                             if add_blend_folder and blend_alpha is not None:
                                 shared_run_base_dir = shared_run_base_dir / f"blend_{alpha_text}"
                             if not run_kwargs.get("forecaster_output_dir"):
+                                mode_forecaster = run_output_dir / "forecaster"
+                                shared_forecaster = forecast_output_dir(shared_run_base_dir, forecast_model) / "forecaster"
                                 run_kwargs["forecaster_output_dir"] = (
-                                    forecast_output_dir(shared_run_base_dir, forecast_model)
-                                    / "forecaster"
+                                    mode_forecaster
+                                    if (mode_forecaster / "forecaster_manifest.json").is_file()
+                                    else shared_forecaster
                                 )
                             if not run_kwargs.get("agent_output_dir"):
                                 run_kwargs["agent_output_dir"] = run_output_dir / "agent"
                         record: dict[str, Any] = {
+                            "experiment_name": resolved_experiment_name,
                             "forecast_start": forecast_start,
                             "forecast_model": forecast_model,
                             "experiment_seed": seed,

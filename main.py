@@ -20,7 +20,7 @@ from dataset_adapter import (DatasetSpec, default_forecast_start, evenly_spaced_
                              load_canonical_dataset, resolve_dataset_spec)
 from reporting import output_lock, scoped_output
 from orchestrator import (format_failure_message, run_dataset_batch, run_experiment_matrix,
-                          run_pipeline)
+                          run_pipeline, normalize_experiment_name)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -58,7 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Name of this experiment under <output-folder>. If omitted, "
-            "the existing automatic matrix name is used."
+            "run.experiment_name or the stable default 'experiment' is used."
         ),
     )
     parser.add_argument("--weather-file", default=None, help="Weather CSV file under data-dir.")
@@ -197,6 +197,11 @@ def main(argv: list[str] | None = None):
     pipeline_stage = normalize_pipeline_stage(
         args.pipeline_stage if args.pipeline_stage is not None else run_config.pipeline_stage
     )
+    experiment_name = (
+        args.experiment_name if args.experiment_name is not None else run_config.experiment_name
+    )
+    resolved_experiment_name = normalize_experiment_name(experiment_name, default="experiment")
+    output_root = Path(args.output_folder or run_config.output_folder)
     data_dirs = args.data_dir if args.data_dir is not None else run_config.data_dir
     if isinstance(data_dirs, list):
         # A shared explicit artifact/cache path would defeat dataset isolation.
@@ -214,7 +219,8 @@ def main(argv: list[str] | None = None):
                                             timeseries_file=args.timeseries_file or data_config.timeseries_file))
         outputs = run_dataset_batch(
             [Path(folder) for folder in data_dirs], argv=argv,
-            output_dir=Path(args.output_folder or run_config.output_folder),
+            output_dir=output_root,
+            experiment_name=experiment_name,
             max_workers=run_config.max_parallel_datasets,
             reuse_outputs=pipeline_stage == "agent",
         )
@@ -232,12 +238,6 @@ def main(argv: list[str] | None = None):
         if args.agent_output_dir is not None
         else run_config.agent_output_dir
     )
-    experiment_name = (
-        args.experiment_name
-        if args.experiment_name is not None
-        else run_config.experiment_name
-    )
-
     cli_starts = normalize_string_list(args.forecast_starts)
     if cli_starts:
         forecast_starts = cli_starts
@@ -320,7 +320,7 @@ def main(argv: list[str] | None = None):
         "data_dir": resolved_data_dir,
         "dataset_spec": dataset_spec,
         "cache_dir": dataset_spec.resolved_cache_dir,
-        "output_dir": scoped_output(Path(args.output_folder or run_config.output_folder), dataset_spec.adapter,
+        "output_dir": scoped_output(output_root / resolved_experiment_name, dataset_spec.adapter,
                                     resolved_data_dir),
         "config_path": config_path,
         "model": args.model,
@@ -370,7 +370,7 @@ def main(argv: list[str] | None = None):
                     )
                     del dataset
             outputs = run_experiment_matrix(
-                experiment_name=experiment_name,
+                experiment_name=resolved_experiment_name,
                 experiment_zone_selection=run_config.experiment_zone_selection,
                 experiment_zone_seed=run_config.experiment_zone_seed,
                 forecast_starts=forecast_starts,

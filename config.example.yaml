@@ -31,8 +31,8 @@ run:
   data_dir: "data/UrbanEV"
   # A list of folders runs datasets in parallel; see docs/datasets.md.
   max_parallel_datasets: 2
-  output_folder: "output" # root folder for generated outputs
-  experiment_name: null # optional; null keeps the automatic experiment-matrix name
+  output_folder: "output" # outputs: <output_folder>/<experiment_name>/<dataset>/...
+  experiment_name: null # null uses the stable folder name "experiment"
   weather_file: "weather_central.csv"
   dry_run: false
   force_cache: false

@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from dataset_adapter import process_file_lock
+from dataset_adapter import atomic_write_json, process_file_lock
 from usage import (
     aggregate_usage, cumulative_global_agent_usage as derive_global_cumulative_usage,
     token_total_summary as token_total_payload, usage_integer as reporting_usage_integer,
@@ -1483,13 +1483,67 @@ def dataset_folder_key(data_path: Path) -> str:
 
 
 def scoped_output(root: Path, adapter: str, data_path: Path) -> Path:
-    """Distinct physical dataset folders never share model/Agent output."""
-    return root / adapter / dataset_folder_key(data_path)
+    """Bind a readable dataset directory beneath an already resolved experiment root."""
+    adapter = str(adapter).strip().lower().replace("-", "_")
+    adapter = {"urban_ev": "urbanev", "mpevdata": "mp_evdata",
+               "generic": "long", "long_format": "long"}.get(adapter, adapter)
+    resolved = data_path.resolve()
+    normalized_path = os.path.normcase(str(resolved))
+    identity = hashlib.sha256(f"{adapter}\0{normalized_path}".encode("utf-8")).hexdigest()
+    registry_path = root / ".dataset_directories.json"
+    with process_file_lock(root / ".dataset_directories.lock", blocking=True):
+        bindings = _read_dataset_directory_bindings(registry_path)
+        if identity in bindings:
+            return root / bindings[identity]["directory"]
+
+        display = {"urbanev": "UrbanEV", "charged": "CHARGED",
+                   "mp_evdata": "MP-EVData"}.get(adapter, safe_filename(adapter))
+        leaf = safe_filename(resolved.name)
+        same_name = re.sub(r"[-_]", "", leaf).casefold() == re.sub(r"[-_]", "", display).casefold()
+        base = display if same_name or not leaf else f"{display}_{leaf}"
+        if not base:
+            raise ValueError("Dataset output directory must contain a nonempty adapter or folder name")
+        # Case-fold even on POSIX so moving an experiment to Windows stays safe.
+        occupied = {entry["directory"].casefold() for entry in bindings.values()}
+        occupied.update(child.name.casefold() for child in root.iterdir())
+        directory = base
+        digest_length = 10
+        while directory.casefold() in occupied:
+            if digest_length > len(identity):
+                raise ValueError(f"Cannot allocate a distinct dataset output directory beneath {root}")
+            directory = f"{base}_{identity[:digest_length]}"
+            digest_length = min(digest_length + 10, len(identity) + 1)
+        bindings[identity] = {"adapter": adapter, "data_path": normalized_path, "directory": directory}
+        atomic_write_json(registry_path, {"schema_version": 1, "datasets": bindings})
+        return root / directory
+
+
+def _read_dataset_directory_bindings(path: Path) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"Cannot read dataset output registry {path}; restore the registry or use another experiment_name") from exc
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or not isinstance(payload.get("datasets"), dict):
+        raise ValueError(f"Invalid dataset output registry: {path}")
+    bindings = payload["datasets"]
+    directories: set[str] = set()
+    for identity, entry in bindings.items():
+        if not isinstance(entry, dict) or any(not isinstance(entry.get(key), str) or not entry[key]
+                                               for key in ("adapter", "data_path", "directory")):
+            raise ValueError(f"Invalid dataset binding in output registry: {path}")
+        directory = entry["directory"]
+        expected_identity = hashlib.sha256(f"{entry['adapter']}\0{entry['data_path']}".encode("utf-8")).hexdigest()
+        if identity != expected_identity or directory != safe_filename(directory) or directory.casefold() in directories:
+            raise ValueError(f"Invalid or conflicting dataset binding in output registry: {path}")
+        directories.add(directory.casefold())
+    return bindings
 
 
 def output_lock(directory: Path):
     """An OS-released process lock prevents simultaneous writers to one output root."""
     return process_file_lock(
         directory / ".mapf-run.lock", blocking=False,
-        conflict_message=f"Another run is writing to {directory}; use a different --output-folder",
+        conflict_message=f"Another run is writing to {directory}; use a different experiment_name or --output-folder",
     )

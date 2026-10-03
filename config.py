@@ -44,6 +44,11 @@ def positive_integer(value: Any, key: str) -> int:
     return value
 
 
+def dataset_path_key(path: str | Path) -> str:
+    """Match dataset folders consistently for relative paths and batch child processes."""
+    return os.path.normcase(str(Path(path).resolve()))
+
+
 def normalize_data_dirs(value: Any) -> str | list[str]:
     if value is None:
         return "data/UrbanEV"
@@ -51,10 +56,26 @@ def normalize_data_dirs(value: Any) -> str | list[str]:
     if not paths or any(not isinstance(path, str) or not path.strip() for path in paths):
         raise ValueError('run.data_dir must be a folder path or a non-empty list of folder paths')
     paths = [path.strip() for path in paths]
-    resolved = [os.path.normcase(str(Path(path).resolve())) for path in paths]
+    resolved = [dataset_path_key(path) for path in paths]
     if len(set(resolved)) != len(resolved):
         raise ValueError('run.data_dir contains duplicate dataset folders')
     return paths if isinstance(value, list) else paths[0]
+
+
+def normalize_experiment_zone_counts(value: Any) -> dict[str, int]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("run.experiment_zone_counts must map dataset folder paths to positive integers")
+    counts = {}
+    for folder, count in value.items():
+        if not isinstance(folder, str) or not folder.strip():
+            raise ValueError("run.experiment_zone_counts keys must be non-empty dataset folder paths")
+        key = dataset_path_key(folder.strip())
+        if key in counts:
+            raise ValueError(f"run.experiment_zone_counts contains duplicate dataset folder: {folder}")
+        counts[key] = positive_integer(count, f"run.experiment_zone_counts[{folder}]")
+    return counts
 
 _ENV_REF_RE = re.compile(r"""
                          \$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\} 
@@ -116,6 +137,7 @@ class RunConfig:
     validation_days: int = 1
     zone_ids: list[str] | None = None
     experiment_zone_count: int = 12
+    experiment_zone_counts: dict[str, int] = field(default_factory=dict)
     experiment_zone_selection: str = "representative"
     experiment_zone_seed: int = 42
     forecast_model: str = "timesfm"
@@ -159,6 +181,9 @@ class RunConfig:
         """Canonical output root; output_dir remains as a compatibility alias."""
 
         return self.output_dir
+
+    def zone_count_for(self, data_dir: str | Path) -> int:
+        return self.experiment_zone_counts.get(dataset_path_key(data_dir), self.experiment_zone_count)
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> "RunConfig":
@@ -206,6 +231,7 @@ class RunConfig:
         return cls(
             **numeric_settings,
             data_dir=normalize_data_dirs(settings.get("data_dir")),
+            experiment_zone_counts=normalize_experiment_zone_counts(settings.get("experiment_zone_counts")),
             max_parallel_datasets=positive_integer(settings.get("max_parallel_datasets", 2), "run.max_parallel_datasets"),
             output_dir=(
                 optional_str(settings.get("output_folder"))

@@ -915,7 +915,8 @@ def run_experiment_matrix(
                     f"Only {len(eligible_ids)} eligible zones remain for {requested_count} requested random zones. "
                     "Both load and electricity price must vary in history before the first validation period, "
                     "and all training windows must be complete. "
-                    "Choose another dataset/date or reduce run.experiment_zone_count. "
+                    "Choose another dataset/date or reduce its configured zone count "
+                    "(run.experiment_zone_counts or run.experiment_zone_count). "
                     f"See eligibility reasons: {eligibility['cache_path']}"
                 )
             profiles = pd.DataFrame({"zone_id": eligible_ids})

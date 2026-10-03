@@ -144,7 +144,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--experiment-zone-count",
         type=int,
         default=None,
-        help="Representative zone count for experiment matrices when --zones is omitted.",
+        help="Override automatic zone counts for all datasets; explicit --zones still takes priority.",
     )
     parser.add_argument(
         "--experiment-seeds",
@@ -285,6 +285,8 @@ def main(argv: list[str] | None = None):
         or bool(diurnal_blend_alphas and len(diurnal_blend_alphas) > 1)
         or bool(experiment_name)
         or run_config.experiment_zone_selection == "random"
+        or bool(run_config.experiment_zone_counts)
+        or args.experiment_zone_count is not None
         or (not forecast_starts and run_config.forecast_start_count > 1)
     )
 
@@ -343,7 +345,7 @@ def main(argv: list[str] | None = None):
         "experiment_zone_count": (
             args.experiment_zone_count
             if args.experiment_zone_count is not None
-            else run_config.experiment_zone_count
+            else run_config.zone_count_for(resolved_data_dir)
         ),
         "agent_mode": agent_mode,
         **{name: getattr(run_config, name) for name in BACKEND_PARAMETER_NAMES},

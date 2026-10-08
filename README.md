@@ -273,6 +273,73 @@ The default destination is `<input>/analysis/`. `evaluation.json` includes metri
 definitions, coverage, per-run/Zone/window details, and the optional LLM analysis.
 CSV tables are `forecaster_global_metrics.csv`, `forecaster_run_metrics.csv`,
 `agent_summary.csv`, and `agent_run_metrics.csv` (only populated sections are written).
+The evaluator also writes `evaluation_report_zh.md`, a deterministic Chinese report,
+and the four PPT-style tables `ppt_forecast.csv`, `ppt_medium.csv`,
+`ppt_first_entries.csv`, and `ppt_tokens.csv`. It does not generate plots; the
+existing optional LLM analyzer remains opt-in.
+
+To compare multiple experiment batches, use unique labels and a separate output:
+
+```powershell
+python evaluate.py --batch 27B=output/random5_start2_qwen3_5 --batch 9B=output/random5_start2_qwen3_5_9b_single --output output/evaluate_qwen_comparison
+```
+
+The equivalent Python entry point is
+`evaluate_experiments({"27B": first_directory, "9B": second_directory})`.
+Labels are supplied by the caller; they do not verify the actual model used by
+old runs that did not record its ID. Input batches may not overlap. Mode tables
+use complete common runs within each batch; pairwise comparisons use the same
+Agent mode and check dataset identity, forecast parameters, regions, timestamps,
+baseline prices/loads/thresholds, and complete hourly observations/predictions
+(including original hourly energy prices when saved).
+`comparison_audit.csv` explains missing, ambiguous, unknown and inconsistent
+matches. Full-population tables remain available separately.
+
+`window_round_details.csv` records baseline, each outer control round, and final
+states. `new` means originally non-Medium and currently Medium; adjacent entries,
+exits, first entries and final losses are separate metrics. Round count is dynamic.
+An explicitly successful early stop carries its final outcome with zero further
+calls; missing intermediate observations are unknown. Internal discussion rounds
+are not additional observed control outcomes.
+
+Revenue is an independent, predicted electricity-income metric with two baselines:
+
+- `baseline_revenue`: original `mean_energy_price * sum_predicted_kwh`, the existing
+  window-mean-price approximation.
+- `baseline_hourly_revenue`: `sum(e_price * predicted_kwh)` over the original hourly
+  forecast records in that window. Both window endpoints are included. This uses
+  predicted load, not `actual_kwh`, and requires complete, unique, valid hourly
+  records. Missing hourly prices or loads leave this baseline unknown.
+
+Each control round uses the actual `proposed_energy_price` times its reforecast
+total kWh. `revenue_change` / `revenue_change_pct` retain the window baseline;
+`revenue_change_vs_hourly` / `revenue_change_vs_hourly_pct` use the hourly baseline.
+Each percentage divides by its own baseline. The `baseline` phase keeps the
+window-mean revenue, so its hourly-relative change shows the difference between
+the two baseline calculations. Directory evaluation loads hourly CSVs automatically;
+direct callers can pass `evaluate_agent(control_result, baseline_hourly=hourly)`
+with a DataFrame or record iterable containing `zone_id`, `time`, `e_price` and
+`predicted_kwh`.
+
+Do not multiply by three again, infer price from the declared percentage, include
+service fees/costs, or add alternative rounds together.
+`revenue_by_dataset_model_mode.csv` and finer tables preserve source
+currency and never pool different datasets/currencies. Missing/invalid values
+keep each full baseline/revenue unknown while exposing known subtotals and coverage; a zero
+baseline has undefined relative change. Existing Medium success rules are unchanged.
+
+`call_details.csv`, `usage_per_run_round.csv`, and grouped `usage_by_*.csv` include
+input/output/total tokens, per-call means, medians/P95 where individual calls are
+complete, repair/role/discussion breakdowns, and cached input tokens. Cache fields
+are `cached_tokens`, `known_cached_tokens`, `cache_reported_call_count`,
+`cache_usage_complete`, and `cache_hit_ratio`, plus mean cached tokens per call.
+The cache ratio is pooled cached input tokens divided by pooled input tokens;
+cached tokens are already included in input/total counts. Missing cache reports
+are unknown, not zero. Partial call details retain known distributions with
+coverage; provider retries do not invent unseen HTTP-request token distributions.
+`usage_audit.csv` compares call, round and cumulative records without adding the
+same usage more than once. Old files without cache reporting cannot recover those
+counts retrospectively.
 
 Forecaster MAE, RMSE, RAE, MAPE and WAPE are calculated from pooled hourly samples
 across all Zones, not averaged from Zone metrics. Global comparisons are grouped

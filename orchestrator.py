@@ -18,7 +18,7 @@ from typing import Any
 
 import pandas as pd
 
-from usage import aggregate_usage, cumulative_global_agent_usage, token_total_summary, usage_integer
+from usage import aggregate_usage, cumulative_global_agent_usage, token_total_summary, usage_integer, cache_usage_fields
 
 from agents import (
     AgentChatClient,
@@ -539,7 +539,7 @@ def run_pipeline(
                             required=True,
                             agent_mode=agent_mode,
                         )
-                        if not config.api_key:
+                        if not config.client_api_key:
                             raise RuntimeError(
                                 f"agent.{config.profile}.api_key is required in config.yaml, "
                                 "or pass --dry-run"
@@ -1803,6 +1803,8 @@ def apply_precomputed_window_data(
         updated_report["agent_completion_tokens"] = 0
         updated_report["agent_total_tokens"] = 0
         updated_report["agent_token_usage_complete"] = True
+        updated_report.update({f"agent_{key}": value for key, value in
+                               cache_usage_fields({"agent_call_count": 0}).items()})
         updated_report["agent_call_usage"] = []
         updated_report["source"] = "precomputed_window_data"
         updated_report["precomputed_window_data_source"] = str(source_path)
@@ -2161,6 +2163,7 @@ async def run_control_loop(
         updated["agent_token_usage_complete"] = cumulative_usage[
             "token_usage_complete"
         ]
+        updated.update({f"agent_{key}": value for key, value in cache_usage_fields(cumulative_usage).items()})
         updated["agent_token_totals"] = token_total_summary(cumulative_usage)
         updated[CONTROL_AGENT_USAGE_KEY] = {
             "agent_round_usage": agent_round_usage,
@@ -2446,6 +2449,7 @@ def build_zone_attempt_agent_usage(
         "completion_tokens": summarized["completion_tokens"],
         "total_tokens": summarized["total_tokens"],
         "token_usage_complete": summarized["token_usage_complete"],
+        **cache_usage_fields(summarized),
         "proposal_phase": proposal_phase,
         "triggered_by_attempt": triggered_by_attempt,
     }
@@ -2498,6 +2502,7 @@ def cumulative_zone_agent_usage(
             "prompt_tokens": summary["prompt_tokens"],
             "completion_tokens": summary["completion_tokens"],
             "total_tokens": summary["total_tokens"],
+            **cache_usage_fields(summary),
             "token_usage_complete": all(
                 bool(item.get("token_usage_complete")) for item in usage_rows
             ),

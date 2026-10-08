@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from textwrap import dedent
 from typing import Any
 
 
@@ -58,48 +59,120 @@ AGENT_CONTEXT_KEYS = {
 }
 
 
-def horizon_label(context: dict[str, Any]) -> str:
-    days = context.get("forecast_horizon_days")
-    try:
-        value = int(days)
-    except (TypeError, ValueError):
-        return "configured days"
-    return "1 day" if value == 1 else f"{value} days"
+def prompt_json(value: Any) -> str:
+    """Canonical object keys across workers, retaining array order and every value."""
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def context_json(context: dict[str, Any]) -> str:
+    """Keep changing retry feedback last without changing its context field path."""
+    stable = {key: value for key, value in context.items() if key != "retry_feedback"}
+    serialized = prompt_json(stable)
+    if "retry_feedback" not in context:
+        return serialized
+    separator = "," if stable else ""
+    return serialized[:-1] + separator + '"retry_feedback":' + prompt_json(context["retry_feedback"]) + "}"
+
+
+def _json_section(label: str, value: Any) -> str:
+    return f"\n\n{label}:\n{prompt_json(value)}"
+
+
+def _context_prompt(
+    instructions: str,
+    context: dict[str, Any],
+    *reports: tuple[str, Any],
+) -> str:
+    # Static instructions, reusable forecast context, then changing Agent reports.
+    return (
+        instructions + "\n\nContext:\n" + context_json(context)
+        + "".join(_json_section(label, value) for label, value in reports)
+    )
+
+
+GRID_INSTRUCTIONS = dedent("""\
+    Phase A / Grid Analyst.
+
+    Task: predict charging load for this zone over the configured forecast horizon in Context. Use the baseline forecast as the numerical anchor unless the context strongly justifies a small adjustment.
+
+    The forecaster values are authoritative: assess them but do not replace them.
+    Return JSON with keys: reasoning_summary, adjustment_needed, confidence, window_assessments.
+    window_assessments must contain window_start, window_end, predicted_load_kwh, load_range_position_pct, grid_stress_level, adjustment_needed, reasoning_summary.
+    Classify each 3-hour load by its position in that zone's full historical 3-hour load range: position = (load - historical minimum) / (historical maximum - historical minimum) * 100. Below 35% is Low, 35% to below 80% is Medium, 80% to below 90% is High, and 90% or above is Extremely High.
+    grid_stress_level must be exactly one of: Low, Medium, High, Extremely High.
+
+    Never use forecast-period actual load, forecast-period errors, or evaluation labels.
+""").strip()
+
+BEHAVIOR_INSTRUCTIONS = dedent("""\
+    Phase B / Behavioural Agent.
+
+    Task: explain why demand looks this way over the configured forecast horizon in Context using POI mix, weather, temporal markers, hourly forecast data, 3-hour pricing windows, and the load shape. Also estimate a positive elasticity_factor for price response: higher means users are more willing to shift charging after a price increase. Rain and high occupancy should lower elasticity. Keep it specific and short.
+
+    Return JSON with keys: reasoning_summary, demand_drivers, elasticity_factor, window_elasticities, confidence.
+""").strip()
+
+ECONOMIST_INSTRUCTIONS = dedent("""\
+    Phase C / Market Economist.
+
+    Task: prescribe energy-price shifts for the configured forecast horizon in Context using only forecast-derived information, prior agent conclusions, category, known service price, baseline energy price, each 3-hour window's predicted load_stress_level, and the behavioural elasticity estimate. Residential users are more price-sensitive; CBD and hub users are less price-sensitive. Adjust only energy price; service price remains unchanged.
+
+    Pricing policy: keep expected load in the Medium band, defined as 35% to below 80% through the zone's full historical 3-hour min-max load range. For Low load, reduce energy price to increase load toward Medium. For Medium load, hold energy price or use only a small change that keeps load inside Medium. For High load, increase energy price to reduce load into Medium. For Extremely High load, use a larger energy-price increase than for High when needed. Every recommended energy price must be non-negative. Historical price-change percentiles are diagnostic only and are intentionally not supplied to you.
+
+    Do not use actual future load, actual future stress, forecast error, stress correctness, or any evaluation/ground-truth fields. Those fields are intentionally not provided to you.
+
+    Return JSON with keys: reasoning_summary, suggested_price_shift_pct, action_label, price_rationale, price_change_windows_3h.
+    price_change_windows_3h must contain one item for each context.pricing_windows_3h item, with keys: window_start, window_end, suggested_price_shift_pct, proposed_energy_price, action_label, price_rationale.
+""").strip()
+
+SINGLE_AGENT_INSTRUCTIONS = dedent("""\
+    Single pricing agent.
+
+    Task: replace the separate Grid Analyst, Behavioural Agent, and Market Economist stages for the configured forecast horizon in Context. Use only forecast-derived information, category, known service price, baseline energy price, predicted 3-hour load_stress_level, weather, occupancy, and load shape. Estimate price-response elasticity and prescribe energy-price shifts for each 3-hour pricing window. Adjust only energy price; service price remains unchanged.
+
+    Pricing policy: reduce energy price for Low load, keep changes small for Medium, raise energy price for High, and raise it more strongly for Extremely High. Target the Medium load band. Every resulting energy price must be non-negative.
+
+    Do not use actual future load, actual future stress, forecast error, stress correctness, or any evaluation/ground-truth fields. Those fields are intentionally not provided to you.
+
+    Return JSON with keys: reasoning_summary, window_assessments, demand_drivers, elasticity_factor, window_elasticities, confidence, suggested_price_shift_pct, action_label, price_rationale, price_change_windows_3h.
+    Classify each 3-hour load by its position in that zone's full historical 3-hour min-max load range: below 35% is Low, 35% to below 80% is Medium, 80% to below 90% is High, and 90% or above is Extremely High.
+    grid_stress_level must be exactly one of: Low, Medium, High, Extremely High.
+    price_change_windows_3h must contain one item for each context.pricing_windows_3h item, with keys: window_start, window_end, suggested_price_shift_pct, proposed_energy_price, action_label, price_rationale.
+""").strip()
+
+REPAIR_INSTRUCTIONS = dedent("""\
+    Repair the Market Economist JSON response.
+
+    The previous response failed schema validation. Return valid JSON only, with no markdown and no explanatory text. Correct the Validation errors listed below.
+
+    Required top-level keys:
+    reasoning_summary, suggested_price_shift_pct, action_label, price_rationale, price_change_windows_3h.
+
+    price_change_windows_3h must contain exactly as many items as context.pricing_windows_3h, one for each item in the same order. The Expected window count is supplied below.
+    Each item must contain: window_start, window_end, suggested_price_shift_pct, proposed_energy_price, action_label, price_rationale.
+    Use the same window_start and window_end values from the context.
+""").strip()
+
+PRICE_RETRY_INSTRUCTIONS = dedent("""\
+    Revise prices only for the failed windows listed in context.retry_feedback. Keep every
+    non-failed window's previous price unchanged. Use the previous proposed price,
+    price-conditioned forecast load, load-range position, stress, and failure reason.
+    Do not use actual future load or evaluation information. Final energy prices must
+    be non-negative.
+
+    Return JSON with keys: reasoning_summary, suggested_price_shift_pct,
+    action_label, price_rationale, price_change_windows_3h. Return every pricing
+    window in original order. Each window requires window_start, window_end,
+    suggested_price_shift_pct, proposed_energy_price, action_label, price_rationale.
+""").strip()
 
 
 def grid_prompt(context: dict[str, Any]) -> str:
-    horizon = horizon_label(context)
-    safe_context = agent_safe_context(context)
-    return (
-        f"""Phase A / Grid Analyst.
-
-        Task: predict the next {horizon} of charging load for this zone. Use the baseline forecast as the numerical anchor unless the context strongly justifies a small adjustment.
-
-        The forecaster values are authoritative: assess them but do not replace them.
-        Return JSON with keys: reasoning_summary, adjustment_needed, confidence, window_assessments.
-        window_assessments must contain window_start, window_end, predicted_load_kwh, load_range_position_pct, grid_stress_level, adjustment_needed, reasoning_summary.
-        Classify each 3-hour load by its position in that zone's full historical 3-hour load range: position = (load - historical minimum) / (historical maximum - historical minimum) * 100. Below 35% is Low, 35% to below 80% is Medium, 80% to below 90% is High, and 90% or above is Extremely High.
-        grid_stress_level must be exactly one of: Low, Medium, High, Extremely High.
-
-        Never use forecast-period actual load, forecast-period errors, or evaluation labels.
-
-        Context:{json.dumps(safe_context, ensure_ascii=False)}"""
-    )
+    return _context_prompt(GRID_INSTRUCTIONS, agent_safe_context(context))
 
 
 def behavior_prompt(context: dict[str, Any], grid_report: dict[str, Any]) -> str:
-    horizon = horizon_label(context)
-    safe_context = agent_safe_context(context)
-    return (
-        f"""Phase B / Behavioural Agent.
-
-        Task: explain why demand looks this way over the next {horizon} using POI mix, weather, temporal markers, hourly forecast data, 3-hour pricing windows, and the load shape. Also estimate a positive elasticity_factor for price response: higher means users are more willing to shift charging after a price increase. Rain and high occupancy should lower elasticity. Keep it specific and short.
-
-        Return JSON with keys: reasoning_summary, demand_drivers, elasticity_factor, window_elasticities, confidence.
-
-        Context:{json.dumps(safe_context, ensure_ascii=False)}
-        Grid report:{json.dumps(grid_report, ensure_ascii=False)}"""
-    )
+    return _context_prompt(BEHAVIOR_INSTRUCTIONS, agent_safe_context(context), ("Grid report", grid_report))
 
 
 def economist_prompt(
@@ -107,23 +180,36 @@ def economist_prompt(
     grid_report: dict[str, Any],
     behavior_report: dict[str, Any],
 ) -> str:
-    horizon = horizon_label(context)
-    economist_context = compact_economist_context(context)
-    return (
-        f"""Phase C / Market Economist.
-        
-        Task: prescribe energy-price shifts for the next {horizon} using only forecast-derived information, prior agent conclusions, category, known service price, baseline energy price, each 3-hour window's predicted load_stress_level, and the behavioural elasticity estimate. Residential users are more price-sensitive; CBD and hub users are less price-sensitive. Adjust only energy price; service price remains unchanged.
+    return _context_prompt(
+        ECONOMIST_INSTRUCTIONS, compact_economist_context(context),
+        ("Grid report", grid_report), ("Behaviour report", behavior_report),
+    )
 
-        Pricing policy: keep expected load in the Medium band, defined as 35% to below 80% through the zone's full historical 3-hour min-max load range. For Low load, reduce energy price to increase load toward Medium. For Medium load, hold energy price or use only a small change that keeps load inside Medium. For High load, increase energy price to reduce load into Medium. For Extremely High load, use a larger energy-price increase than for High when needed. Every recommended energy price must be non-negative. Historical price-change percentiles are diagnostic only and are intentionally not supplied to you.
 
-        Do not use actual future load, actual future stress, forecast error, stress correctness, or any evaluation/ground-truth fields. Those fields are intentionally not provided to you.
+def _discussion_prompt(
+    instructions: str,
+    task: str,
+    context: dict[str, Any],
+    *reports: tuple[str, Any],
+    discussion_round: int,
+    previous_exchange: dict[str, Any] | None,
+) -> str:
+    # The round number must not interrupt the reusable instructions/context prefix.
+    collaboration = dedent("""\
+        Collaborative discussion, up to 3 rounds.
+        Treat other agents' outputs as advice, not ground truth. Use only the supplied,
+        no-leakage forecast context. Return structured reasoning summaries only, never
+        hidden chain-of-thought.
+        Also return agreements, disagreements, revisions_from_prior_round, and message_to_other_agents.
 
-        Return JSON with keys: reasoning_summary, suggested_price_shift_pct, action_label, price_rationale, price_change_windows_3h.
-        price_change_windows_3h must contain one item for each context.pricing_windows_3h item, with keys: window_start, window_end, suggested_price_shift_pct, proposed_energy_price, action_label, price_rationale.
-
-        Context:\n{json.dumps(economist_context, ensure_ascii=False)}
-        Grid report:\n{json.dumps(grid_report, ensure_ascii=False)}
-        Behaviour report:\n{json.dumps(behavior_report, ensure_ascii=False)}"""
+        Previous round compact handoff contains only conclusion_summary,
+        disagreements, and key_decisions. Full prior Agent outputs are intentionally
+        omitted; do not ask for or reconstruct them.
+    """).strip()
+    previous = previous_exchange or {"status": "No previous exchange; establish the round-1 position."}
+    return _context_prompt(
+        instructions + "\n\n" + collaboration + "\n" + task, context, *reports,
+        ("Discussion round", discussion_round), ("Previous round compact handoff", previous),
     )
 
 
@@ -133,20 +219,12 @@ def discussion_grid_prompt(
     discussion_round: int,
     previous_exchange: dict[str, Any] | None,
 ) -> str:
-    return (
-        grid_prompt(context)
-        + collaborative_round_instruction(
-            role="Grid Analyst",
-            discussion_round=discussion_round,
-            previous_exchange=previous_exchange,
-            task=(
-                "Review the previous Behavioural Agent and Market Economist conclusions, "
-                "identify agreements or disagreements that affect grid stress, and revise "
-                "your structured assessment when justified. Do not change the forecaster's "
-                "numerical load values. Also return agreements, disagreements, "
-                "revisions_from_prior_round, and message_to_other_agents."
-            ),
-        )
+    return _discussion_prompt(
+        GRID_INSTRUCTIONS,
+        "Review the previous Behavioural Agent and Market Economist conclusions, "
+        "identify agreements or disagreements that affect grid stress, and revise "
+        "your structured assessment when justified. Do not change the forecaster's numerical load values.",
+        agent_safe_context(context), discussion_round=discussion_round, previous_exchange=previous_exchange,
     )
 
 
@@ -157,19 +235,12 @@ def discussion_behavior_prompt(
     discussion_round: int,
     previous_exchange: dict[str, Any] | None,
 ) -> str:
-    return (
-        behavior_prompt(context, grid_report)
-        + collaborative_round_instruction(
-            role="Behavioural Agent",
-            discussion_round=discussion_round,
-            previous_exchange=previous_exchange,
-            task=(
-                "Review the previous Grid and Economist conclusions together with the "
-                "current Grid report. Reconcile demand drivers and elasticity estimates, "
-                "and explain any revision. Also return agreements, disagreements, "
-                "revisions_from_prior_round, and message_to_other_agents."
-            ),
-        )
+    return _discussion_prompt(
+        BEHAVIOR_INSTRUCTIONS,
+        "Review the previous Grid and Economist conclusions together with the current Grid report. "
+        "Reconcile demand drivers and elasticity estimates, and explain any revision.",
+        agent_safe_context(context), ("Grid report", grid_report),
+        discussion_round=discussion_round, previous_exchange=previous_exchange,
     )
 
 
@@ -181,69 +252,18 @@ def discussion_economist_prompt(
     discussion_round: int,
     previous_exchange: dict[str, Any] | None,
 ) -> str:
-    return (
-        economist_prompt(context, grid_report, behavior_report)
-        + collaborative_round_instruction(
-            role="Market Economist",
-            discussion_round=discussion_round,
-            previous_exchange=previous_exchange,
-            task=(
-                "Review the previous round and the current Grid and Behavioural reports. "
-                "Resolve disagreements explicitly in the structured summary and revise "
-                "the price schedule when the shared evidence supports it. Preserve all "
-                "required economist pricing keys. Also return agreements, disagreements, "
-                "revisions_from_prior_round, and message_to_other_agents."
-            ),
-        )
-    )
-
-
-def collaborative_round_instruction(
-    *,
-    role: str,
-    discussion_round: int,
-    previous_exchange: dict[str, Any] | None,
-    task: str,
-) -> str:
-    previous = previous_exchange or {
-        "status": "No previous exchange; establish the round-1 position."
-    }
-    return (
-        f"""
-
-        Collaborative discussion round {discussion_round} of 3 / {role}.
-        {task}
-        Treat other agents' outputs as advice, not ground truth. Use only the supplied,
-        no-leakage forecast context. Return structured reasoning summaries only, never
-        hidden chain-of-thought.
-
-        Previous round compact handoff contains only conclusion_summary,
-        disagreements, and key_decisions. Full prior Agent outputs are intentionally
-        omitted; do not ask for or reconstruct them.
-
-        Previous round compact handoff:\n{json.dumps(previous, ensure_ascii=False)}"""
+    return _discussion_prompt(
+        ECONOMIST_INSTRUCTIONS,
+        "Review the previous round and the current Grid and Behavioural reports. "
+        "Resolve disagreements explicitly in the structured summary and revise the price schedule "
+        "when the shared evidence supports it. Preserve all required economist pricing keys.",
+        compact_economist_context(context), ("Grid report", grid_report), ("Behaviour report", behavior_report),
+        discussion_round=discussion_round, previous_exchange=previous_exchange,
     )
 
 
 def single_agent_prompt(context: dict[str, Any]) -> str:
-    horizon = horizon_label(context)
-    economist_context = compact_economist_context(context)
-    return (
-        f"""Single pricing agent.
-
-        Task: replace the separate Grid Analyst, Behavioural Agent, and Market Economist stages for the next {horizon}. Use only forecast-derived information, category, known service price, baseline energy price, predicted 3-hour load_stress_level, weather, occupancy, and load shape. Estimate price-response elasticity and prescribe energy-price shifts for each 3-hour pricing window. Adjust only energy price; service price remains unchanged.
-
-        Pricing policy: reduce energy price for Low load, keep changes small for Medium, raise energy price for High, and raise it more strongly for Extremely High. Target the Medium load band. Every resulting energy price must be non-negative.
-
-        Do not use actual future load, actual future stress, forecast error, stress correctness, or any evaluation/ground-truth fields. Those fields are intentionally not provided to you.
-
-        Return JSON with keys: reasoning_summary, window_assessments, demand_drivers, elasticity_factor, window_elasticities, confidence, suggested_price_shift_pct, action_label, price_rationale, price_change_windows_3h.
-        Classify each 3-hour load by its position in that zone's full historical 3-hour min-max load range: below 35% is Low, 35% to below 80% is Medium, 80% to below 90% is High, and 90% or above is Extremely High.
-        grid_stress_level must be exactly one of: Low, Medium, High, Extremely High.
-        price_change_windows_3h must contain one item for each context.pricing_windows_3h item, with keys: window_start, window_end, suggested_price_shift_pct, proposed_energy_price, action_label, price_rationale.
-
-        Context:\n{json.dumps(economist_context, ensure_ascii=False)}"""
-    )
+    return _context_prompt(SINGLE_AGENT_INSTRUCTIONS, compact_economist_context(context))
 
 
 def repair_economist_prompt(
@@ -255,23 +275,11 @@ def repair_economist_prompt(
 ) -> str:
     economist_context = compact_economist_context(context)
     expected_count = len(economist_context.get("pricing_windows_3h", []))
-    return (
-        f"""Repair the Market Economist JSON response.
-
-        The previous response failed schema validation. Return valid JSON only, with no markdown and no explanatory text.
-        Validation errors: {json.dumps(validation_errors, ensure_ascii=False)}
-
-        Required top-level keys:
-        reasoning_summary, suggested_price_shift_pct, action_label, price_rationale, price_change_windows_3h.
-
-        price_change_windows_3h must contain exactly {expected_count} items, one for each context.pricing_windows_3h item in the same order.
-        Each item must contain: window_start, window_end, suggested_price_shift_pct, proposed_energy_price, action_label, price_rationale.
-        Use the same window_start and window_end values from the context.
-
-        Context:\n{json.dumps(economist_context, ensure_ascii=False)}
-        Grid report:\n{json.dumps(grid_report, ensure_ascii=False)}
-        Behaviour report:\n{json.dumps(behavior_report, ensure_ascii=False)}
-        Previous invalid response:\n{json.dumps(previous_report, ensure_ascii=False)}"""
+    return _context_prompt(
+        REPAIR_INSTRUCTIONS, economist_context,
+        ("Grid report", grid_report), ("Behaviour report", behavior_report),
+        ("Expected window count", expected_count),
+        ("Previous invalid response", previous_report), ("Validation errors", validation_errors),
     )
 
 
@@ -283,26 +291,10 @@ def price_retry_prompt(
     *,
     single_agent: bool = False,
 ) -> str:
-    safe_context = agent_safe_context(context)
     role = "Single pricing agent" if single_agent else "Market Economist"
-    return (
-        f"""{role} retry.
-
-        Revise prices only for the failed windows listed in retry_feedback. Keep every
-        non-failed window's previous price unchanged. Use the previous proposed price,
-        price-conditioned forecast load, load-range position, stress, and failure reason.
-        Do not use actual future load or evaluation information. Final energy prices must
-        be non-negative.
-
-        Return JSON with keys: reasoning_summary, suggested_price_shift_pct,
-        action_label, price_rationale, price_change_windows_3h. Return every pricing
-        window in original order. Each window requires window_start, window_end,
-        suggested_price_shift_pct, proposed_energy_price, action_label, price_rationale.
-
-        Context:\n{json.dumps(safe_context, ensure_ascii=False)}
-        Grid report:\n{json.dumps(grid_report, ensure_ascii=False)}
-        Behaviour report:\n{json.dumps(behavior_report, ensure_ascii=False)}
-        Previous report:\n{json.dumps(previous_report, ensure_ascii=False)}"""
+    return _context_prompt(
+        role + " retry.\n\n" + PRICE_RETRY_INSTRUCTIONS, agent_safe_context(context),
+        ("Grid report", grid_report), ("Behaviour report", behavior_report), ("Previous report", previous_report),
     )
 
 

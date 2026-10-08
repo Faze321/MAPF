@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import re
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from usage import (
     optional_int_usage, call_token_usage_complete, sum_token_usage, summarize_agent_call_usage,
+    cache_usage_fields,
 )
 
 from config import AgentConfig
+from request_limits import SharedRequestLimiter
 from load_policy import (
     EXTREMELY_HIGH_STRESS,
     HIGH_STRESS,
@@ -104,22 +108,10 @@ class AgentChatClient:
     config: AgentConfig
 
     def __post_init__(self) -> None:
-        if not self.config.api_key:
+        api_key = self.config.client_api_key
+        if not api_key:
             raise ValueError(
                 f"agent.{self.config.profile}.api_key is required when dry-run is disabled"
-            )
-        if self.config.max_concurrent_requests < 1:
-            raise ValueError(
-                f"agent.{self.config.profile}.max_concurrent_requests must be at least 1"
-            )
-        if self.config.provider_json_retries < 0:
-            raise ValueError(
-                f"agent.{self.config.profile}.provider_json_retries cannot be negative"
-            )
-        if self.config.provider_json_retry_backoff_seconds < 0:
-            raise ValueError(
-                f"agent.{self.config.profile}.provider_json_retry_backoff_seconds "
-                "cannot be negative"
             )
         from openai import AsyncOpenAI
 
@@ -130,12 +122,17 @@ class AgentChatClient:
         #     headers["X-Title"] = self.config.title
         #     headers["X-OpenRouter-Title"] = self.config.title
         self._client = AsyncOpenAI(
-            api_key=self.config.api_key,
+            api_key=api_key,
             base_url=self.config.base_url,
             default_headers=headers or None,
             timeout=self.config.timeout_seconds,
         )
         self._request_semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
+        self._shared_request_limiter = (
+            SharedRequestLimiter(self.config.base_url, self.config.max_concurrent_requests_total)
+            if self.config.max_concurrent_requests_total is not None
+            else None
+        )
 
     async def complete_json(self, prompt: str, *, temperature: float) -> dict[str, Any]:
         request: dict[str, Any] = {
@@ -147,7 +144,9 @@ class AgentChatClient:
             "response_format": {"type": "json_object"},
             "temperature": temperature,
         }
-        extra_body = reasoning_extra_body(self.config)
+        if self.config.max_tokens is not None:
+            request["max_tokens"] = self.config.max_tokens
+        extra_body = request_extra_body(self.config)
         if extra_body is not None:
             request["extra_body"] = extra_body
         response, provider_attempt_count = await self._create_completion_with_retry(request)
@@ -155,6 +154,10 @@ class AgentChatClient:
         payload = extract_json_object(content)
         token_usage = response_token_usage(response)
         token_usage["provider_attempt_count"] = provider_attempt_count
+        if provider_attempt_count > 1:
+            # Failed provider responses may have consumed unreported cache/input tokens.
+            token_usage["cache_usage_complete"] = False
+            token_usage.update(cache_usage_fields(token_usage))
         token_usage["token_usage_complete"] = (
             provider_attempt_count == 1
             and all(
@@ -193,8 +196,12 @@ class AgentChatClient:
         for attempt_index in range(retry_count + 1):
             try:
                 async with semaphore:
-                    response = await self._client.chat.completions.create(**request)
-                    return response, attempt_index + 1
+                    async with AsyncExitStack() as slots:
+                        limiter = getattr(self, "_shared_request_limiter", None)
+                        if limiter is not None:
+                            await slots.enter_async_context(limiter.slot())
+                        response = await self._client.chat.completions.create(**request)
+                        return response, attempt_index + 1
             except json.JSONDecodeError as exc:
                 if attempt_index >= retry_count:
                     raise ProviderResponseDecodeError(
@@ -216,10 +223,20 @@ class DryRunChatClient:
 
 
 def reasoning_extra_body(config: AgentConfig) -> dict[str, Any] | None:
+    if config.resolved_backend != "openrouter":
+        return None
     effort = str(config.reasoning_effort or "").strip()
     if not effort or config.model.strip().lower().startswith("meta-llama/"):
         return None
     return {"reasoning": {"effort": effort}}
+
+
+def request_extra_body(config: AgentConfig) -> dict[str, Any] | None:
+    """Send only extensions supported/selected for this endpoint's protocol."""
+    body = reasoning_extra_body(config) or {}
+    if config.chat_template_kwargs:
+        body["chat_template_kwargs"] = copy.deepcopy(config.chat_template_kwargs)
+    return body or None
 
 
 def completion_message_content(response: Any, *, requested_model: str) -> str:
@@ -979,18 +996,23 @@ def attach_economist_debug(report: dict[str, Any], debug: dict[str, Any]) -> dic
     return tagged
 
 
-def response_token_usage(response: Any) -> dict[str, int | None]:
-    usage = getattr(response, "usage", None)
+def response_token_usage(response: Any) -> dict[str, Any]:
+    usage = response_field(response, "usage")
     prompt_tokens = usage_value(usage, "prompt_tokens", "input_tokens")
     completion_tokens = usage_value(usage, "completion_tokens", "output_tokens")
     total_tokens = usage_value(usage, "total_tokens")
     if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
         total_tokens = prompt_tokens + completion_tokens
-    return {
+    result = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
     }
+    details = response_field(usage, "prompt_tokens_details")
+    result.update(cache_usage_fields({
+        **result, "cached_tokens": response_field(details, "cached_tokens"),
+    }))
+    return result
 
 
 def usage_value(usage: Any, *keys: str) -> int | None:
@@ -1041,6 +1063,7 @@ def agent_call_usage_record(
         "total_tokens": total_tokens,
         "token_usage_complete": token_usage_complete,
         "provider_attempt_count": provider_attempt_count,
+        **cache_usage_fields(usage),
     }
 
 
@@ -1298,6 +1321,7 @@ def combine_reports(
         "agent_completion_tokens": usage_summary["completion_tokens"],
         "agent_total_tokens": usage_summary["total_tokens"],
         "agent_token_usage_complete": usage_summary["token_usage_complete"],
+        **{f"agent_{key}": value for key, value in cache_usage_fields(usage_summary).items()},
         "agent_call_usage": agent_call_usage or [],
         "source": source,
     }

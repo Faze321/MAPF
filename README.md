@@ -143,6 +143,87 @@ Supported control modes are:
 
 Each run permits at most three price proposals. Successful windows retain their price for the next proposal, but every global reforecast re-evaluates all windows; a formerly successful window can become failed again. Negative prices consume an attempt and fail validation. There is no historical-P95 price cap or historical-mean multiplier cap.
 
+## Prompt prefix caching
+
+Agent prompts place fixed role, policy, output-schema, and discussion instructions
+before the forecast context. Actual horizon values stay in the context; current
+Agent reports follow it, with discussion round/handoff and schema-repair errors
+at the end. Retry feedback is the final field of the context object and retains
+its `context.retry_feedback` path. Updated forecasts and prices are always sent.
+
+JSON objects use recursively sorted keys and compact separators, so identical
+inputs produce identical prompt text across dataset workers and Python hash seeds.
+Window arrays retain their original order. Existing context filters, output keys,
+and pricing rules are preserved. This layout is used automatically without a new
+configuration option. Actual cache hits depend on the inference service's cache
+support, activation, minimum prefix length, and retention/routing behavior; see
+the [provider caching documentation](https://openrouter.ai/docs/guides/best-practices/prompt-caching).
+
+## vLLM and SGLang endpoints
+
+The Agent client uses the existing Chat Completions API. Select the server in each
+Agent profile; for example, after starting a local vLLM server:
+
+```yaml
+agent:
+  max_concurrent_requests_total: 4
+  multi_agent:
+    backend: vllm # sglang uses the same configuration fields
+    base_url: http://127.0.0.1:8000/v1
+    model: Qwen/Qwen3-14B # must match the server's model name or served alias
+    api_key: null # use the configured key if the server requires authentication
+    chat_template_kwargs:
+      enable_thinking: false # standard Qwen3; use the served model's supported options
+    max_tokens: null # optional positive output-token limit; allow room for every window
+    max_concurrent_requests: 4
+```
+
+The same options apply to `single_agent`. `backend: auto` identifies OpenRouter by
+its URL hostname; other URLs use `openai_compatible`. It does not guess a local
+engine from a port number or model name. `reasoning_effort` is sent in OpenRouter's
+format only to that backend. Explicit `chat_template_kwargs` are forwarded in
+`extra_body`; they control local chat templates independently of that cloud option.
+Only explicit `vllm`/`sglang` profiles may omit an API key, in which case the SDK
+receives an `EMPTY` placeholder. Real server authentication still requires its key.
+
+`max_tokens: null` preserves the server's output budget; a positive integer sets
+the request's output-token limit. Different models and discussion modes can need
+different budgets. These options do not change forecast models or select a device.
+
+`max_concurrent_requests` remains the per-client limit. Optional
+`max_concurrent_requests_total` additionally bounds requests to the same normalized
+server URL across this checkout's processes, including parallel datasets and Agent
+profiles. Configure the same total for every profile sharing an endpoint. The
+current `config.yaml` sets a shared total of 4; omitted or null totals preserve the
+original per-client behavior. Clients with a null total do not join the shared
+budget. URL aliases such as `localhost` and `127.0.0.1`, distinct API paths, separate
+checkouts, and remote machines are not combined; use a common URL and server-side
+admission limits when those also need one budget.
+
+Request slots use OS locks under `.cache/llm_request_limits/` and are released on
+completion, cancellation, errors, or process exit. Waiting does not block the async
+event loop. Changing a total is allowed while that endpoint is idle; conflicting
+totals while requests are active produce a configuration error. This directory
+stores only endpoint hashes and limit metadata, not prompts or KV cache content.
+
+Enable caching and reporting in the inference server as supported by its installed
+version: vLLM provides `--enable-prefix-caching` and
+`--enable-prompt-tokens-details`; SGLang uses Radix caching (keep
+`--disable-radix-cache` unset) and `--enable-cache-report`. See the
+[vLLM arguments](https://docs.vllm.ai/en/latest/cli/serve/) and
+[SGLang arguments](https://docs.sglang.io/docs/advanced_features/server_arguments).
+Restarting the Python API client does not clear the server's KV cache.
+
+Agent usage JSON and the step/attempt usage CSVs now include `cached_tokens`,
+`cache_hit_ratio`, and `cache_usage_complete`. The ratio is cached input tokens
+divided by input tokens (0 to 1), pooled across calls; it is not a request hit rate.
+Missing or invalid cache counts remain unknown. Partial results expose
+`known_cached_tokens` and `cache_reported_call_count`, while the full count/ratio
+remain null. Calls with malformed-provider-response retries are marked incomplete
+because the earlier attempts may have unreported usage. Existing prompt, completion,
+and total token counts retain their meanings. The dataset cache is independent of
+this server-side prefix cache.
+
 ## Fixed-origin and no leakage
 
 - Profiles, scalers, stress thresholds, preprocessing, and validation calibration use only timestamps before `forecast_start`.

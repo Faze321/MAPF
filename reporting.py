@@ -11,7 +11,8 @@ import pandas as pd
 
 from dataset_adapter import atomic_write_json, process_file_lock
 from usage import (
-    aggregate_usage, cumulative_global_agent_usage as derive_global_cumulative_usage,
+    CACHE_USAGE_FIELDS, aggregate_usage, cache_usage_fields,
+    cumulative_global_agent_usage as derive_global_cumulative_usage, summarize_cache_usage,
     token_total_summary as token_total_payload, usage_integer as reporting_usage_integer,
 )
 
@@ -55,6 +56,7 @@ TRACE_COLUMNS = [
     "agent_completion_tokens",
     "agent_total_tokens",
     "agent_token_usage_complete",
+    *[f"agent_{field}" for field in CACHE_USAGE_FIELDS],
     "source",
 ]
 TRACE_OUTPUT_RENAMES = {
@@ -131,6 +133,7 @@ AGENT_ATTEMPT_USAGE_COLUMNS = [
     "completion_tokens",
     "total_tokens",
     "token_usage_complete",
+    *CACHE_USAGE_FIELDS,
     "agent_stages",
     "agent_names",
     "agent_call_usage_json",
@@ -152,6 +155,7 @@ AGENT_STEP_TOKEN_USAGE_COLUMNS = [
     "completion_tokens",
     "total_tokens",
     "token_usage_complete",
+    *CACHE_USAGE_FIELDS,
     "provider_attempt_count",
 ]
 
@@ -630,7 +634,7 @@ def normalized_attempt_usage(attempt: dict[str, Any]) -> dict[str, Any]:
             )
             for call in calls
         )
-    return {
+    result = {
         "proposal_phase": raw.get("proposal_phase")
         or attempt.get("proposal_phase")
         or ("initial" if reporting_usage_integer(attempt.get("attempt")) == 1 else "frozen"),
@@ -662,6 +666,12 @@ def normalized_attempt_usage(attempt: dict[str, Any]) -> dict[str, Any]:
         ),
         "token_usage_complete": bool(token_usage_complete),
     }
+    # Prefer the authoritative aggregate; older records may expose only calls.
+    if any(field in raw for field in CACHE_USAGE_FIELDS):
+        result.update(cache_usage_fields({**result, **raw}))
+    else:
+        result.update(cache_usage_fields({**result, **summarize_cache_usage(calls)}))
+    return result
 
 
 def normalized_zone_cumulative_usage(
@@ -717,6 +727,7 @@ def normalized_zone_cumulative_usage(
                 fallback_token_usage_complete,
             )
         ),
+        **summarize_cache_usage(calls),
     }
 
 
@@ -795,6 +806,7 @@ def agent_attempt_usage_row(
         ),
         "total_tokens": reporting_usage_integer(usage.get("total_tokens")),
         "token_usage_complete": bool(usage.get("token_usage_complete")),
+        **cache_usage_fields(usage),
         "agent_stages": "|".join(stages),
         "agent_names": "|".join(names),
         "agent_call_usage_json": json.dumps(calls, ensure_ascii=False),
@@ -833,6 +845,7 @@ def agent_step_token_usage_row(
         ),
         "total_tokens": reporting_usage_integer(call.get("total_tokens")),
         "token_usage_complete": bool(call.get("token_usage_complete")),
+        **cache_usage_fields(call),
         "provider_attempt_count": reporting_usage_integer(
             call.get("provider_attempt_count", 1)
         ),
@@ -853,7 +866,8 @@ def token_only_call_usage(value: dict[str, Any]) -> dict[str, Any]:
         "token_usage_complete",
         "provider_attempt_count",
     )
-    return {key: value.get(key) for key in allowed if key in value}
+    return {**{key: value.get(key) for key in allowed if key in value},
+            **cache_usage_fields(value)}
 
 
 def token_only_round_usage(value: dict[str, Any]) -> dict[str, Any]:
@@ -870,10 +884,13 @@ def token_only_round_usage(value: dict[str, Any]) -> dict[str, Any]:
         "token_usage_complete",
         "invoked_zone_ids",
     )
-    return {key: value.get(key) for key in allowed if key in value}
+    return {**{key: value.get(key) for key in allowed if key in value},
+            **cache_usage_fields(value)}
 
 
 def token_only_cumulative_usage(value: dict[str, Any]) -> dict[str, Any]:
+    if not value:
+        return {}
     allowed = (
         "agent_round_count",
         "agent_attempt_count",
@@ -887,7 +904,8 @@ def token_only_cumulative_usage(value: dict[str, Any]) -> dict[str, Any]:
         "total_tokens",
         "token_usage_complete",
     )
-    return {key: value.get(key) for key in allowed if key in value}
+    return {**{key: value.get(key) for key in allowed if key in value},
+            **cache_usage_fields(value)}
 
 
 def split_agent_debug_outputs(reports: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:

@@ -3,18 +3,27 @@ agent:
     api_key: "${MULTI_AGENT_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
     model: "qwen/qwen3-14b"
-    reasoning_effort: "none" # required for JSON mode with Qwen3 thinking models
+    backend: "auto" # auto detects only openrouter.ai; otherwise openai_compatible
+    # For a local server, explicitly choose vllm or sglang; api_key may then be null.
+    chat_template_kwargs: {} # standard Qwen3 on vllm/sglang: {enable_thinking: false}
+    reasoning_effort: "none" # sent only to OpenRouter; local thinking uses chat_template_kwargs
+    max_tokens: null # optional positive output-token limit; size for all pricing windows
     timeout_seconds: 90
     max_concurrent_requests: 4
+    max_concurrent_requests_total: null # optional shared limit for the same server across dataset processes
     provider_json_retries: 2 # additional attempts for malformed/truncated provider HTTP JSON
     provider_json_retry_backoff_seconds: 1.0
   single_agent:
     api_key: "${SINGLE_AGENT_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
     model: "meta-llama/llama-3.3-70b-instruct"
-    reasoning_effort: "none"
+    backend: "auto" # auto, openrouter, openai_compatible, vllm, sglang
+    chat_template_kwargs: {} # standard Qwen3 on vllm/sglang: {enable_thinking: false}
+    reasoning_effort: "none" # OpenRouter only
+    max_tokens: null
     timeout_seconds: 90
     max_concurrent_requests: 4
+    max_concurrent_requests_total: null
     provider_json_retries: 2
     provider_json_retry_backoff_seconds: 1.0
 

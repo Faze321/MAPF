@@ -16,6 +16,8 @@ from typing import Any, Protocol
 import numpy as np
 import pandas as pd
 
+from usage import cache_usage_fields, summarize_cache_usage
+
 
 TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
 DEFINITIONS = {
@@ -31,6 +33,7 @@ DEFINITIONS = {
     "transitions": "Match run, Zone and window identity; report retained, gained, lost, never and unknown.",
     "calls": "Recorded agent_call_count, including recorded repair/retry calls; proposals are counted separately.",
     "tokens": "Known provider tokens only; full totals/averages are null if any usage is incomplete.",
+    "cache": "Cached input tokens / all input tokens, pooled across calls; null when any cache count is unavailable. Independent of completion-token accounting.",
     "averages": "Calls/tokens per run and per Zone; tokens per call = pooled tokens / pooled calls. All runs, including failures, are included.",
     "forecast_deduplication": "Within each model/blend, identical samples with the same dataset, forecast parameters, Zone, time and predictions are counted once across copied Agent-mode outputs. Per-run metrics retain all rows.",
 }
@@ -116,12 +119,14 @@ def _usage(result: dict[str, Any]) -> dict[str, Any]:
     raw = result.get("agent_cumulative_usage")
     if not isinstance(raw, dict) or not raw:
         return {"agent_call_count": None, "token_usage_complete": False,
-                **{field: None for field in TOKEN_FIELDS}}
+                **{field: None for field in TOKEN_FIELDS},
+                **cache_usage_fields({"agent_call_count": None})}
     values = {field: _number(raw.get(field)) for field in TOKEN_FIELDS}
     return {
         "agent_call_count": _number(raw.get("agent_call_count")), **values,
         "token_usage_complete": raw.get("token_usage_complete") is True
         and all(value is not None for value in values.values()),
+        **cache_usage_fields({**raw, "agent_call_count": _number(raw.get("agent_call_count"))}),
     }
 
 
@@ -212,6 +217,8 @@ def summarize_agents(runs: list[dict[str, Any]]) -> dict[str, Any]:
     complete = bool(usages) and all(u["token_usage_complete"] for u in usages)
     result["token_usage_complete"] = complete
     result["incomplete_usage_run_count"] = sum(not u["token_usage_complete"] for u in usages)
+    result.update(summarize_cache_usage(usages, aggregated=True))
+    result["incomplete_cache_usage_run_count"] = sum(not u["cache_usage_complete"] for u in usages)
     for field in TOKEN_FIELDS:
         observed = [u[field] for u in usages if u[field] is not None]
         known = sum(observed) if observed else None

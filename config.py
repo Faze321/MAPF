@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, TypeVar
+from urllib.parse import urlsplit
+import json
+import math
 import re
 import os
 import yaml
@@ -36,6 +40,7 @@ BACKEND_PARAMETER_NAMES = (
 )
 
 PIPELINE_STAGES = {"full", "forecaster", "agent"}
+AGENT_BACKENDS = {"auto", "openrouter", "openai_compatible", "vllm", "sglang"}
 
 
 def positive_integer(value: Any, key: str) -> int:
@@ -286,6 +291,81 @@ class AgentConfig:
     max_concurrent_requests: int = 4
     provider_json_retries: int = 2
     provider_json_retry_backoff_seconds: float = 1.0
+    backend: str = "auto"
+    chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
+    max_tokens: int | None = None
+    max_concurrent_requests_total: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.backend, str) or self.backend not in AGENT_BACKENDS:
+            raise ValueError(f"agent.backend must be one of: {', '.join(sorted(AGENT_BACKENDS))}")
+        kwargs = self.chat_template_kwargs
+        if kwargs is None:
+            kwargs = {}
+        if not isinstance(kwargs, dict):
+            raise ValueError("agent.chat_template_kwargs must contain a mapping")
+
+        def validate_keys(value: Any) -> None:
+            if isinstance(value, dict):
+                if any(not isinstance(key, str) for key in value):
+                    raise ValueError("agent.chat_template_kwargs keys must be strings")
+                for item in value.values():
+                    validate_keys(item)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    validate_keys(item)
+
+        try:
+            validate_keys(kwargs)
+            json.dumps(kwargs, allow_nan=False)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError(
+                "agent.chat_template_kwargs must be JSON serializable with string keys and finite numbers"
+            ) from exc
+        if "enable_thinking" in kwargs and not isinstance(kwargs["enable_thinking"], bool):
+            raise ValueError("agent.chat_template_kwargs.enable_thinking must be a boolean")
+        object.__setattr__(self, "chat_template_kwargs", deepcopy(kwargs))
+        for name in ("max_tokens", "max_concurrent_requests_total"):
+            value = getattr(self, name)
+            if value is not None:
+                positive_integer(value, f"agent.{name}")
+        positive_integer(self.max_concurrent_requests, "agent.max_concurrent_requests")
+        if (
+            isinstance(self.provider_json_retries, bool)
+            or not isinstance(self.provider_json_retries, int)
+            or self.provider_json_retries < 0
+        ):
+            raise ValueError("agent.provider_json_retries must be a non-negative integer")
+        for name, allow_zero in (
+            ("timeout_seconds", False),
+            ("provider_json_retry_backoff_seconds", True),
+        ):
+            value = getattr(self, name)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or (value < 0 if allow_zero else value <= 0)
+            ):
+                qualifier = "non-negative" if allow_zero else "positive"
+                raise ValueError(f"agent.{name} must be a finite {qualifier} number")
+
+    @property
+    def resolved_backend(self) -> str:
+        if self.backend != "auto":
+            return self.backend
+        hostname = (urlsplit(self.base_url).hostname or "").lower().rstrip(".")
+        if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
+            return "openrouter"
+        return "openai_compatible"
+
+    @property
+    def client_api_key(self) -> str | None:
+        if self.api_key:
+            return self.api_key
+        if self.backend in {"vllm", "sglang"}:
+            return "EMPTY"
+        return None
 
     @classmethod
     def from_file(
@@ -328,6 +408,10 @@ class AgentConfig:
             "max_concurrent_requests",
             "provider_json_retries",
             "provider_json_retry_backoff_seconds",
+            "backend",
+            "chat_template_kwargs",
+            "max_tokens",
+            "max_concurrent_requests_total",
         )
         resolved = {name: settings[name] for name in setting_names if name in settings}
         resolved.update(profile_settings)
@@ -348,6 +432,20 @@ class AgentConfig:
         )
         resolved = _expand_env_vars(resolved)
 
+        # Keep legacy numeric strings (including environment variables), but do
+        # not silently turn booleans or fractional concurrency counts into ints.
+        def legacy_number(name: str, default: int | float, convert: type) -> int | float:
+            value = resolved.get(name, default)
+            if isinstance(value, bool):
+                raise ValueError(f"agent.{name} must be a number, not a boolean")
+            try:
+                converted = convert(value)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(f"agent.{name} must be a valid {convert.__name__}") from exc
+            if convert is int and not isinstance(value, str) and converted != value:
+                raise ValueError(f"agent.{name} must be an integer")
+            return converted
+
         return cls(
             api_key=optional_str(resolved.get("api_key")),
             base_url=optional_str(resolved.get("base_url")) or "https://openrouter.ai/api/v1",
@@ -357,12 +455,16 @@ class AgentConfig:
             reasoning_effort=optional_str(resolved.get("reasoning_effort")) or "none",
             http_referer=optional_str(resolved.get("http_referer")),
             title=optional_str(resolved.get("title")) or "MAPF UrbanEV",
-            timeout_seconds=float(resolved.get("timeout_seconds", 90)),
-            max_concurrent_requests=int(resolved.get("max_concurrent_requests", 4)),
-            provider_json_retries=int(resolved.get("provider_json_retries", 2)),
-            provider_json_retry_backoff_seconds=float(
-                resolved.get("provider_json_retry_backoff_seconds", 1.0)
+            timeout_seconds=legacy_number("timeout_seconds", 90.0, float),
+            max_concurrent_requests=legacy_number("max_concurrent_requests", 4, int),
+            provider_json_retries=legacy_number("provider_json_retries", 2, int),
+            provider_json_retry_backoff_seconds=legacy_number(
+                "provider_json_retry_backoff_seconds", 1.0, float
             ),
+            backend=resolved.get("backend", "auto"),
+            chat_template_kwargs=resolved.get("chat_template_kwargs"),
+            max_tokens=resolved.get("max_tokens"),
+            max_concurrent_requests_total=resolved.get("max_concurrent_requests_total"),
         )
 
     @classmethod

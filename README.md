@@ -223,9 +223,11 @@ different budgets. These options do not change forecast models or select a devic
 `max_concurrent_requests` remains the per-client limit. Optional
 `max_concurrent_requests_total` additionally bounds requests to the same normalized
 server URL across this checkout's processes, including parallel datasets and Agent
-profiles. Configure the same total for every profile sharing an endpoint. The
-current `config.yaml` sets a shared total of 4; omitted or null totals preserve the
-original per-client behavior. Clients with a null total do not join the shared
+profiles. Configure the same total for every profile sharing an endpoint. Set it
+under `agent` as a shared default, or in a profile to override that default. The
+example leaves the shared limit disabled (`null`). An explicit profile-level
+`null` also disables it instead of inheriting the parent value. If omitted from
+both levels, only the per-client limit applies. Clients with a null total do not join the shared
 budget. URL aliases such as `localhost` and `127.0.0.1`, distinct API paths, separate
 checkouts, and remote machines are not combined; use a common URL and server-side
 admission limits when those also need one budget.

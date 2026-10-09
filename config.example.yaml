@@ -5,8 +5,8 @@ agent:
     model: "qwen/qwen3-14b"
     backend: "auto" # auto detects only openrouter.ai; otherwise openai_compatible
     # For a local server, explicitly choose vllm or sglang; api_key may then be null.
-    chat_template_kwargs: {} # standard Qwen3 on vllm/sglang: {enable_thinking: false}
-    reasoning_effort: "none" # sent only to OpenRouter; local thinking uses chat_template_kwargs
+    chat_template_kwargs: {} # explicit enable_thinking overrides the switch derived from reasoning_effort
+    reasoning_effort: "none" # OpenRouter/vllm/sglang; none=off, low/medium/high=on; local null=server default
     max_tokens: null # optional positive output-token limit; size for all pricing windows
     timeout_seconds: 90
     max_concurrent_requests: 4
@@ -18,8 +18,8 @@ agent:
     base_url: "https://openrouter.ai/api/v1"
     model: "meta-llama/llama-3.3-70b-instruct"
     backend: "auto" # auto, openrouter, openai_compatible, vllm, sglang
-    chat_template_kwargs: {} # standard Qwen3 on vllm/sglang: {enable_thinking: false}
-    reasoning_effort: "none" # OpenRouter only
+    chat_template_kwargs: {} # leave empty to follow reasoning_effort on vllm/sglang
+    reasoning_effort: "none" # OpenRouter/vllm/sglang; local null leaves the server default
     max_tokens: null
     timeout_seconds: 90
     max_concurrent_requests: 4

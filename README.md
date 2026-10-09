@@ -172,22 +172,52 @@ agent:
     base_url: http://127.0.0.1:8000/v1
     model: Qwen/Qwen3-14B # must match the server's model name or served alias
     api_key: null # use the configured key if the server requires authentication
-    chat_template_kwargs:
-      enable_thinking: false # standard Qwen3; use the served model's supported options
+    reasoning_effort: "none" # none=disable thinking; low/medium/high=enable and forward effort
+    chat_template_kwargs: {} # normally keep empty to follow reasoning_effort
     max_tokens: null # optional positive output-token limit; allow room for every window
     max_concurrent_requests: 4
 ```
 
 The same options apply to `single_agent`. `backend: auto` identifies OpenRouter by
 its URL hostname; other URLs use `openai_compatible`. It does not guess a local
-engine from a port number or model name. `reasoning_effort` is sent in OpenRouter's
-format only to that backend. Explicit `chat_template_kwargs` are forwarded in
-`extra_body`; they control local chat templates independently of that cloud option.
+engine from a port number or model name. Both `vllm` and `sglang` now use the
+existing `reasoning_effort` setting. Their HTTP request receives top-level
+`reasoning_effort`, together with `chat_template_kwargs.enable_thinking` derived
+from the setting. The SDK merges these fields from `extra_body` into the JSON
+request. OpenRouter retains its `reasoning: {effort: ...}` format; other generic
+endpoints keep their previous behavior.
+
+| Local `reasoning_effort` | Request behavior |
+| --- | --- |
+| `"none"` (default) | Send `reasoning_effort: "none"` and `enable_thinking: false` |
+| `"low"`, `"medium"`, `"high"` | Forward the selected effort and set `enable_thinking: true` |
+| `"minimal"`, `"xhigh"`, `"max"` | Forward unchanged and enable thinking; requires a server/model version supporting that level |
+| `null` or an empty string | Omit automatic effort and thinking fields; use server/model defaults |
+
+Each profile can override an inherited effort, including `null` to clear it for
+a local backend. Local values are normalized to lowercase and validated before
+any request. Explicit `chat_template_kwargs.enable_thinking` takes precedence
+over the derived switch; other template options are preserved. For example,
+`reasoning_effort: high` with `enable_thinking: false` sends both fields but keeps
+the explicit switch false. Leave the switch unset when effort should control it.
+See the [vLLM reasoning protocol](https://docs.vllm.ai/en/latest/features/reasoning_outputs/#automatic-enable_thinking-activation)
+and [SGLang request protocol](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/openai/protocol.py).
+
+**Qwen3.5 limitation:** its standard template implements a thinking switch, so
+`low`/`medium`/`high` all enable thinking; forwarding these labels does not create
+different token budgets. Graded behavior depends on the served model and template.
+The client does not invent an effort-to-token mapping. Configure the appropriate
+reasoning parser on the server when enabling thinking (Qwen uses
+`--reasoning-parser qwen3`). The prompt text is unchanged, and only final response
+content is parsed as the existing JSON result. See the
+[official Qwen3.5 template](https://huggingface.co/Qwen/Qwen3.5-27B/blob/main/chat_template.jinja).
+
 Only explicit `vllm`/`sglang` profiles may omit an API key, in which case the SDK
 receives an `EMPTY` placeholder. Real server authentication still requires its key.
 
 `max_tokens: null` preserves the server's output budget; a positive integer sets
-the request's output-token limit. Different models and discussion modes can need
+the request's total output-token limit (thinking plus final answer, not a separate
+thinking budget). Different models and discussion modes can need
 different budgets. These options do not change forecast models or select a device.
 
 `max_concurrent_requests` remains the per-client limit. Optional

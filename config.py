@@ -41,6 +41,8 @@ BACKEND_PARAMETER_NAMES = (
 
 PIPELINE_STAGES = {"full", "forecaster", "agent"}
 AGENT_BACKENDS = {"auto", "openrouter", "openai_compatible", "vllm", "sglang"}
+LOCAL_AGENT_BACKENDS = {"vllm", "sglang"}
+LOCAL_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 
 
 def positive_integer(value: Any, key: str) -> int:
@@ -284,7 +286,7 @@ class AgentConfig:
     model: str
     profile: str = "multi_agent"
     single_agent_model: str | None = None
-    reasoning_effort: str = "none"
+    reasoning_effort: str | None = "none"
     http_referer: str | None = None
     title: str | None = None
     timeout_seconds: float = 90.0
@@ -299,6 +301,18 @@ class AgentConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str) or self.backend not in AGENT_BACKENDS:
             raise ValueError(f"agent.backend must be one of: {', '.join(sorted(AGENT_BACKENDS))}")
+        if self.backend in LOCAL_AGENT_BACKENDS:
+            effort = self.reasoning_effort
+            if effort is not None and not isinstance(effort, str):
+                raise ValueError("agent.reasoning_effort must be a string or null for vllm/sglang")
+            if effort is not None:
+                effort = effort.strip().lower() or None
+            if effort is not None and effort not in LOCAL_REASONING_EFFORTS:
+                raise ValueError(
+                    "agent.reasoning_effort for vllm/sglang must be null or one of: "
+                    + ", ".join(sorted(LOCAL_REASONING_EFFORTS))
+                )
+            object.__setattr__(self, "reasoning_effort", effort)
         kwargs = self.chat_template_kwargs
         if kwargs is None:
             kwargs = {}
@@ -363,7 +377,7 @@ class AgentConfig:
     def client_api_key(self) -> str | None:
         if self.api_key:
             return self.api_key
-        if self.backend in {"vllm", "sglang"}:
+        if self.backend in LOCAL_AGENT_BACKENDS:
             return "EMPTY"
         return None
 
@@ -446,13 +460,20 @@ class AgentConfig:
                 raise ValueError(f"agent.{name} must be an integer")
             return converted
 
+        backend = resolved.get("backend", "auto")
+        reasoning_effort = resolved.get("reasoning_effort", "none")
+        if not isinstance(backend, str) or backend not in LOCAL_AGENT_BACKENDS:
+            # Preserve the legacy cloud default. Local null explicitly delegates
+            # reasoning settings to the server/model instead of disabling them.
+            reasoning_effort = optional_str(reasoning_effort) or "none"
+
         return cls(
             api_key=optional_str(resolved.get("api_key")),
             base_url=optional_str(resolved.get("base_url")) or "https://openrouter.ai/api/v1",
             model=optional_str(resolved.get("model")) or "meta-llama/llama-3.1-8b-instruct",
             profile=profile,
             single_agent_model=optional_str(settings.get("single_agent_model")),
-            reasoning_effort=optional_str(resolved.get("reasoning_effort")) or "none",
+            reasoning_effort=reasoning_effort,
             http_referer=optional_str(resolved.get("http_referer")),
             title=optional_str(resolved.get("title")) or "MAPF UrbanEV",
             timeout_seconds=legacy_number("timeout_seconds", 90.0, float),
@@ -461,7 +482,7 @@ class AgentConfig:
             provider_json_retry_backoff_seconds=legacy_number(
                 "provider_json_retry_backoff_seconds", 1.0, float
             ),
-            backend=resolved.get("backend", "auto"),
+            backend=backend,
             chat_template_kwargs=resolved.get("chat_template_kwargs"),
             max_tokens=resolved.get("max_tokens"),
             max_concurrent_requests_total=resolved.get("max_concurrent_requests_total"),

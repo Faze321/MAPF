@@ -41,6 +41,7 @@ run:
   data_dir: "data/UrbanEV"
   # A list of folders runs datasets in parallel; see docs/datasets.md.
   max_parallel_datasets: 2
+  max_dataset_errors: 3 # stop this dataset on the Nth failed combination; positive integer
   output_folder: "output" # outputs: <output_folder>/<experiment_name>/<dataset>/...
   experiment_name: null # null uses the stable folder name "experiment"
   weather_file: "weather_central.csv"

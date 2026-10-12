@@ -288,6 +288,18 @@ Companion outputs are:
 
 Experiment matrices additionally aggregate these records into `experiment_agent_attempt_usage.csv`, `experiment_agent_step_token_usage.csv`, and `experiment_control_attempt_trace.csv`.
 
+`run.max_dataset_errors` sets the cumulative exception limit for each dataset's
+experiment matrix. It must be a positive integer and defaults to `3` when omitted:
+the first two failed combinations are skipped, and the third stops that dataset.
+Every failed combination is recorded in `experiment_runs.csv`
+with its error details and cumulative `dataset_error_count`, plus a traceback in
+`errors/`. The counter starts at zero for each dataset invocation, spans all dates,
+models, seeds, modes, and blend values, and is not reset by successful combinations.
+Other dataset processes continue even when one reaches the limit. Configuration
+or zone-selection errors before the matrix starts still stop that dataset immediately.
+An ordinary control outcome of `fail` is not an exception and does not increment
+this counter.
+
 The run is `success` only when every selected Zone and every 3-hour window is `Medium`; otherwise the third proposal produces `fail` with the final summaries and reforecast state.
 
 ## Offline result analysis

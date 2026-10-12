@@ -373,6 +373,7 @@ def main(argv: list[str] | None = None):
                     del dataset
             outputs = run_experiment_matrix(
                 experiment_name=resolved_experiment_name,
+                max_dataset_errors=run_config.max_dataset_errors,
                 experiment_zone_selection=run_config.experiment_zone_selection,
                 experiment_zone_seed=run_config.experiment_zone_seed,
                 forecast_starts=forecast_starts,

@@ -37,6 +37,7 @@ from config import (
     normalize_forecast_model_name,
     normalize_pipeline_stage,
     normalize_zone_selection,
+    positive_integer,
 )
 from data_loader import (
     build_zone_3h_load_policy_thresholds,
@@ -867,8 +868,10 @@ def run_experiment_matrix(
     agent_modes: Iterable[str] | None = None,
     diurnal_blend_alphas: Iterable[float] | None = None,
     experiment_name: str | None = None,
+    max_dataset_errors: int = RunConfig.max_dataset_errors,
     **pipeline_kwargs: Any,
 ) -> dict[str, Path]:
+    max_dataset_errors = positive_integer(max_dataset_errors, "run.max_dataset_errors")
     starts = normalize_forecast_starts(forecast_starts)
     models = normalize_forecast_models(forecast_models)
     seeds = normalize_experiment_seeds(experiment_seeds)
@@ -964,6 +967,7 @@ def run_experiment_matrix(
     decision_summary_path = experiment_dir / "experiment_decision_quality_summary.csv"
 
     run_records: list[dict[str, Any]] = []
+    dataset_error_count = 0
     metrics_frames: list[pd.DataFrame] = []
     price_frames: list[pd.DataFrame] = []
     rationale_frames: list[pd.DataFrame] = []
@@ -1047,6 +1051,7 @@ def run_experiment_matrix(
                             "error_message": "",
                             "traceback_file": "",
                             "completed_at": "",
+                            "dataset_error_count": dataset_error_count,
                         }
                         try:
                             outputs = run_pipeline(
@@ -1072,8 +1077,10 @@ def run_experiment_matrix(
                             for output_key, (frames, _) in experiment_tables.items():
                                 append_experiment_frame(frames, outputs.get(output_key), metadata)
                         except Exception as exc:
+                            dataset_error_count += 1
                             record["status"] = "failed"
                             record["completed_at"] = pd.Timestamp.now().isoformat()
+                            record["dataset_error_count"] = dataset_error_count
                             record.update(
                                 experiment_error_record(
                                     exc,
@@ -1082,7 +1089,21 @@ def run_experiment_matrix(
                                     run_index=len(run_records) + 1,
                                 )
                             )
-                            raise
+                            limit_reached = dataset_error_count >= max_dataset_errors
+                            action = (
+                                "Stopping this dataset: error limit reached."
+                                if limit_reached
+                                else "Skipping this combination and continuing this dataset."
+                            )
+                            print(
+                                f"[{data_dir}] Experiment failed "
+                                f"({dataset_error_count}/{max_dataset_errors}): {record['error']}\n"
+                                f"{action} Traceback: {record['traceback_file']}",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            if limit_reached:
+                                raise
                         finally:
                             cache_attempted = True
                             run_records.append(record)

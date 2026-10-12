@@ -128,6 +128,7 @@ class DataConfig:
 class RunConfig:
     data_dir: str | list[str] = "data/UrbanEV"
     max_parallel_datasets: int = 2
+    max_dataset_errors: int = 3
     output_dir: str = "output"
     experiment_name: str | None = None
     weather_file: str = "weather_airport.csv"
@@ -240,6 +241,9 @@ class RunConfig:
             data_dir=normalize_data_dirs(settings.get("data_dir")),
             experiment_zone_counts=normalize_experiment_zone_counts(settings.get("experiment_zone_counts")),
             max_parallel_datasets=positive_integer(settings.get("max_parallel_datasets", 2), "run.max_parallel_datasets"),
+            max_dataset_errors=positive_integer(
+                settings.get("max_dataset_errors", defaults.max_dataset_errors), "run.max_dataset_errors"
+            ),
             output_dir=(
                 optional_str(settings.get("output_folder"))
                 or optional_str(settings.get("output_dir"))

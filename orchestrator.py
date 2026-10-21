@@ -32,6 +32,7 @@ from config import (
     AgentConfig,
     RunConfig,
     BACKEND_PARAMETER_NAMES,
+    XGBOOST_PARAMETER_DEFAULTS,
     agent_config_profile,
     normalize_agent_mode,
     normalize_forecast_model_name,
@@ -285,6 +286,16 @@ def run_pipeline(
     lstm_device: str = "auto",
     lstm_roll_actuals: bool = False,
     lstm_seed: int = 42,
+    xgboost_lags: list[int] | None = None,
+    xgboost_exog_cols: list[str] | None = None,
+    xgboost_n_estimators: int = 300,
+    xgboost_max_depth: int = 9,
+    xgboost_learning_rate: float = 0.1,
+    xgboost_colsample_bytree: float = 0.9,
+    xgboost_tree_method: str = "approx",
+    xgboost_n_jobs: int = 1,
+    xgboost_diurnal_blend_alpha: float = 0.0,
+    xgboost_seed: int = 42,
     temperature: float = 0.2,
     precomputed_window_data: Path | str | None = None,
     pipeline_stage: str = "full",
@@ -352,6 +363,16 @@ def run_pipeline(
         lstm_device=lstm_device,
         lstm_roll_actuals=lstm_roll_actuals,
         lstm_seed=lstm_seed,
+        xgboost_lags=xgboost_lags,
+        xgboost_exog_cols=xgboost_exog_cols,
+        xgboost_n_estimators=xgboost_n_estimators,
+        xgboost_max_depth=xgboost_max_depth,
+        xgboost_learning_rate=xgboost_learning_rate,
+        xgboost_colsample_bytree=xgboost_colsample_bytree,
+        xgboost_tree_method=xgboost_tree_method,
+        xgboost_n_jobs=xgboost_n_jobs,
+        xgboost_diurnal_blend_alpha=xgboost_diurnal_blend_alpha,
+        xgboost_seed=xgboost_seed,
     )
 
     if pipeline_stage == "agent":
@@ -630,6 +651,8 @@ def run_pipeline(
 
 
 def make_forecast_parameters(**values: Any) -> dict[str, Any]:
+    # Old artifacts predate XGBoost and do not need its optional parameters.
+    values = {**XGBOOST_PARAMETER_DEFAULTS, **values}
     missing = [name for name in FORECAST_PARAMETER_NAMES if name not in values]
     if missing:
         raise ValueError("Missing forecast parameter(s): " + ", ".join(missing))
@@ -641,6 +664,7 @@ def make_forecast_parameters(**values: Any) -> dict[str, Any]:
 
 
 def price_conditioned_parameters(forecast_parameters: dict[str, Any]) -> dict[str, Any]:
+    forecast_parameters = {**XGBOOST_PARAMETER_DEFAULTS, **forecast_parameters}
     missing = [
         name for name in PRICE_CONDITIONED_PARAMETER_NAMES if name not in forecast_parameters
     ]
@@ -1008,12 +1032,14 @@ def run_experiment_matrix(
                         run_kwargs["agent_mode"] = agent_mode
                         if seed is not None:
                             run_kwargs["lstm_seed"] = seed
+                            run_kwargs["xgboost_seed"] = seed
                         if blend_alpha is not None:
                             alpha_value = float(blend_alpha)
                             run_kwargs["timesfm_diurnal_blend_alpha"] = alpha_value
                             run_kwargs["ar_diurnal_blend_alpha"] = alpha_value
                             run_kwargs["chronos_diurnal_blend_alpha"] = alpha_value
                             run_kwargs["lstm_diurnal_blend_alpha"] = alpha_value
+                            run_kwargs["xgboost_diurnal_blend_alpha"] = alpha_value
                         if matrix_stage == "agent":
                             shared_run_base_dir = time_output_dir
                             if add_seed_folder and seed is not None:
@@ -1897,9 +1923,19 @@ def apply_price_conditioned_baseline_forecasts(
     lstm_diurnal_blend_alpha: float,
     lstm_device: str,
     lstm_seed: int,
+    xgboost_lags: list[int] | None = None,
+    xgboost_exog_cols: list[str] | None = None,
+    xgboost_n_estimators: int = 300,
+    xgboost_max_depth: int = 9,
+    xgboost_learning_rate: float = 0.1,
+    xgboost_colsample_bytree: float = 0.9,
+    xgboost_tree_method: str = "approx",
+    xgboost_n_jobs: int = 1,
+    xgboost_diurnal_blend_alpha: float = 0.0,
+    xgboost_seed: int = 42,
 ) -> list[dict[str, Any]]:
     normalized_model = normalize_forecast_model_name(forecast_model)
-    if normalized_model not in {"timesfm", "lstm", "chronos", "AR"}:
+    if normalized_model not in {"timesfm", "lstm", "chronos", "xgboost", "AR"}:
         return [
             mark_price_conditioned_baseline_unavailable(
                 report,
@@ -2819,6 +2855,16 @@ def build_contexts(
     lstm_device: str,
     lstm_roll_actuals: bool,
     lstm_seed: int,
+    xgboost_lags: list[int] | None = None,
+    xgboost_exog_cols: list[str] | None = None,
+    xgboost_n_estimators: int = 300,
+    xgboost_max_depth: int = 9,
+    xgboost_learning_rate: float = 0.1,
+    xgboost_colsample_bytree: float = 0.9,
+    xgboost_tree_method: str = "approx",
+    xgboost_n_jobs: int = 1,
+    xgboost_diurnal_blend_alpha: float = 0.0,
+    xgboost_seed: int = 42,
 ) -> tuple[list[dict[str, Any]], dict[str, ForecastResult]]:
     start = pd.Timestamp(forecast_start) if forecast_start else None
     contexts = []
@@ -2873,6 +2919,16 @@ def build_contexts(
                 lstm_device=lstm_device,
                 lstm_roll_actuals=lstm_roll_actuals,
                 lstm_seed=lstm_seed,
+                xgboost_lags=xgboost_lags,
+                xgboost_exog_cols=xgboost_exog_cols,
+                xgboost_n_estimators=xgboost_n_estimators,
+                xgboost_max_depth=xgboost_max_depth,
+                xgboost_learning_rate=xgboost_learning_rate,
+                xgboost_colsample_bytree=xgboost_colsample_bytree,
+                xgboost_tree_method=xgboost_tree_method,
+                xgboost_n_jobs=xgboost_n_jobs,
+                xgboost_diurnal_blend_alpha=xgboost_diurnal_blend_alpha,
+                xgboost_seed=xgboost_seed,
             )
         except Exception as exc:
             raise PipelineStageError(

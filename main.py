@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--forecast-model",
         default=None,
-        help="Forecast model: timesfm, chronos, lstm, or AR.",
+        help="Forecast model: timesfm, chronos, lstm, xgboost, or AR.",
     )
     parser.add_argument(
         "--model",
@@ -138,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--forecast-models",
         nargs="+",
         default=None,
-        help="Forecast model(s) for an experiment matrix: timesfm, chronos, lstm, or AR.",
+        help="Forecast model(s) for an experiment matrix: timesfm, chronos, lstm, xgboost, or AR.",
     )
     parser.add_argument(
         "--experiment-zone-count",
@@ -150,7 +150,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--experiment-seeds",
         nargs="+",
         default=None,
-        help="Seed(s) for repeated experiment runs, mainly affecting LSTM training.",
+        help="Seed(s) for repeated experiment runs, affecting LSTM and XGBoost training.",
     )
     parser.add_argument(
         "--agent-mode",
@@ -356,6 +356,7 @@ def main(argv: list[str] | None = None):
         common_kwargs["ar_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
         common_kwargs["chronos_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
         common_kwargs["lstm_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
+        common_kwargs["xgboost_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
 
     with output_lock(Path(agent_output_dir) if agent_output_dir else common_kwargs["output_dir"]):
         if run_matrix:

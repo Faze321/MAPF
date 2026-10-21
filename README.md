@@ -256,6 +256,42 @@ because the earlier attempts may have unreported usage. Existing prompt, complet
 and total token counts retain their meanings. The dataset cache is independent of
 this server-side prefix cache.
 
+## XGBoost forecaster
+
+Install the updated dependencies (`uv sync` or `pip install -r requirements.txt`).
+Select `run.forecast_model: xgboost`, or include `xgboost` in `run.forecast_models`
+for a model comparison. A non-empty `forecast_models` list takes precedence over
+`forecast_model`; this CLI override selects only XGBoost:
+
+```powershell
+python main.py --config config.yaml --forecast-model xgboost --pipeline-stage forecaster
+```
+
+`xgboost` (alias `xgb`) trains one `XGBRegressor` per Zone. Defaults follow the
+supplied notebook: 300 trees, depth 9, learning rate 0.1, column sampling 0.9,
+and `tree_method: approx`. It runs on CPU with one thread by default. All
+`xgboost_*` settings are listed in `config.example.yaml`; experiment seeds and
+uniform diurnal-blend sweeps also apply to this backend.
+
+Inputs are load lags (default 1, 2, 3 and 24 hours), hourly/weekly calendar cycles,
+and the configured known covariates. Training requires more history hours than
+the largest lag. Targets are in kWh; no scaler is fitted. Missing weather and
+other covariates remain NaN for XGBoost's missing-value handling. Target columns
+cannot be selected as covariates. Future prices/weather must be available at
+the forecast origin, as with the other covariate forecasters.
+
+The model trains only on the history window. The pre-origin validation window
+provides a scalar bias correction and an empirical residual interval; forecasts
+then recursively append their own corrected, blended predictions. The q10/q90
+columns follow the existing residual-width convention and are not learned
+quantiles. With no validation, bias is zero and interval bounds are unavailable.
+
+The artifact stores the trained model in XGBoost's
+[JSON model format](https://xgboost.readthedocs.io/en/stable/tutorials/saving_model.html),
+lag state and calibration. Full and Agent-only runs reuse it for each proposed
+price schedule without retraining. Load changes depend on the relationships
+learned from history; tree predictions can remain unchanged for small price changes.
+
 ## Fixed-origin and no leakage
 
 - Profiles, scalers, stress thresholds, preprocessing, and validation calibration use only timestamps before `forecast_start`.
@@ -281,7 +317,7 @@ Companion outputs are:
 - `control_experiment_summary.csv`
 - `forecaster/forecaster_artifact.json` for refit-free Agent-only handoff. It stores
   backend-specific inference state and known-future covariates; every proposed price
-  schedule is sent back through the original TimesFM, Chronos, LSTM, or AR forecast
+  schedule is sent back through the original TimesFM, Chronos, LSTM, XGBoost, or AR forecast
   function. The control loop does not use a separate price-to-load approximation.
 - `forecaster/context_snippets.json` for the no-leakage Agent handoff
 - forecast evaluation CSV/plots, separate from `control_results.json`

@@ -58,11 +58,12 @@ run:
   horizon_days: 2
   history_days: 7
   validation_days: 1
-  forecast_model: "timesfm" # options: "timesfm", "chronos", "lstm", "AR"
+  forecast_model: "timesfm" # options: "timesfm", "chronos", "lstm", "xgboost", "AR"
   forecast_models:
     - "timesfm"
     - "chronos"
     - "lstm"
+    - "xgboost"
     - "AR"
   diurnal_blend_alphas:
     - 0.0
@@ -120,6 +121,18 @@ run:
   lstm_batch_size: 32
   lstm_roll_actuals: false # strict fixed-origin; always false in the config loader
   lstm_seed: 42
+
+# XGBoost: recursive hourly predictions; no forecast-period actual load is used.
+  xgboost_lags: [1, 2, 3, 24] # history_days * 24 must exceed the largest lag
+  xgboost_exog_cols: [T, U, nRAIN, e_price, s_price, is_weekend, temp_price_idx]
+  xgboost_n_estimators: 300
+  xgboost_max_depth: 9
+  xgboost_learning_rate: 0.1
+  xgboost_colsample_bytree: 0.9
+  xgboost_tree_method: approx # approx, hist, or exact; runs on CPU
+  xgboost_n_jobs: 1 # threads per model; datasets may already run in parallel
+  xgboost_diurnal_blend_alpha: 0.0 # uniform blend/sweep settings take precedence
+  xgboost_seed: 42
   zones: null # automatically select sites from the current dataset
   experiment_zone_count: 12
   experiment_zone_counts: {} # optional per-folder counts; unspecified folders use experiment_zone_count

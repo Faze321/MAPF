@@ -11,7 +11,21 @@ import re
 import os
 import yaml
 
+XGBOOST_PARAMETER_DEFAULTS = {
+    "xgboost_lags": None,
+    "xgboost_exog_cols": None,
+    "xgboost_n_estimators": 300,
+    "xgboost_max_depth": 9,
+    "xgboost_learning_rate": 0.1,
+    "xgboost_colsample_bytree": 0.9,
+    "xgboost_tree_method": "approx",
+    "xgboost_n_jobs": 1,
+    "xgboost_diurnal_blend_alpha": 0.0,
+    "xgboost_seed": 42,
+}
+
 BACKEND_PARAMETER_NAMES = (
+    *XGBOOST_PARAMETER_DEFAULTS,
     "timesfm_repo",
     "timesfm_context_hours",
     "timesfm_step_horizon",
@@ -182,6 +196,16 @@ class RunConfig:
     lstm_device: str = "auto"
     lstm_roll_actuals: bool = False
     lstm_seed: int = 42
+    xgboost_lags: list[int] | None = None
+    xgboost_exog_cols: list[str] | None = None
+    xgboost_n_estimators: int = 300
+    xgboost_max_depth: int = 9
+    xgboost_learning_rate: float = 0.1
+    xgboost_colsample_bytree: float = 0.9
+    xgboost_tree_method: str = "approx"
+    xgboost_n_jobs: int = 1
+    xgboost_diurnal_blend_alpha: float = 0.0
+    xgboost_seed: int = 42
     temperature: float = 0.2
 
     @property
@@ -223,6 +247,10 @@ class RunConfig:
                 "lstm_epochs",
                 "lstm_batch_size",
                 "lstm_seed",
+                "xgboost_n_estimators",
+                "xgboost_max_depth",
+                "xgboost_n_jobs",
+                "xgboost_seed",
             )),
             (optional_float, (
                 "timesfm_diurnal_blend_alpha",
@@ -230,6 +258,9 @@ class RunConfig:
                 "chronos_diurnal_blend_alpha",
                 "lstm_learning_rate",
                 "lstm_diurnal_blend_alpha",
+                "xgboost_learning_rate",
+                "xgboost_colsample_bytree",
+                "xgboost_diurnal_blend_alpha",
                 "temperature",
             )),
         ):
@@ -280,6 +311,9 @@ class RunConfig:
             lstm_exog_cols=normalize_zone_id_list(settings.get("lstm_exog_cols")),
             lstm_device="auto",
             lstm_roll_actuals=False,
+            xgboost_lags=normalize_int_list(settings.get("xgboost_lags")),
+            xgboost_exog_cols=normalize_zone_id_list(settings.get("xgboost_exog_cols")),
+            xgboost_tree_method=optional_str(settings.get("xgboost_tree_method")) or "approx",
         )
 
 
@@ -612,6 +646,8 @@ def optional_str(value: Any) -> str | None:
 
 def normalize_forecast_model_name(value: str | None) -> str:
     normalized = (value or "timesfm").strip().lower().replace("-", "_")
+    if normalized in {"xgb", "xg_boost"}:
+        return "xgboost"
     return "AR" if normalized == "ar" else normalized
 
 

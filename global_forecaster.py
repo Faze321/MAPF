@@ -13,7 +13,7 @@ import pandas as pd
 
 SCHEMA_VERSION = 1
 NATIVE_ARTIFACT_SCHEMA_VERSION = 2
-SUPPORTED_BACKENDS = {"timesfm", "chronos", "chronos_2", "lstm", "ar", "AR"}
+SUPPORTED_BACKENDS = {"timesfm", "chronos", "chronos_2", "lstm", "xgboost", "ar", "AR"}
 CORE_COLUMNS = {"timestamp", "time", "zone", "zone_id", "load", "actual_kwh", "energy_price", "e_price"}
 
 
@@ -348,6 +348,16 @@ class NativeForecasterArtifact:
             lstm_device=str(parameters["lstm_device"]),
             lstm_roll_actuals=False,
             lstm_seed=int(parameters["lstm_seed"]),
+            xgboost_lags=parameters.get("xgboost_lags", None),
+            xgboost_exog_cols=parameters.get("xgboost_exog_cols", None),
+            xgboost_n_estimators=parameters.get("xgboost_n_estimators", 300),
+            xgboost_max_depth=parameters.get("xgboost_max_depth", 9),
+            xgboost_learning_rate=parameters.get("xgboost_learning_rate", 0.1),
+            xgboost_colsample_bytree=parameters.get("xgboost_colsample_bytree", 0.9),
+            xgboost_tree_method=parameters.get("xgboost_tree_method", "approx"),
+            xgboost_n_jobs=parameters.get("xgboost_n_jobs", 1),
+            xgboost_diurnal_blend_alpha=parameters.get("xgboost_diurnal_blend_alpha", 0.0),
+            xgboost_seed=parameters.get("xgboost_seed", 42),
             fitted_state=self.fitted_state,
         )
         output = hourly[["time", "predicted_kwh"]].copy()

@@ -78,9 +78,24 @@ def forecast_zone(
     lstm_device: str = "auto",
     lstm_roll_actuals: bool = False,
     lstm_seed: int = 42,
+    xgboost_lags: list[int] | None = None,
+    xgboost_exog_cols: list[str] | None = None,
+    xgboost_n_estimators: int = 300,
+    xgboost_max_depth: int = 9,
+    xgboost_learning_rate: float = 0.1,
+    xgboost_colsample_bytree: float = 0.9,
+    xgboost_tree_method: str = "approx",
+    xgboost_n_jobs: int = 1,
+    xgboost_diurnal_blend_alpha: float = 0.0,
+    xgboost_seed: int = 42,
 ) -> ForecastResult:
     zone_id = str(zone_id)
     normalized_model = normalize_forecast_model_name(forecast_model)
+    if normalized_model == "xgboost":
+        from xgboost_forecaster import DEFAULT_XGBOOST_LAGS
+
+        xgboost_lags = list(DEFAULT_XGBOOST_LAGS if xgboost_lags is None else xgboost_lags)
+        xgboost_exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if xgboost_exog_cols is None else xgboost_exog_cols)
     horizon_hours = horizon_days * 24
     if forecast_start is None:
         forecast_start = load["time"].max() - pd.Timedelta(hours=horizon_hours - 1)
@@ -132,6 +147,16 @@ def forecast_zone(
         lstm_device=lstm_device,
         lstm_roll_actuals=lstm_roll_actuals,
         lstm_seed=lstm_seed,
+        xgboost_lags=xgboost_lags,
+        xgboost_exog_cols=xgboost_exog_cols,
+        xgboost_n_estimators=xgboost_n_estimators,
+        xgboost_max_depth=xgboost_max_depth,
+        xgboost_learning_rate=xgboost_learning_rate,
+        xgboost_colsample_bytree=xgboost_colsample_bytree,
+        xgboost_tree_method=xgboost_tree_method,
+        xgboost_n_jobs=xgboost_n_jobs,
+        xgboost_diurnal_blend_alpha=xgboost_diurnal_blend_alpha,
+        xgboost_seed=xgboost_seed,
     )
     forecast_attrs = dict(hourly.attrs)
     hourly_feature_cols = [
@@ -177,6 +202,7 @@ def forecast_zone(
         "AR": ar_diurnal_blend_alpha,
         "chronos": chronos_diurnal_blend_alpha,
         "lstm": lstm_diurnal_blend_alpha,
+        "xgboost": xgboost_diurnal_blend_alpha,
     }.get(normalized_model)
 
     summary = {
@@ -220,6 +246,16 @@ def forecast_zone(
         "lstm_device": lstm_device if normalized_model == "lstm" else None,
         "lstm_roll_actuals": bool(lstm_roll_actuals) if normalized_model == "lstm" else None,
         "lstm_seed": int(lstm_seed) if normalized_model == "lstm" else None,
+        "xgboost_lags": xgboost_lags if normalized_model == "xgboost" else None,
+        "xgboost_exog_cols": xgboost_exog_cols if normalized_model == "xgboost" else None,
+        "xgboost_n_estimators": xgboost_n_estimators if normalized_model == "xgboost" else None,
+        "xgboost_max_depth": xgboost_max_depth if normalized_model == "xgboost" else None,
+        "xgboost_learning_rate": xgboost_learning_rate if normalized_model == "xgboost" else None,
+        "xgboost_colsample_bytree": xgboost_colsample_bytree if normalized_model == "xgboost" else None,
+        "xgboost_tree_method": xgboost_tree_method if normalized_model == "xgboost" else None,
+        "xgboost_n_jobs": xgboost_n_jobs if normalized_model == "xgboost" else None,
+        "xgboost_diurnal_blend_alpha": xgboost_diurnal_blend_alpha if normalized_model == "xgboost" else None,
+        "xgboost_seed": xgboost_seed if normalized_model == "xgboost" else None,
         "calibration": forecast_attrs.get("calibration"),
         "forecast_total_kwh": round(forecast_total, 2),
         "forecast_peak_kwh": round(forecast_peak, 2),
@@ -276,6 +312,16 @@ def forecast_zone(
             "lstm_diurnal_blend_alpha": float(lstm_diurnal_blend_alpha),
             "lstm_device": lstm_device,
             "lstm_seed": int(lstm_seed),
+            "xgboost_lags": xgboost_lags,
+            "xgboost_exog_cols": xgboost_exog_cols,
+            "xgboost_n_estimators": xgboost_n_estimators,
+            "xgboost_max_depth": xgboost_max_depth,
+            "xgboost_learning_rate": xgboost_learning_rate,
+            "xgboost_colsample_bytree": xgboost_colsample_bytree,
+            "xgboost_tree_method": xgboost_tree_method,
+            "xgboost_n_jobs": xgboost_n_jobs,
+            "xgboost_diurnal_blend_alpha": xgboost_diurnal_blend_alpha,
+            "xgboost_seed": xgboost_seed,
         },
         "fitted_state": forecast_attrs.get("reusable_forecaster_state"),
     }
@@ -320,6 +366,16 @@ def forecast_load(
     lstm_device: str,
     lstm_roll_actuals: bool,
     lstm_seed: int,
+    xgboost_lags: list[int] | None = None,
+    xgboost_exog_cols: list[str] | None = None,
+    xgboost_n_estimators: int = 300,
+    xgboost_max_depth: int = 9,
+    xgboost_learning_rate: float = 0.1,
+    xgboost_colsample_bytree: float = 0.9,
+    xgboost_tree_method: str = "approx",
+    xgboost_n_jobs: int = 1,
+    xgboost_diurnal_blend_alpha: float = 0.0,
+    xgboost_seed: int = 42,
     fitted_state: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     normalized = normalize_forecast_model_name(model_name)
@@ -383,6 +439,23 @@ def forecast_load(
             device=lstm_device,
             roll_actuals=lstm_roll_actuals,
             seed=lstm_seed,
+            fitted_state=fitted_state,
+        )
+    if normalized == "xgboost":
+        from xgboost_forecaster import xgboost_forecast
+
+        return xgboost_forecast(
+            history, validation, full_frame, forecast_start, horizon_hours,
+            lags=xgboost_lags,
+            exog_cols=xgboost_exog_cols,
+            n_estimators=xgboost_n_estimators,
+            max_depth=xgboost_max_depth,
+            learning_rate=xgboost_learning_rate,
+            colsample_bytree=xgboost_colsample_bytree,
+            tree_method=xgboost_tree_method,
+            n_jobs=xgboost_n_jobs,
+            diurnal_blend_alpha=xgboost_diurnal_blend_alpha,
+            seed=xgboost_seed,
             fitted_state=fitted_state,
         )
     raise ValueError(f"Unsupported forecast_model: {model_name}")

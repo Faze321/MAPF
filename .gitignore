@@ -9,6 +9,7 @@ __pycache__/
 
 test/
 tests/
+!tests/test_xgboost.py
 test.py
 test.ipynb
 config.yaml

@@ -14,6 +14,7 @@ from numbers import Integral, Real
 from typing import Any
 
 from usage import cache_usage_fields, summarize_cache_usage
+from evaluation_artifacts import canonical_forecast_parameters, normalize_evaluation_fields
 
 
 TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
@@ -44,7 +45,7 @@ def _json(value: Any) -> str:
 
 
 def _identity(run: dict[str, Any]) -> tuple[str, str, str, tuple[str, ...]] | None:
-    fields = [run.get(name) for name in ("dataset_identity", "forecast_origin", "forecast_model")]
+    fields = [run.get(name) for name in ("dataset_identity", "forecast_origin", "backend")]
     zones = run.get("zone_ids")
     if not all(isinstance(value, str) and value for value in fields):
         return None
@@ -56,7 +57,7 @@ def _identity(run: dict[str, Any]) -> tuple[str, str, str, tuple[str, ...]] | No
 
 
 def _metadata(key: tuple[str, str, str, tuple[str, ...]]) -> dict[str, Any]:
-    return dict(zip(("dataset_identity", "forecast_origin", "forecast_model", "zone_ids"), (*key[:3], list(key[3]))))
+    return dict(zip(("dataset_identity", "forecast_origin", "backend", "zone_ids"), (*key[:3], list(key[3]))))
 
 
 def _unknown_fields(run: dict[str, Any]) -> list[str]:
@@ -162,7 +163,7 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
         left, right = by_id[pair["left_run_id"]], by_id[pair["right_run_id"]]
         key = (
             pair["left_batch"], pair["right_batch"], pair["dataset_identity"],
-            pair["forecast_model"], pair["agent_mode"], left.get("revenue_unit"), right.get("revenue_unit"),
+            pair["backend"], pair["agent_mode"], left.get("revenue_unit"), right.get("revenue_unit"),
         )
         grouped[key].append(pair)
     summaries = []
@@ -186,7 +187,7 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
         first_left = by_id[records[0]["left_run_id"]]
         summaries.append({
             "left_batch": key[0], "right_batch": key[1], "dataset_identity": key[2],
-            "dataset": first_left.get("dataset"), "forecast_model": key[3], "agent_mode": key[4],
+            "dataset": first_left.get("dataset"), "backend": key[3], "agent_mode": key[4],
             "revenue_unit": key[5] if units_agree else None,
             "left_revenue_unit": key[5], "right_revenue_unit": key[6],
             "pair_count": len(records), "left": left, "right": right, "delta": delta,
@@ -203,6 +204,10 @@ def build_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
     combination with its reason.  No pairing ever slices a run's tokens across
     windows or resolves duplicate candidates arbitrarily.
     """
+    runs = normalize_evaluation_fields(runs)
+    for run in runs:
+        if isinstance(run.get("forecast_parameters"), dict):
+            run["forecast_parameters"] = canonical_forecast_parameters(run["forecast_parameters"])
     by_id: dict[str, dict[str, Any]] = {}
     for run in runs:
         run_id = run.get("run_id")

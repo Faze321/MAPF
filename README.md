@@ -30,7 +30,6 @@ run:
   # For parallel training, replace the value above with:
   # data_dir: [data/UrbanEV, data/CHARGED/JHB, data/MP-EVData]
   max_parallel_datasets: 2
-  forecast_start: null
   forecast_starts: null
   zones: null
 ```
@@ -38,8 +37,10 @@ run:
 Null dates select the dataset's last complete forecast window; null zones select
 sites from that dataset. Explicit dates and sites remain supported for controlled
 experiments. Devices are selected automatically by the existing model backends.
-Outputs use `<output_folder>/<adapter>/<folder>_<path-hash>/`; parallel batches
-add a unique parent folder, individual logs, and `batch_manifest.json`.
+Outputs are grouped under `<output_folder>/<experiment_name>/<dataset>/`, with
+the date, seed, and mode directories required by the experiment matrix. Every
+single-model forecast uses `blend_<alpha>/<backend>/`. Parallel batches also
+write individual logs and `batch_manifest.json`.
 See [dataset setup, filtering rules and parallel training](docs/datasets.md).
 
 A generic long-format dataset can be configured with explicit semantic mappings:
@@ -104,7 +105,7 @@ do not need to be set. The legacy flat `agent.api_key`/`agent.base_url` format a
 profile for that run without changing the other profile.
 
 ```powershell
-python main.py --dry-run --forecast-model AR --agent-mode multi_agent_economist_retry
+python main.py --dry-run --forecast-models AR --agent-mode multi_agent_economist_retry
 ```
 
 The output root and run name are configured separately:
@@ -112,7 +113,7 @@ The output root and run name are configured separately:
 ```yaml
 run:
   output_folder: "output"
-  experiment_name: null # null uses the existing automatic experiment name
+  experiment_name: null # null uses the stable folder name "experiment"
 ```
 
 The same values can be overridden independently from the CLI:
@@ -121,16 +122,16 @@ The same values can be overridden independently from the CLI:
 python main.py --output-folder output --experiment-name my_experiment
 ```
 
-`experiment_name` identifies one complete experiment matrix; it does not rename
-ordinary single-model output. An unnamed matrix keeps the existing descriptive
-name, for example `<dataset-output>/3zonesx4timesx4modes_2blends`. A custom name is
-written as `<dataset-output>/my_experiment`, inside the dataset's isolated output folder.
+`experiment_name` identifies the run or experiment matrix under the output root.
+An unnamed run uses `<output_folder>/experiment/<dataset>/`; a custom name uses
+`<output_folder>/my_experiment/<dataset>/`. Forecast directories include the actual
+alpha and backend, including when there is only one configuration.
 
 Stages can be separated without changing the fitted state:
 
 ```powershell
-python main.py --pipeline-stage forecaster --forecast-model AR
-python main.py --pipeline-stage agent --forecast-model AR --agent-mode multi_agent_economist_retry
+python main.py --pipeline-stage forecaster --forecast-models AR
+python main.py --pipeline-stage agent --forecast-models AR --agent-mode multi_agent_economist_retry
 ```
 
 Supported control modes are:
@@ -256,22 +257,93 @@ because the earlier attempts may have unreported usage. Existing prompt, complet
 and total token counts retain their meanings. The dataset cache is independent of
 this server-side prefix cache.
 
+## Forecast windows and daily bias calibration
+
+All five backends use the same default split: 30 days of training history,
+5 days of validation, and 1 day of forecasting. The lengths remain configurable.
+For forecast origin `T`, the default training window is `[T-35d, T-5d)`,
+validation is `[T-5d, T)`, and the forecast is `[T, T+1d)`. Each model's
+`context_hours` is independent of the available training/history window.
+
+Each Zone/model run fits once, using only the training window. Validation makes
+five separate 24-hour predictions. At each validation origin, context consists
+of the most recent `history_days` of already observed load; observations from
+the current or later validation day cannot enter its forecast. Trained weights,
+scalers, the AR price response, and the training diurnal profile remain frozen.
+
+For each validation day, model predictions are blended once with the training
+diurnal profile. Their signed errors (`blended prediction - actual`) are averaged
+across validation days at each of the 24 horizon offsets. The final prediction
+is `max(0, blended prediction - bias[offset % 24])`. Thus the default produces
+24 biases from all 120 validation hours, rather than one scalar bias or a bias
+from only the first validation day. Saved calibration records include daily
+predictions, hourly residuals, and the averaged bias vector.
+
+Incomplete or invalid validation load is an error. `validation_days: 0` disables
+calibration. A longer configured forecast repeats the 24-hour bias vector; it
+never consumes forecast-period actual load. LSTM and XGBoost may recursively
+predict within the requested horizon. The old `roll_actuals` and per-model
+`step_horizon` settings have been removed.
+
+Configuration selects dates and models through plural keys, even for one run:
+
+```yaml
+run:
+  history_days: 30
+  validation_days: 5
+  horizon_days: 1
+  forecast_starts: null
+  forecast_start_count: 2
+  forecast_models: [timesfm, chronos, lstm, xgboost, AR]
+  diurnal_blend_alphas: [0.0, 0.5]
+  timesfm_diurnal_blend_alphas: null
+  chronos_diurnal_blend_alphas: null
+  lstm_diurnal_blend_alphas: [0.0, 0.25]
+  xgboost_diurnal_blend_alphas: [0.0]
+  ar_diurnal_blend_alphas: null
+```
+
+A non-null per-model alpha list replaces the global list. Missing/null overrides
+inherit it; the global default is `[0.0]`. Each setting also accepts one number.
+Values must be finite and between 0 and 1; empty lists are rejected. Values are
+deduplicated to six decimal places while preserving order. Global and per-model
+CLI options use the same plural names with hyphens. CLI overrides its matching
+YAML setting before per-model precedence is applied:
+
+```powershell
+python main.py --forecast-models lstm xgboost --diurnal-blend-alphas 0 0.5 --lstm-diurnal-blend-alphas 0.25
+```
+
+The matrix runs each backend only for its own effective alpha list. Independent
+models' alpha lists are not multiplied together. Every output path contains a
+`blend_<alpha>` component with the same precision as the configuration, including
+single-alpha runs. Single-run artifacts record the resolved scalar alpha and
+only that backend's inference parameters; changing an unrelated model's grid
+does not change their identity. Forecaster, Full, and Agent-only stages share
+the same path convention.
+
+The singular date/model configuration and CLI options are removed, as are the
+singular alpha configuration options. Deprecated inputs fail with a migration
+message instead of silently falling back. Python single-run APIs and new output
+fields use `forecast_origin` and `backend`. Offline evaluation accepts legacy
+field names at its reading boundary and writes the new names. Model artifacts
+use the new protocol and do not replay legacy calibration states.
+
 ## XGBoost forecaster
 
 Install the updated dependencies (`uv sync` or `pip install -r requirements.txt`).
-Select `run.forecast_model: xgboost`, or include `xgboost` in `run.forecast_models`
-for a model comparison. A non-empty `forecast_models` list takes precedence over
-`forecast_model`; this CLI override selects only XGBoost:
+Select `run.forecast_models: [xgboost]`, or include `xgboost` alongside other
+backends for a model comparison. This CLI override selects only XGBoost:
 
 ```powershell
-python main.py --config config.yaml --forecast-model xgboost --pipeline-stage forecaster
+python main.py --config config.yaml --forecast-models xgboost --pipeline-stage forecaster
 ```
 
 `xgboost` (alias `xgb`) trains one `XGBRegressor` per Zone. Defaults follow the
 supplied notebook: 300 trees, depth 9, learning rate 0.1, column sampling 0.9,
 and `tree_method: approx`. It runs on CPU with one thread by default. All
 `xgboost_*` settings are listed in `config.example.yaml`; experiment seeds and
-uniform diurnal-blend sweeps also apply to this backend.
+global and independent diurnal-blend sweeps also apply to this backend.
 
 Inputs are load lags (default 1, 2, 3 and 24 hours), hourly/weekly calendar cycles,
 and the configured known covariates. Training requires more history hours than
@@ -280,11 +352,11 @@ other covariates remain NaN for XGBoost's missing-value handling. Target columns
 cannot be selected as covariates. Future prices/weather must be available at
 the forecast origin, as with the other covariate forecasters.
 
-The model trains only on the history window. The pre-origin validation window
-provides a scalar bias correction and an empirical residual interval; forecasts
-then recursively append their own corrected, blended predictions. The q10/q90
-columns follow the existing residual-width convention and are not learned
-quantiles. With no validation, bias is zero and interval bounds are unavailable.
+The model follows the shared daily bias-calibration protocol above. Its internal
+recursion appends its own raw predictions; blending and correction happen once
+on the forecast output. The q10/q90 columns follow the empirical residual-width
+convention and are not learned quantiles. With no validation, bias is zero and
+interval bounds are unavailable.
 
 The artifact stores the trained model in XGBoost's
 [JSON model format](https://xgboost.readthedocs.io/en/stable/tutorials/saving_model.html),
@@ -294,7 +366,7 @@ learned from history; tree predictions can remain unchanged for small price chan
 
 ## Fixed-origin and no leakage
 
-- Profiles, scalers, stress thresholds, preprocessing, and validation calibration use only timestamps before `forecast_start`.
+- Profiles, scalers, stress thresholds, preprocessing, and validation calibration use only timestamps before `forecast_origin`.
 - Multi-step forecasts roll their own predictions, never forecast-period actual load.
 - Agent context is constructed from an allowlist. It excludes future actual load/stress/percentile, future error metrics, evaluation nodes, and all derived correctness labels.
 - Grid Agent assesses the forecaster values but cannot overwrite them.
@@ -306,7 +378,7 @@ For every Zone, the adapter computes mean energy price in consecutive non-overla
 
 ## Outputs
 
-The authoritative control artifact is `control_results.json` (schema version 3). It records the dataset fingerprint, split cache key, feature manifest, forecast origin/model, experiment mode, global and Zone status, attempts, structured Agent summaries, reforecast trace, final window prices/load positions/stress, rationale, and historical price diagnostics. Agent time is not measured or emitted. Every concrete Grid, Behaviour, Economist, schema-repair, and retry call records prompt, completion, and total tokens. Attempt-level summaries and the final `agent_token_totals` provide Zone and global totals. Missing provider usage remains explicitly incomplete instead of being estimated.
+The authoritative control artifact is `control_results.json` (schema version 4). It records the dataset fingerprint, split cache key, feature manifest, forecast origin/model, experiment mode, global and Zone status, attempts, structured Agent summaries, reforecast trace, final window prices/load positions/stress, rationale, and historical price diagnostics. Agent time is not measured or emitted. Every concrete Grid, Behaviour, Economist, schema-repair, and retry call records prompt, completion, and total tokens. Attempt-level summaries and the final `agent_token_totals` provide Zone and global totals. Missing provider usage remains explicitly incomplete instead of being estimated.
 
 Companion outputs are:
 

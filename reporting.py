@@ -67,7 +67,7 @@ TRACE_OUTPUT_RENAMES = {
 WINDOW_LOAD_PRICE_CACHE_COLUMNS = [
     "zone_id",
     "category",
-    "forecast_model",
+    "backend",
     "agent_mode",
     "source",
     "window_start",
@@ -119,7 +119,7 @@ WINDOW_LOAD_PRICE_CACHE_COLUMNS = [
 
 AGENT_ATTEMPT_USAGE_COLUMNS = [
     "record_scope",
-    "forecast_model",
+    "backend",
     "agent_mode",
     "zone_id",
     "category",
@@ -140,7 +140,7 @@ AGENT_ATTEMPT_USAGE_COLUMNS = [
 ]
 
 AGENT_STEP_TOKEN_USAGE_COLUMNS = [
-    "forecast_model",
+    "backend",
     "agent_mode",
     "zone_id",
     "category",
@@ -167,7 +167,7 @@ def write_outputs(
     contexts: list[dict[str, Any]],
     reports: list[dict[str, Any]],
     forecast_results: dict[str, Any],
-    forecast_model: str | None = None,
+    backend: str | None = None,
     agent_mode: str | None = None,
 ) -> dict[str, Path]:
     outputs = write_forecaster_outputs(
@@ -180,7 +180,7 @@ def write_outputs(
         write_agent_outputs(
             output_dir=output_dir,
             reports=reports,
-            forecast_model=forecast_model,
+            backend=backend,
             agent_mode=agent_mode,
         )
     )
@@ -257,7 +257,7 @@ def write_agent_outputs(
     *,
     output_dir: Path,
     reports: list[dict[str, Any]],
-    forecast_model: str | None = None,
+    backend: str | None = None,
     agent_mode: str | None = None,
     manifest: dict[str, Any] | None = None,
 ) -> dict[str, Path]:
@@ -295,7 +295,7 @@ def write_agent_outputs(
     write_window_load_price_cache(
         window_load_price_cache_csv,
         trace_reports,
-        forecast_model=forecast_model,
+        backend=backend,
         agent_mode=agent_mode,
     )
     write_explainability_review_outputs(
@@ -311,7 +311,7 @@ def write_agent_outputs(
         agent_step_token_usage_csv,
         experiment_aggregate_csv,
         trace_reports,
-        forecast_model=forecast_model,
+        backend=backend,
         agent_mode=agent_mode,
         manifest=manifest,
         control_agent_usage=control_agent_usage,
@@ -359,7 +359,7 @@ def write_control_outputs(
     experiment_summary_csv: Path,
     reports: list[dict[str, Any]],
     *,
-    forecast_model: str | None,
+    backend: str | None,
     agent_mode: str | None,
     manifest: dict[str, Any] | None,
     control_agent_usage: dict[str, Any] | None = None,
@@ -468,7 +468,7 @@ def write_control_outputs(
         for window in final_windows:
             final_rows.append(
                 {
-                    "forecast_model": forecast_model,
+                    "backend": backend,
                     "agent_mode": agent_mode,
                     "zone_id": zone_id,
                     "category": report.get("category"),
@@ -490,7 +490,7 @@ def write_control_outputs(
             for step_index, call in enumerate(attempt_calls, start=1):
                 step_token_rows.append(
                     agent_step_token_usage_row(
-                        forecast_model=forecast_model,
+                        backend=backend,
                         agent_mode=agent_mode,
                         zone_id=zone_id,
                         category=report.get("category"),
@@ -509,7 +509,7 @@ def write_control_outputs(
             zone_usage_rows.append(
                 agent_attempt_usage_row(
                     record_scope="zone",
-                    forecast_model=forecast_model,
+                    backend=backend,
                     agent_mode=agent_mode,
                     zone_id=zone_id,
                     category=report.get("category"),
@@ -523,7 +523,7 @@ def write_control_outputs(
                     continue
                 attempt_rows.append(
                     {
-                        "forecast_model": forecast_model,
+                        "backend": backend,
                         "agent_mode": agent_mode,
                         "zone_id": zone_id,
                         "category": report.get("category"),
@@ -548,7 +548,7 @@ def write_control_outputs(
     global_usage_rows = [
         agent_attempt_usage_row(
             record_scope="global",
-            forecast_model=forecast_model,
+            backend=backend,
             agent_mode=agent_mode,
             zone_id=None,
             category=None,
@@ -560,11 +560,11 @@ def write_control_outputs(
     ]
     global_status = "success" if zones and all(z["status"] == "success" for z in zones) else "fail"
     payload = {
-        "schema_version": 3,
+        "schema_version": 4,
         "result_type": "forecaster_agent_control",
         "status": global_status,
         "forecast_origin": metadata.get("forecast_origin"),
-        "forecast_model": forecast_model,
+        "backend": backend,
         "agent_mode": agent_mode,
         "dataset_fingerprint": metadata.get("dataset_fingerprint"),
         "cache_keys": metadata.get("cache_keys") or {},
@@ -592,7 +592,7 @@ def write_control_outputs(
     pd.DataFrame(
         [
             {
-                "forecast_model": forecast_model,
+                "backend": backend,
                 "agent_mode": agent_mode,
                 "status": global_status,
                 "zone_count": len(zones),
@@ -773,7 +773,7 @@ def derive_global_agent_round_usage(
 def agent_attempt_usage_row(
     *,
     record_scope: str,
-    forecast_model: str | None,
+    backend: str | None,
     agent_mode: str | None,
     zone_id: Any,
     category: Any,
@@ -785,7 +785,7 @@ def agent_attempt_usage_row(
     names = list(dict.fromkeys(str(call.get("agent")) for call in calls if call.get("agent")))
     return {
         "record_scope": record_scope,
-        "forecast_model": forecast_model,
+        "backend": backend,
         "agent_mode": agent_mode,
         "zone_id": zone_id,
         "category": category,
@@ -815,7 +815,7 @@ def agent_attempt_usage_row(
 
 def agent_step_token_usage_row(
     *,
-    forecast_model: str | None,
+    backend: str | None,
     agent_mode: str | None,
     zone_id: Any,
     category: Any,
@@ -828,7 +828,7 @@ def agent_step_token_usage_row(
     stage = str(call.get("stage") or "")
     match = re.search(r"(?:^|\.)round_(\d+)(?:\.|$)", stage)
     return {
-        "forecast_model": forecast_model,
+        "backend": backend,
         "agent_mode": agent_mode,
         "zone_id": zone_id,
         "category": category,
@@ -958,12 +958,13 @@ def write_forecast_outputs(
             {
                 "zone_id": zone_id,
                 "category": result.summary.get("category"),
-                "forecast_model": result.summary.get("forecast_model"),
+                "backend": result.summary.get("backend"),
                 "diurnal_blend_alpha": result.summary.get("diurnal_blend_alpha"),
                 "calibration_enabled": (result.summary.get("calibration") or {}).get("enabled"),
+                "calibration_method": (result.summary.get("calibration") or {}).get("method"),
                 "bias_mean": (result.summary.get("calibration") or {}).get("bias_mean"),
                 "bias_max_abs": (result.summary.get("calibration") or {}).get("bias_max_abs"),
-                "forecast_start": result.summary.get("forecast_start"),
+                "forecast_origin": result.summary.get("forecast_origin"),
                 "forecast_end": result.summary.get("forecast_end"),
                 "n": metrics.get("n"),
                 "MAE": metrics.get("MAE"),
@@ -1124,7 +1125,7 @@ def write_window_load_price_cache(
     cache_csv: Path,
     reports: list[dict[str, Any]],
     *,
-    forecast_model: str | None = None,
+    backend: str | None = None,
     agent_mode: str | None = None,
 ) -> None:
     rows: list[dict[str, Any]] = []
@@ -1142,7 +1143,7 @@ def write_window_load_price_cache(
                 {
                     "zone_id": report.get("zone_id"),
                     "category": report.get("category"),
-                    "forecast_model": forecast_model,
+                    "backend": backend,
                     "agent_mode": agent_mode,
                     "source": report.get("source"),
                     "window_start": window.get("window_start"),

@@ -20,7 +20,6 @@ XGBOOST_PARAMETER_DEFAULTS = {
     "xgboost_colsample_bytree": 0.9,
     "xgboost_tree_method": "approx",
     "xgboost_n_jobs": 1,
-    "xgboost_diurnal_blend_alpha": 0.0,
     "xgboost_seed": 42,
 }
 
@@ -28,30 +27,49 @@ BACKEND_PARAMETER_NAMES = (
     *XGBOOST_PARAMETER_DEFAULTS,
     "timesfm_repo",
     "timesfm_context_hours",
-    "timesfm_step_horizon",
     "timesfm_exog_cols",
-    "timesfm_diurnal_blend_alpha",
-    "timesfm_roll_actuals",
-    "ar_diurnal_blend_alpha",
     "chronos_repo",
     "chronos_context_hours",
-    "chronos_step_horizon",
-    "chronos_diurnal_blend_alpha",
     "chronos_device",
-    "chronos_roll_actuals",
     "lstm_context_hours",
-    "lstm_step_horizon",
     "lstm_exog_cols",
     "lstm_hidden_size",
     "lstm_num_layers",
     "lstm_epochs",
     "lstm_learning_rate",
     "lstm_batch_size",
-    "lstm_diurnal_blend_alpha",
     "lstm_device",
-    "lstm_roll_actuals",
     "lstm_seed",
 )
+
+FORECAST_BACKENDS = ("timesfm", "chronos", "lstm", "xgboost", "AR")
+BACKEND_BLEND_PARAMETER_NAMES = tuple(f"{backend.lower()}_diurnal_blend_alphas" for backend in FORECAST_BACKENDS)
+CALIBRATION_METHOD = "daily_hour_mean_v1"
+
+
+def reject_retired_forecast_settings(settings: dict[str, Any]) -> None:
+    replacements = {
+        "forecast_start": "forecast_starts",
+        "forecast_model": "forecast_models",
+        "diurnal_blend_alpha": "diurnal_blend_alphas",
+        **{f"{backend.lower()}_diurnal_blend_alpha": f"{backend.lower()}_diurnal_blend_alphas"
+           for backend in FORECAST_BACKENDS},
+    }
+    retired = [key for key in settings if key in replacements
+               or key in {"roll_actuals", "step_horizon"}
+               or key.endswith(("_roll_actuals", "_step_horizon"))]
+    if retired:
+        details = [f"run.{key} was removed" + (f"; use run.{replacements[key]}" if key in replacements
+                   else "; forecasts now use fixed daily blocks and never roll forecast-period actuals") for key in retired]
+        raise ValueError("Deprecated forecast configuration: " + ". ".join(details))
+
+
+def resolve_backend_blend_alphas(backend: str, global_values: Any, overrides: dict[str, Any]) -> list[float]:
+    name = f"{normalize_forecast_model_name(backend).lower()}_diurnal_blend_alphas"
+    local = normalize_float_list(overrides.get(name))
+    global_alphas = normalize_float_list(global_values)
+    return local if local is not None else global_alphas if global_alphas is not None else [0.0]
+
 
 PIPELINE_STAGES = {"full", "forecaster", "agent"}
 AGENT_BACKENDS = {"auto", "openrouter", "openai_compatible", "vllm", "sglang"}
@@ -153,48 +171,40 @@ class RunConfig:
     agent_output_dir: str | None = None
     precomputed_window_data: str | None = None
     max_poi_rows: int | None = None
-    forecast_start: str | None = None
-    horizon_days: int = 4
-    history_days: int = 7
-    validation_days: int = 1
+    horizon_days: int = 1
+    history_days: int = 30
+    validation_days: int = 5
     zone_ids: list[str] | None = None
     experiment_zone_count: int = 12
     experiment_zone_counts: dict[str, int] = field(default_factory=dict)
     experiment_zone_selection: str = "representative"
     experiment_zone_seed: int = 42
-    forecast_model: str = "timesfm"
     forecast_starts: list[str] | None = None
     forecast_start_count: int = 1
     forecast_models: list[str] | None = None
     experiment_seeds: list[int] | None = None
     agent_mode: str = "multi_agent_economist_retry"
     agent_modes: list[str] | None = None
-    diurnal_blend_alpha: float | None = None
     diurnal_blend_alphas: list[float] | None = None
+    timesfm_diurnal_blend_alphas: list[float] | None = None
+    chronos_diurnal_blend_alphas: list[float] | None = None
+    lstm_diurnal_blend_alphas: list[float] | None = None
+    xgboost_diurnal_blend_alphas: list[float] | None = None
+    ar_diurnal_blend_alphas: list[float] | None = None
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch"
     timesfm_context_hours: int = 168
-    timesfm_step_horizon: int = 24
     timesfm_exog_cols: list[str] | None = None
-    timesfm_diurnal_blend_alpha: float = 1.0
-    timesfm_roll_actuals: bool = False
-    ar_diurnal_blend_alpha: float = 0.0
     chronos_repo: str = "amazon/chronos-2"
     chronos_context_hours: int = 512
-    chronos_step_horizon: int = 24
-    chronos_diurnal_blend_alpha: float = 0.0
     chronos_device: str = "auto"
-    chronos_roll_actuals: bool = False
     lstm_context_hours: int = 24
-    lstm_step_horizon: int = 24
     lstm_exog_cols: list[str] | None = None
     lstm_hidden_size: int = 64
     lstm_num_layers: int = 1
     lstm_epochs: int = 50
     lstm_learning_rate: float = 0.001
     lstm_batch_size: int = 32
-    lstm_diurnal_blend_alpha: float = 0.0
     lstm_device: str = "auto"
-    lstm_roll_actuals: bool = False
     lstm_seed: int = 42
     xgboost_lags: list[int] | None = None
     xgboost_exog_cols: list[str] | None = None
@@ -204,7 +214,6 @@ class RunConfig:
     xgboost_colsample_bytree: float = 0.9
     xgboost_tree_method: str = "approx"
     xgboost_n_jobs: int = 1
-    xgboost_diurnal_blend_alpha: float = 0.0
     xgboost_seed: int = 42
     temperature: float = 0.2
 
@@ -220,13 +229,13 @@ class RunConfig:
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> "RunConfig":
         settings = raw or {}
+        reject_retired_forecast_settings(settings)
         zone_ids = settings.get("zone_ids", settings.get("zones"))
         forecast_starts = normalize_string_list(settings.get("forecast_starts"))
         forecast_models = normalize_forecast_model_list(settings.get("forecast_models"))
         experiment_seeds = normalize_int_list(settings.get("experiment_seeds"))
         agent_modes = normalize_agent_mode_list(settings.get("agent_modes"))
         diurnal_blend_alphas = normalize_float_list(settings.get("diurnal_blend_alphas"))
-        diurnal_blend_alpha = optional_float(settings.get("diurnal_blend_alpha"))
         defaults = cls()
         numeric_settings = {}
         for convert, names in (
@@ -237,11 +246,8 @@ class RunConfig:
                 "experiment_zone_count",
                 "experiment_zone_seed",
                 "timesfm_context_hours",
-                "timesfm_step_horizon",
                 "chronos_context_hours",
-                "chronos_step_horizon",
                 "lstm_context_hours",
-                "lstm_step_horizon",
                 "lstm_hidden_size",
                 "lstm_num_layers",
                 "lstm_epochs",
@@ -253,14 +259,9 @@ class RunConfig:
                 "xgboost_seed",
             )),
             (optional_float, (
-                "timesfm_diurnal_blend_alpha",
-                "ar_diurnal_blend_alpha",
-                "chronos_diurnal_blend_alpha",
                 "lstm_learning_rate",
-                "lstm_diurnal_blend_alpha",
                 "xgboost_learning_rate",
                 "xgboost_colsample_bytree",
-                "xgboost_diurnal_blend_alpha",
                 "temperature",
             )),
         ):
@@ -289,28 +290,23 @@ class RunConfig:
             agent_output_dir=optional_str(settings.get("agent_output_dir")),
             precomputed_window_data=optional_str(settings.get("precomputed_window_data")),
             max_poi_rows=optional_int(settings.get("max_poi_rows")),
-            forecast_start=optional_str(settings.get("forecast_start")),
             zone_ids=normalize_zone_id_list(zone_ids),
             experiment_zone_selection=normalize_zone_selection(settings.get("experiment_zone_selection")),
-            forecast_model=normalize_forecast_model_name(optional_str(settings.get("forecast_model"))),
             forecast_starts=forecast_starts,
             forecast_start_count=positive_integer(settings.get("forecast_start_count", 1), "run.forecast_start_count"),
             forecast_models=forecast_models,
             experiment_seeds=experiment_seeds,
             agent_mode=normalize_agent_mode(optional_str(settings.get("agent_mode"))),
             agent_modes=agent_modes,
-            diurnal_blend_alpha=diurnal_blend_alpha,
             diurnal_blend_alphas=diurnal_blend_alphas,
+            **{name: normalize_float_list(settings.get(name)) for name in BACKEND_BLEND_PARAMETER_NAMES},
             timesfm_repo=optional_str(settings.get("timesfm_repo"))
             or "google/timesfm-2.5-200m-pytorch",
             timesfm_exog_cols=normalize_zone_id_list(settings.get("timesfm_exog_cols")),
-            timesfm_roll_actuals=False,
             chronos_repo=optional_str(settings.get("chronos_repo")) or "amazon/chronos-2",
             chronos_device="auto",
-            chronos_roll_actuals=False,
             lstm_exog_cols=normalize_zone_id_list(settings.get("lstm_exog_cols")),
             lstm_device="auto",
-            lstm_roll_actuals=False,
             xgboost_lags=normalize_int_list(settings.get("xgboost_lags")),
             xgboost_exog_cols=normalize_zone_id_list(settings.get("xgboost_exog_cols")),
             xgboost_tree_method=optional_str(settings.get("xgboost_tree_method")) or "approx",
@@ -731,13 +727,23 @@ def normalize_int_list(value: Any) -> list[int] | None:
 
 
 def normalize_float_list(value: Any) -> list[float] | None:
+    """Normalize an alpha candidate list; null inherits, an empty list is invalid."""
+    if value is None:
+        return None
+    if isinstance(value, tuple):
+        value = list(value)
+    if isinstance(value, bool) or (isinstance(value, list) and any(isinstance(item, bool) for item in value)):
+        raise ValueError("Diurnal blend alpha must be a finite number between 0 and 1")
     def convert(item: str) -> float:
         number = float(item)
-        if number < 0.0 or number > 1.0:
-            raise ValueError(f"Diurnal blend alpha must be between 0 and 1: {item}")
+        if not math.isfinite(number) or number < 0.0 or number > 1.0:
+            raise ValueError(f"Diurnal blend alpha must be a finite number between 0 and 1: {item}")
         return round(number, 6)
 
-    return normalize_typed_list(value, convert)
+    values = normalize_typed_list(value, convert)
+    if not values:
+        raise ValueError("Diurnal blend alpha lists cannot be empty; use null to inherit")
+    return values
 
 
 def normalize_agent_mode_list(value: Any) -> list[str] | None:

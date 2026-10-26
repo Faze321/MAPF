@@ -12,7 +12,7 @@ import pandas as pd
 
 
 SCHEMA_VERSION = 1
-NATIVE_ARTIFACT_SCHEMA_VERSION = 2
+NATIVE_ARTIFACT_SCHEMA_VERSION = 3
 SUPPORTED_BACKENDS = {"timesfm", "chronos", "chronos_2", "lstm", "xgboost", "ar", "AR"}
 CORE_COLUMNS = {"timestamp", "time", "zone", "zone_id", "load", "actual_kwh", "energy_price", "e_price"}
 
@@ -222,7 +222,7 @@ class NativeForecasterArtifact:
 
     zone: str
     backend: str
-    forecast_start: str
+    forecast_origin: str
     horizon_hours: int
     history: tuple[dict[str, Any], ...]
     validation: tuple[dict[str, Any], ...]
@@ -231,7 +231,7 @@ class NativeForecasterArtifact:
     fitted_state: dict[str, Any]
 
     def __post_init__(self) -> None:
-        forecast_origin = pd.Timestamp(self.forecast_start)
+        forecast_origin = pd.Timestamp(self.forecast_origin)
         if self.horizon_hours <= 0:
             raise ValueError("Reusable forecaster horizon must be positive.")
         if any("actual_kwh" in row or "load" in row for row in self.known_future):
@@ -266,7 +266,7 @@ class NativeForecasterArtifact:
         return cls(
             zone=str(reusable["zone"]),
             backend=str(reusable["backend"]),
-            forecast_start=pd.Timestamp(reusable["forecast_start"]).isoformat(),
+            forecast_origin=pd.Timestamp(reusable["forecast_origin"]).isoformat(),
             horizon_hours=int(reusable["horizon_hours"]),
             history=dataframe_records(reusable["history"]),
             validation=dataframe_records(reusable["validation"]),
@@ -313,51 +313,10 @@ class NativeForecasterArtifact:
             history,
             validation,
             known_future,
-            pd.Timestamp(self.forecast_start),
+            pd.Timestamp(self.forecast_origin),
             self.horizon_hours,
-            model_name=self.backend,
-            timesfm_repo=str(parameters["timesfm_repo"]),
-            timesfm_context_hours=int(parameters["timesfm_context_hours"]),
-            timesfm_step_horizon=int(parameters["timesfm_step_horizon"]),
-            timesfm_exog_cols=list(parameters["timesfm_exog_cols"]),
-            timesfm_diurnal_blend_alpha=float(
-                parameters["timesfm_diurnal_blend_alpha"]
-            ),
-            timesfm_roll_actuals=False,
-            ar_diurnal_blend_alpha=float(parameters["ar_diurnal_blend_alpha"]),
-            chronos_repo=str(parameters["chronos_repo"]),
-            chronos_context_hours=int(parameters["chronos_context_hours"]),
-            chronos_step_horizon=int(parameters["chronos_step_horizon"]),
-            chronos_exog_cols=list(parameters["chronos_exog_cols"]),
-            chronos_diurnal_blend_alpha=float(
-                parameters["chronos_diurnal_blend_alpha"]
-            ),
-            chronos_device=str(parameters["chronos_device"]),
-            chronos_roll_actuals=False,
-            lstm_context_hours=int(parameters["lstm_context_hours"]),
-            lstm_step_horizon=int(parameters["lstm_step_horizon"]),
-            lstm_exog_cols=list(parameters["lstm_exog_cols"]),
-            lstm_hidden_size=int(parameters["lstm_hidden_size"]),
-            lstm_num_layers=int(parameters["lstm_num_layers"]),
-            lstm_epochs=int(parameters["lstm_epochs"]),
-            lstm_learning_rate=float(parameters["lstm_learning_rate"]),
-            lstm_batch_size=int(parameters["lstm_batch_size"]),
-            lstm_diurnal_blend_alpha=float(
-                parameters["lstm_diurnal_blend_alpha"]
-            ),
-            lstm_device=str(parameters["lstm_device"]),
-            lstm_roll_actuals=False,
-            lstm_seed=int(parameters["lstm_seed"]),
-            xgboost_lags=parameters.get("xgboost_lags", None),
-            xgboost_exog_cols=parameters.get("xgboost_exog_cols", None),
-            xgboost_n_estimators=parameters.get("xgboost_n_estimators", 300),
-            xgboost_max_depth=parameters.get("xgboost_max_depth", 9),
-            xgboost_learning_rate=parameters.get("xgboost_learning_rate", 0.1),
-            xgboost_colsample_bytree=parameters.get("xgboost_colsample_bytree", 0.9),
-            xgboost_tree_method=parameters.get("xgboost_tree_method", "approx"),
-            xgboost_n_jobs=parameters.get("xgboost_n_jobs", 1),
-            xgboost_diurnal_blend_alpha=parameters.get("xgboost_diurnal_blend_alpha", 0.0),
-            xgboost_seed=parameters.get("xgboost_seed", 42),
+            backend=self.backend,
+            **{key: value for key, value in parameters.items() if key != "calibration_method"},
             fitted_state=self.fitted_state,
         )
         output = hourly[["time", "predicted_kwh"]].copy()
@@ -386,7 +345,7 @@ class NativeForecasterArtifact:
             "artifact_type": "native_backend_reforecast",
             "backend": self.backend,
             "zone": self.zone,
-            "forecast_origin": self.forecast_start,
+            "forecast_origin": self.forecast_origin,
             "inference_mode": "original_backend_reforecast",
             "price_schedule_scope": "complete_control_scenario",
             "artifact_reused": True,
@@ -419,7 +378,7 @@ class NativeForecasterArtifact:
         return cls(
             zone=str(payload["zone"]),
             backend=str(payload["backend"]),
-            forecast_start=pd.Timestamp(payload["forecast_origin"]).isoformat(),
+            forecast_origin=pd.Timestamp(payload["forecast_origin"]).isoformat(),
             horizon_hours=int(payload["horizon_hours"]),
             history=tuple(dict(row) for row in payload["history"]),
             validation=tuple(dict(row) for row in payload["validation"]),

@@ -18,7 +18,67 @@ THRESHOLD_FIELDS = (
 
 
 def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+    return normalize_evaluation_fields(json.loads(path.read_text(encoding="utf-8-sig")))
+
+
+def normalize_evaluation_fields(value: Any) -> Any:
+    """Normalize historical result names at the offline analysis boundary only."""
+    if isinstance(value, dict):
+        result = {key: normalize_evaluation_fields(item) for key, item in value.items()}
+        for old, new in (("forecast_start", "forecast_origin"), ("forecast_model", "backend")):
+            if old in result:
+                if new in result and result[new] != result[old]:
+                    raise ValueError(f"Conflicting historical result fields: {old} and {new}")
+                result[new] = result.pop(old)
+        return result
+    if isinstance(value, list):
+        return [normalize_evaluation_fields(item) for item in value]
+    return value
+
+
+def normalize_evaluation_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    """Read old CSVs without writing legacy column names into new analysis output."""
+    result = frame.copy()
+    for old, new in (("forecast_start", "forecast_origin"), ("forecast_model", "backend")):
+        if old in result:
+            if new in result:
+                if not result[old].equals(result[new]):
+                    raise ValueError(f"Conflicting historical result columns: {old} and {new}")
+                result = result.drop(columns=old)
+            else:
+                result = result.rename(columns={old: new})
+    return result
+
+
+def canonical_forecast_parameters(raw: dict[str, Any]) -> dict[str, Any]:
+    """Keep only resolved inference provenance, independent of candidate grids."""
+    parameters = normalize_evaluation_fields(raw)
+    if not parameters:
+        return {}
+    backend = str(parameters.get("backend") or "").strip().lower().replace("-", "_")
+    backend = {"xgb": "xgboost", "xg_boost": "xgboost", "chronos_2": "chronos"}.get(backend, backend)
+    if backend:
+        parameters["backend"] = "AR" if backend == "ar" else backend
+    if "forecast_origin" in parameters:
+        parameters["forecast_origin"] = timestamp(parameters["forecast_origin"])
+    active_alpha = f"{backend}_diurnal_blend_alpha"
+    if parameters.get(active_alpha) is not None:
+        parameters["diurnal_blend_alpha"] = parameters[active_alpha]
+    if parameters.get("diurnal_blend_alpha") is not None:
+        parameters["diurnal_blend_alpha"] = round(float(parameters["diurnal_blend_alpha"]), 6)
+    prefixes = ("timesfm_", "chronos_", "lstm_", "xgboost_", "ar_")
+    for key in list(parameters):
+        if key in ("forecast_starts", "forecast_start_count", "forecast_models", "diurnal_blend_alphas") or key.endswith("_diurnal_blend_alphas"):
+            parameters.pop(key)
+        elif backend and key.startswith(prefixes) and not key.startswith(f"{backend}_"):
+            parameters.pop(key)
+        elif key == active_alpha:
+            parameters.pop(key)
+        elif key.endswith("_roll_actuals") and parameters[key] is False:
+            parameters.pop(key)
+    # Old artifacts cannot establish the new multi-day calibration protocol.
+    parameters.setdefault("calibration_method", "legacy_unknown")
+    return parameters
 
 
 def clean_json(value: Any) -> Any:
@@ -80,22 +140,24 @@ def load_forecast_context(directory: Path) -> dict:
     manifest = read_json(manifest_path) if manifest_path.exists() else {}
     detail_dir = directory / "evaluation" / "forecast_details"
     paths = sorted(detail_dir.glob("zone_*_forecast_vs_actual.csv"))
-    frames = [pd.read_csv(p, dtype={"zone_id": str}) for p in paths]
+    frames = [normalize_evaluation_columns(pd.read_csv(p, dtype={"zone_id": str})) for p in paths]
     frame = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if "time" in frame:
         frame["time"] = frame["time"].map(timestamp)
     metrics_path = directory / "evaluation" / "forecast_metrics.csv"
-    metrics = pd.read_csv(metrics_path) if metrics_path.exists() else pd.DataFrame()
-    parameters = dict(manifest.get("forecast_parameters") or {})
-    if "forecast_start" in parameters:
-        parameters["forecast_start"] = timestamp(parameters["forecast_start"])
+    metrics = normalize_evaluation_columns(pd.read_csv(metrics_path)) if metrics_path.exists() else pd.DataFrame()
+    raw_parameters = dict(manifest.get("forecast_parameters") or {})
     metadata = dataset_metadata(manifest)
-    for key in ("forecast_model", "diurnal_blend_alpha"):
+    for key in ("backend", "diurnal_blend_alpha", "calibration_method", "forecast_origin"):
         unique = metrics[key].dropna().unique() if key in metrics else []
         if len(unique) > 1:
             raise ValueError(f"Mixed {key} in {metrics_path}")
-        metadata[key] = str(unique[0]) if len(unique) else str(parameters.get(key, "unknown"))
-    metadata["forecast_origin"] = timestamp(parameters.get("forecast_start"))
+        if len(unique) and raw_parameters.get(key) is None:
+            raw_parameters[key] = unique[0]
+    parameters = canonical_forecast_parameters(raw_parameters)
+    for key in ("backend", "diurnal_blend_alpha"):
+        metadata[key] = str(parameters.get(key, "unknown"))
+    metadata["forecast_origin"] = timestamp(parameters.get("forecast_origin"))
     snippets_path = directory / "context_snippets.json"
     snippets = read_json(snippets_path) if snippets_path.exists() else []
     if not isinstance(snippets, list):

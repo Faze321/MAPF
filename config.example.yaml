@@ -52,13 +52,11 @@ run:
   agent_output_dir: null # optional override; normally written beside forecaster/
   precomputed_window_data: null # path to a previous window_load_price_cache.csv
   max_poi_rows: null
-  forecast_start: null # null: automatic dates controlled by forecast_start_count
   forecast_starts: null # explicit dates override automatic selection
   forecast_start_count: 1 # 1: latest window; 2+: evenly spaced valid origins per dataset
-  horizon_days: 2
-  history_days: 7
-  validation_days: 1
-  forecast_model: "timesfm" # options: "timesfm", "chronos", "lstm", "xgboost", "AR"
+  horizon_days: 1 # forecast length; multi-day forecasts reuse the 24-hour bias pattern
+  history_days: 30 # training history; model context is configured independently
+  validation_days: 5 # average daily validation errors for each forecast hour
   forecast_models:
     - "timesfm"
     - "chronos"
@@ -77,6 +75,13 @@ run:
     - 0.8
     - 0.9
     - 1.0
+  # A non-null model-specific list overrides the global list above.
+  # Null inherits; if the global list is also null, the effective list is [0.0].
+  timesfm_diurnal_blend_alphas: null # example: [0.0, 0.5]
+  chronos_diurnal_blend_alphas: null
+  lstm_diurnal_blend_alphas: null
+  xgboost_diurnal_blend_alphas: null
+  ar_diurnal_blend_alphas: null
   agent_modes:
     - "multi_agent_economist_retry"
     # - "multi_agent_full_retry"
@@ -86,7 +91,6 @@ run:
 # TimesFM
   timesfm_repo: "google/timesfm-2.5-200m-pytorch"
   timesfm_context_hours: 168
-  timesfm_step_horizon: 24
   timesfm_exog_cols:
     - "T"
     - "U"
@@ -95,17 +99,13 @@ run:
     - "s_price"
     - "is_weekend"
     - "temp_price_idx"
-  timesfm_roll_actuals: false # compatibility setting: the config loader always forces false
 
 # Chronos
   chronos_repo: "amazon/chronos-2"
   chronos_context_hours: 168
-  chronos_step_horizon: 24
-  chronos_roll_actuals: false # strict fixed-origin; always false in the config loader
 
 # LSTM
   lstm_context_hours: 48
-  lstm_step_horizon: 24
   lstm_exog_cols:
     - "T"
     - "U"
@@ -119,7 +119,6 @@ run:
   lstm_epochs: 50
   lstm_learning_rate: 0.001
   lstm_batch_size: 32
-  lstm_roll_actuals: false # strict fixed-origin; always false in the config loader
   lstm_seed: 42
 
 # XGBoost: recursive hourly predictions; no forecast-period actual load is used.
@@ -131,7 +130,6 @@ run:
   xgboost_colsample_bytree: 0.9
   xgboost_tree_method: approx # approx, hist, or exact; runs on CPU
   xgboost_n_jobs: 1 # threads per model; datasets may already run in parallel
-  xgboost_diurnal_blend_alpha: 0.0 # uniform blend/sweep settings take precedence
   xgboost_seed: 42
   zones: null # automatically select sites from the current dataset
   experiment_zone_count: 12

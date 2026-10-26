@@ -737,7 +737,7 @@ async def run_single_agent_zone_chain(
     debug = {
         "zone_id": context.get("zone_id"),
         "category": context.get("category"),
-        "forecast_start": context.get("forecast_start"),
+        "forecast_origin": context.get("forecast_origin"),
         "forecast_end": context.get("forecast_end"),
         "expected_price_window_count": len(context.get("pricing_windows_3h", []))
         if isinstance(context.get("pricing_windows_3h"), list)
@@ -955,7 +955,7 @@ async def complete_validated_economist_report(
     debug: dict[str, Any] = {
         "zone_id": context.get("zone_id"),
         "category": context.get("category"),
-        "forecast_start": context.get("forecast_start"),
+        "forecast_origin": context.get("forecast_origin"),
         "forecast_end": context.get("forecast_end"),
         "expected_price_window_count": len(expected_windows) if isinstance(expected_windows, list) else 0,
         "initial_response": report,
@@ -1199,7 +1199,7 @@ def heuristic_behavior(context: dict[str, Any]) -> dict[str, Any]:
     shape = context["hourly_shape"]
     windows = context.get("pricing_windows_3h") or []
     horizon_days = context.get("forecast_horizon_days", "configured")
-    forecast_start = str(context.get("forecast_start") or "the forecast start")
+    forecast_origin = str(context.get("forecast_origin") or "the forecast start")
     forecast_end = str(context.get("forecast_end") or "the forecast end")
     change = as_float(context.get("predicted_change_pct"), 0)
     drivers = []
@@ -1232,7 +1232,7 @@ def heuristic_behavior(context: dict[str, Any]) -> dict[str, Any]:
     poi_total = profile.get("poi_total", 0)
     return {
         "agent_reasoning": (
-            f"For the {horizon_days}-day window from {forecast_start} to {forecast_end}, "
+            f"For the {horizon_days}-day window from {forecast_origin} to {forecast_end}, "
             f"{category} demand is best explained by {', '.join(drivers)} and the "
             f"local POI mix of {poi_total} assigned POIs."
         ),

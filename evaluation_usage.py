@@ -16,7 +16,7 @@ from usage import CACHE_USAGE_FIELDS, cache_usage_fields, summarize_cache_usage
 
 
 TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
-_CONTEXT = ("batch", "dataset", "forecast_model", "agent_mode")
+_CONTEXT = ("batch", "dataset", "backend", "agent_mode")
 
 
 def _integer(value: Any) -> int | None:

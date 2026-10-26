@@ -205,8 +205,8 @@ def extract_window_rounds(control_result: dict[str, Any], *, baseline_hourly: An
     coverage supplies the additional hourly-price baseline; no interpolation or
     replacement of the original window-mean baseline is performed.
     """
-    if control_result.get("schema_version") not in (2, 3):
-        raise ValueError("Expected control_results.json schema version 2 or 3")
+    if control_result.get("schema_version") not in (2, 3, 4):
+        raise ValueError("Expected control_results.json schema version 2, 3 or 4")
     hourly_index, invalid_hourly_zones = _index_baseline_hourly(baseline_hourly)
     zones = control_result.get("zones") or []
     prepared = []
@@ -439,16 +439,16 @@ def build_window_tables(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, 
     control_groups = {
         "round_overall": (),
         "round_by_dataset": ("dataset", "dataset_identity"),
-        "round_by_dataset_model": ("dataset", "dataset_identity", "forecast_model"),
+        "round_by_dataset_model": ("dataset", "dataset_identity", "backend"),
         "round_by_mode": ("agent_mode",),
-        "round_by_origin_model_mode": ("dataset", "dataset_identity", "forecast_origin", "forecast_model", "agent_mode"),
-        "round_by_zone": ("dataset", "dataset_identity", "forecast_model", "agent_mode", "forecast_origin", "zone_id"),
+        "round_by_origin_model_mode": ("dataset", "dataset_identity", "forecast_origin", "backend", "agent_mode"),
+        "round_by_zone": ("dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "zone_id"),
     }
     revenue_groups = {
         "revenue_by_dataset": ("dataset", "dataset_identity", "revenue_unit"),
-        "revenue_by_dataset_model_mode": ("dataset", "dataset_identity", "forecast_model", "agent_mode", "revenue_unit"),
-        "revenue_by_origin_model_mode": ("dataset", "dataset_identity", "forecast_model", "agent_mode", "forecast_origin", "revenue_unit"),
-        "revenue_by_zone": ("dataset", "dataset_identity", "forecast_model", "agent_mode", "forecast_origin", "zone_id", "revenue_unit"),
+        "revenue_by_dataset_model_mode": ("dataset", "dataset_identity", "backend", "agent_mode", "revenue_unit"),
+        "revenue_by_origin_model_mode": ("dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "revenue_unit"),
+        "revenue_by_zone": ("dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "zone_id", "revenue_unit"),
     }
     tables = {}
     for table_name, dimensions in {**control_groups, **revenue_groups}.items():

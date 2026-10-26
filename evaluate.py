@@ -19,7 +19,7 @@ import pandas as pd
 from usage import cache_usage_fields, summarize_cache_usage
 from evaluation_artifacts import (
     clean_json, dataset_metadata, find_forecast_context, load_forecast_context,
-    pairing_metadata, read_json, timestamp,
+    normalize_evaluation_fields, pairing_metadata, read_json, timestamp,
 )
 from evaluation_windows import extract_window_rounds, summarize_windows, build_window_tables
 from evaluation_usage import extract_usage_details, summarize_usage, build_usage_tables
@@ -160,13 +160,14 @@ def evaluate_agent(
     control_result: dict[str, Any], *, analyzer: AgentAnalyzer | None = None,
     baseline_hourly: pd.DataFrame | Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Analyze a schema 2/3 result with optional original hourly baseline records.
+    """Analyze a schema 2/3/4 result with optional original hourly baseline records.
 
     ``baseline_hourly`` uses zone_id/time/e_price/predicted_kwh; absent hourly
     records leave the additional hourly revenue baseline unknown.
     """
-    if control_result.get("schema_version") not in (2, 3):
-        raise ValueError("Expected control_results.json schema version 2 or 3")
+    control_result = normalize_evaluation_fields(control_result)
+    if control_result.get("schema_version") not in (2, 3, 4):
+        raise ValueError("Expected control_results.json schema version 2, 3 or 4")
     zones = []
     seen_zones: set[str] = set()
     for zone in control_result["zones"]:
@@ -193,7 +194,7 @@ def evaluate_agent(
             ]),
         })
     analysis = {
-        "forecast_model": control_result.get("forecast_model"),
+        "backend": control_result.get("backend"),
         "agent_mode": control_result.get("agent_mode"),
         "forecast_origin": control_result.get("forecast_origin"),
         "first_success": _all_success([z["first_success"] for z in zones]),
@@ -374,7 +375,7 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
                 except (ValueError, KeyError, TypeError) as exc:
                     raise ValueError(f"Cannot evaluate {path}: {exc}") from exc
                 meta = {"batch": label, **dataset_metadata((context or {}).get("manifest", {}), raw),
-                        "forecast_model": raw.get("forecast_model"), "agent_mode": raw.get("agent_mode"),
+                        "backend": raw.get("backend"), "agent_mode": raw.get("agent_mode"),
                         "forecast_origin": timestamp(raw.get("forecast_origin")),
                         "run_id": f"{label}/{path.relative_to(root)}" if multiple else str(path.relative_to(root))}
                 analysis.update(meta)
@@ -407,9 +408,9 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
         keys = ["batch", "_forecast_identity", "zone_id", "time", "actual_kwh", "predicted_kwh"]
         unique = pooled.drop_duplicates(keys) if all(k in pooled for k in keys) else pooled
         dimensions = {
-            "forecast_by_dataset": ["batch", "dataset", "dataset_identity", "forecast_model", "diurnal_blend_alpha"],
-            "forecast_by_origin": ["batch", "dataset", "dataset_identity", "forecast_model", "diurnal_blend_alpha", "forecast_origin"],
-            "forecast_by_zone_origin": ["batch", "dataset", "dataset_identity", "forecast_model", "diurnal_blend_alpha", "forecast_origin", "zone_id"],
+            "forecast_by_dataset": ["batch", "dataset", "dataset_identity", "backend", "diurnal_blend_alpha"],
+            "forecast_by_origin": ["batch", "dataset", "dataset_identity", "backend", "diurnal_blend_alpha", "forecast_origin"],
+            "forecast_by_zone_origin": ["batch", "dataset", "dataset_identity", "backend", "diurnal_blend_alpha", "forecast_origin", "zone_id"],
         }
         for name, dimensions_ in dimensions.items():
             rows = []
@@ -418,7 +419,7 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
                 rows.append({**dict(zip(dimensions_, key)), **_forecast_summary(group)})
             tables[name] = rows
         tables["ppt_forecast"] = tables["forecast_by_dataset"]
-        dimensions_ = ["batch", "forecast_model", "diurnal_blend_alpha"]
+        dimensions_ = ["batch", "backend", "diurnal_blend_alpha"]
         for key, group in pooled.groupby(dimensions_, dropna=False, sort=True):
             dedup = group.drop_duplicates(keys) if all(k in group for k in keys) else group
             meta = dict(zip(dimensions_, key))
@@ -437,12 +438,12 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
     tables["paired_runs"] = comparison["pairs"]
     tables["paired_summary"] = comparison["paired_summary"]
     tables["control_inventory"] = [{key: run.get(key) for key in
-        ("batch", "dataset", "dataset_identity", "forecast_model", "agent_mode", "forecast_origin", "run_id",
+        ("batch", "dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "run_id",
          "source_file", "zone_ids", "pairing_ready", "label_source", "first_success", "final_success", "attempts_used")}
         for run in agent_runs]
-    group_keys = ("batch", "forecast_model", "agent_mode") if multiple else ("forecast_model", "agent_mode")
+    group_keys = ("batch", "backend", "agent_mode") if multiple else ("backend", "agent_mode")
     report = {
-        "schema_version": 1, "input_dir": str(next(iter(roots.values()))) if not multiple else None,
+        "schema_version": 2, "input_dir": str(next(iter(roots.values()))) if not multiple else None,
         "inputs": {label: str(path) for label, path in roots.items()}, "definitions": DEFINITIONS,
         "forecaster": {"runs": forecast_runs, "global_by_model": forecast_summary},
         "agent": {"runs": agent_runs, "overall": summarize_agents(agent_runs),
@@ -520,7 +521,7 @@ def render_evaluation_report(report: dict[str, Any]) -> str:
                 f"{len(comparison.get('common_run_ids', []))} 个运行；跨批成功配对 "
                 f"{len(comparison.get('pairs', []))} 对。业务控制失败的完整运行也参与分析。"]
     for title, name, columns in (
-        ("预测指标", "ppt_forecast", ["batch", "dataset", "forecast_model", "diurnal_blend_alpha", "n", "MAE", "RMSE", "RAE", "MAPE_pct", "WAPE_pct", "bias_pct"]),
+        ("预测指标", "ppt_forecast", ["batch", "dataset", "backend", "diurnal_blend_alpha", "n", "MAE", "RMSE", "RAE", "MAPE_pct", "WAPE_pct", "bias_pct"]),
         ("Medium 逐轮数量（共同样本）", "ppt_medium", None),
         ("首次进入 Medium 与总 tokens（共同样本）", "ppt_first_entries", None),
         ("每轮平均 tokens 与缓存命中（共同样本）", "ppt_tokens", None),
@@ -541,7 +542,7 @@ def render_evaluation_report(report: dict[str, Any]) -> str:
         "缓存命中比例为累计命中输入 tokens ÷ 累计输入 tokens（0–1）。服务端未返回时完整统计为未知；known_cached_tokens 仅代表已知部分，不能把部分数据视为完整总量。"])
     revenue = tables.get("revenue_by_dataset_model_mode", [])
     sections.extend(["## 电价收益（全量，按数据集分开）", "同时使用两个基准：窗口基准 baseline_revenue = 窗口均价 × 原始预测总 kWh；逐小时基准 baseline_hourly_revenue = Σ（原始小时电价 e_price × 同小时预测负荷 predicted_kwh），按窗口起止小时（含两端）求和。每轮及最终收益 = 实际采用价格 × 同轮重预测总 kWh。无需再乘 3，各轮是独立方案，不累加为收入。仅含电费、不含服务费、未扣成本；未改变 Medium 达标规则。",
-                     _markdown_table(revenue, ["batch", "dataset", "forecast_model", "agent_mode", "revenue_unit", "phase", "round",
+                     _markdown_table(revenue, ["batch", "dataset", "backend", "agent_mode", "revenue_unit", "phase", "round",
                                                "baseline_revenue", "baseline_hourly_revenue", "revenue", "revenue_change", "revenue_change_pct",
                                                "revenue_change_vs_hourly", "revenue_change_vs_hourly_pct"]),
                      "revenue_change / revenue_change_pct 相对窗口基准；revenue_change_vs_hourly / revenue_change_vs_hourly_pct 相对逐小时基准，各自除以对应基准计算百分比。baseline 行的 revenue 保留窗口基准，因此该行相对逐小时的差额表示两种基准的差异。不同数据集/币种不直接合计收益。基准为零时其增减比例未知。缺少完整小时价格/预测负荷时逐小时基准未知，不用窗口均价或实际负荷代替。"])
@@ -549,7 +550,7 @@ def render_evaluation_report(report: dict[str, Any]) -> str:
                                                           ("baseline_revenue", "baseline_hourly_revenue", "revenue"))]
     if incomplete_revenue:
         sections.extend(["### 收益数据覆盖（仅列不完整项）", _markdown_table(incomplete_revenue, [
-            "batch", "dataset", "forecast_model", "agent_mode", "revenue_unit", "phase", "round", "window_count",
+            "batch", "dataset", "backend", "agent_mode", "revenue_unit", "phase", "round", "window_count",
             "known_baseline_revenue", "baseline_revenue_coverage_pct", "known_baseline_hourly_revenue",
             "baseline_hourly_revenue_coverage_pct", "known_revenue", "revenue_coverage_pct"]),
             "known_* 仅为完整有效窗口的已知部分和，不能作为完整收益或基准；覆盖率以窗口数计算，窗口内缺小时不计为完整窗口。"])
@@ -591,7 +592,7 @@ def write_evaluation(report: dict[str, Any], output_dir: Path | str) -> Path:
         "forecaster_run_metrics.csv": report["forecaster"]["runs"],
         "agent_summary.csv": report["agent"]["by_model_and_mode"],
         "agent_run_metrics.csv": [
-            {"run_id": r["run_id"], "forecast_model": r["forecast_model"],
+            {"run_id": r["run_id"], "backend": r["backend"],
              "agent_mode": r["agent_mode"], **r["summary"]}
             for r in report["agent"]["runs"]
         ],

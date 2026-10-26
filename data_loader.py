@@ -77,11 +77,11 @@ def build_zone_profiles(
     *,
     force_cache: bool = False,
     max_poi_rows: int | None = None,
-    forecast_start: pd.Timestamp | str | None = None,
+    forecast_origin: pd.Timestamp | str | None = None,
 ) -> pd.DataFrame:
     cache_dir.mkdir(parents=True, exist_ok=True)
     profile_cache = cache_dir / (
-        "training_zone_profiles.csv" if forecast_start is not None else "zone_profiles.csv"
+        "training_zone_profiles.csv" if forecast_origin is not None else "zone_profiles.csv"
     )
     if profile_cache.exists() and not force_cache and max_poi_rows is None:
         cached = pd.read_csv(profile_cache, dtype={"zone_id": str})
@@ -125,8 +125,8 @@ def build_zone_profiles(
     load = read_time_matrix(data_dir / LOAD_FILE)
     service_price = read_time_matrix(data_dir / "s_price.csv")
     energy_price = read_time_matrix(data_dir / "e_price.csv")
-    if forecast_start is not None:
-        cutoff = pd.Timestamp(forecast_start)
+    if forecast_origin is not None:
+        cutoff = pd.Timestamp(forecast_origin)
         load = load[load["time"] < cutoff].copy()
         service_price = service_price[service_price["time"] < cutoff].copy()
         energy_price = energy_price[energy_price["time"] < cutoff].copy()
@@ -178,7 +178,7 @@ def build_zone_profiles_from_canonical(
     dataset: CanonicalDataset,
     cache_dir: Path,
     *,
-    forecast_start: pd.Timestamp | str,
+    forecast_origin: pd.Timestamp | str,
     force_cache: bool = False,
 ) -> pd.DataFrame:
     """Build forecast-origin-safe zone profiles from canonical data."""
@@ -189,18 +189,18 @@ def build_zone_profiles_from_canonical(
         try:
             cached = pd.read_csv(cache_file, dtype={"zone_id": str})
             if "profile_cutoff" in cached and (
-                cached["profile_cutoff"] == pd.Timestamp(forecast_start).isoformat()
+                cached["profile_cutoff"] == pd.Timestamp(forecast_origin).isoformat()
             ).all():
                 return cached
         except (OSError, pd.errors.ParserError, ValueError):
             pass
 
-    cutoff = pd.Timestamp(forecast_start)
+    cutoff = pd.Timestamp(forecast_origin)
     history = dataset.timeseries[
         dataset.timeseries[CANONICAL_TIME_COLUMN] < cutoff
     ].copy()
     if history.empty:
-        raise ValueError(f"No historical observations exist before forecast_start={cutoff}")
+        raise ValueError(f"No historical observations exist before forecast_origin={cutoff}")
     load = pivot_timeseries(history, CANONICAL_LOAD_COLUMN)
     zone_ids = [str(column) for column in load.columns if column != "time"]
     load_features = compute_load_features(load, zone_ids)
@@ -270,13 +270,13 @@ def build_zone_3h_load_policy_thresholds(
     force_cache: bool = False,
     source_file: str = LOAD_FILE,
     window_hours: int = 3,
-    forecast_start: pd.Timestamp | str | None = None,
+    forecast_origin: pd.Timestamp | str | None = None,
     load_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_file = cache_dir / (
         "historical_3h_load_policy.csv"
-        if forecast_start is not None
+        if forecast_origin is not None
         else "zone_3h_load_quantiles.csv"
     )
     if cache_file.exists() and not force_cache:
@@ -311,16 +311,16 @@ def build_zone_3h_load_policy_thresholds(
             ).all()
         )
         cutoff_ok = True
-        if forecast_start is not None:
-            cutoff_ok = "forecast_start_cutoff" in cached.columns and (
-                cached["forecast_start_cutoff"] == pd.Timestamp(forecast_start).isoformat()
+        if forecast_origin is not None:
+            cutoff_ok = "forecast_origin_cutoff" in cached.columns and (
+                cached["forecast_origin_cutoff"] == pd.Timestamp(forecast_origin).isoformat()
             ).all()
         if source_ok and window_ok and policy_ok and cutoff_ok:
             return cached
 
     load = load_frame.copy() if load_frame is not None else read_time_matrix(data_dir / source_file)
-    if forecast_start is not None:
-        load = load[load["time"] < pd.Timestamp(forecast_start)].copy()
+    if forecast_origin is not None:
+        load = load[load["time"] < pd.Timestamp(forecast_origin)].copy()
     zone_ids = [str(col) for col in load.columns if col != "time"]
     values = load.set_index("time")[zone_ids].apply(pd.to_numeric, errors="coerce").sort_index()
     grouped = values.resample(f"{int(window_hours)}h", origin="start_day").sum(min_count=1)
@@ -335,9 +335,9 @@ def build_zone_3h_load_policy_thresholds(
                 "zone_id": zone_id,
                 "stress_source_file": source_file,
                 "stress_window_hours": int(window_hours),
-                "forecast_start_cutoff": (
-                    pd.Timestamp(forecast_start).isoformat()
-                    if forecast_start is not None
+                "forecast_origin_cutoff": (
+                    pd.Timestamp(forecast_origin).isoformat()
+                    if forecast_origin is not None
                     else None
                 ),
                 "historical_3h_windows": int(len(zone_values)),

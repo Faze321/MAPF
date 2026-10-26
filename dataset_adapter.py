@@ -866,18 +866,18 @@ def load_cached_dataset(
 
 def split_cache_key(
     dataset_fingerprint: str,
-    forecast_start: Any,
+    forecast_origin: Any,
     *,
     window_hours: int,
     policy_id: str,
 ) -> str:
-    start = pd.Timestamp(forecast_start).isoformat()
+    start = pd.Timestamp(forecast_origin).isoformat()
     payload = {
         "dataset": dataset_fingerprint,
-        "forecast_start": start,
+        "forecast_origin": start,
         "window_hours": int(window_hours),
         "policy_id": policy_id,
-        "history_rule": "strictly_before_forecast_start",
+        "history_rule": "strictly_before_forecast_origin",
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")

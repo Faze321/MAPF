@@ -21,7 +21,7 @@ from dataset_adapter import (
 )
 
 
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 CONSTANT_RTOL = 1e-9
 CONSTANT_ATOL = 1e-12
 
@@ -148,7 +148,7 @@ def _build_report(dataset: CanonicalDataset, policy: dict[str, Any]) -> dict[str
             ):
                 window_reasons.append("invalid_training_energy_price")
             training_windows.append({
-                "forecast_start": origin,
+                "forecast_origin": origin,
                 "start": start.isoformat(), "end_exclusive": end.isoformat(),
                 "expected_hours": expected_hours, "observed_hours": len(window),
                 "complete": complete, "load_kwh": load, "energy_price": price,

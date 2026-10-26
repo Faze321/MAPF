@@ -32,7 +32,11 @@ from config import (
     AgentConfig,
     RunConfig,
     BACKEND_PARAMETER_NAMES,
-    XGBOOST_PARAMETER_DEFAULTS,
+    BACKEND_BLEND_PARAMETER_NAMES,
+    CALIBRATION_METHOD,
+    FORECAST_BACKENDS,
+    normalize_float_list,
+    resolve_backend_blend_alphas,
     agent_config_profile,
     normalize_agent_mode,
     normalize_forecast_model_name,
@@ -139,11 +143,11 @@ DECISION_SUMMARY_KEYS = {
     "history_end",
     "validation_start",
     "validation_end",
-    "forecast_start",
+    "forecast_origin",
     "forecast_end",
     "forecast_horizon_days",
     "forecast_horizon_hours",
-    "forecast_model",
+    "backend",
     "diurnal_blend_alpha",
     "forecast_total_kwh",
     "forecast_peak_kwh",
@@ -167,7 +171,6 @@ DECISION_SUMMARY_KEYS = {
     "load_3h_medium_high_threshold_kwh",
     "load_3h_high_extremely_high_threshold_kwh",
     "zone_mean_energy_price",
-    "calibration",
     "price",
     "weather",
     "occupancy",
@@ -194,20 +197,17 @@ ERROR_CODE_BY_STAGE = {
 }
 MAX_CONTROL_ATTEMPTS = 3
 CONTROL_AGENT_USAGE_KEY = "_control_agent_usage"
-FORECASTER_MANIFEST_SCHEMA_VERSION = 3
+FORECASTER_MANIFEST_SCHEMA_VERSION = 4
 FORECAST_PARAMETER_NAMES = (
-    'forecast_start',
+    'forecast_origin',
     'horizon_days',
     'history_days',
     'validation_days',
-    'forecast_model',
+    'backend',
+    'diurnal_blend_alpha',
     *BACKEND_PARAMETER_NAMES,
 )
-PRICE_CONDITIONED_PARAMETER_NAMES = tuple(
-    name
-    for name in FORECAST_PARAMETER_NAMES
-    if name not in {"timesfm_roll_actuals", "chronos_roll_actuals", "lstm_roll_actuals"}
-)
+PRICE_CONDITIONED_PARAMETER_NAMES = FORECAST_PARAMETER_NAMES
 
 
 class PipelineStageError(RuntimeError):
@@ -253,38 +253,29 @@ def run_pipeline(
     dry_run: bool = False,
     force_cache: bool = False,
     max_poi_rows: int | None = None,
-    forecast_start: str | None = None,
-    horizon_days: int = 4,
-    history_days: int = 7,
-    validation_days: int = 1,
+    forecast_origin: str | None = None,
+    horizon_days: int = 1,
+    history_days: int = 30,
+    validation_days: int = 5,
     zone_ids: str | Iterable[str] | None = None,
     experiment_zone_count: int = 12,
     agent_mode: str = "multi_agent_economist_retry",
-    forecast_model: str = "timesfm",
+    backend: str = "timesfm",
+    diurnal_blend_alpha: float = 0.0,
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch",
     timesfm_context_hours: int = 168,
-    timesfm_step_horizon: int = 24,
     timesfm_exog_cols: list[str] | None = None,
-    timesfm_diurnal_blend_alpha: float = 1.0,
-    timesfm_roll_actuals: bool = False,
-    ar_diurnal_blend_alpha: float = 0.0,
     chronos_repo: str = "amazon/chronos-2",
     chronos_context_hours: int = 512,
-    chronos_step_horizon: int = 24,
-    chronos_diurnal_blend_alpha: float = 0.0,
     chronos_device: str = "auto",
-    chronos_roll_actuals: bool = False,
     lstm_context_hours: int = 24,
-    lstm_step_horizon: int = 24,
     lstm_exog_cols: list[str] | None = None,
     lstm_hidden_size: int = 64,
     lstm_num_layers: int = 1,
     lstm_epochs: int = 50,
     lstm_learning_rate: float = 0.001,
     lstm_batch_size: int = 32,
-    lstm_diurnal_blend_alpha: float = 0.0,
     lstm_device: str = "auto",
-    lstm_roll_actuals: bool = False,
     lstm_seed: int = 42,
     xgboost_lags: list[int] | None = None,
     xgboost_exog_cols: list[str] | None = None,
@@ -294,7 +285,6 @@ def run_pipeline(
     xgboost_colsample_bytree: float = 0.9,
     xgboost_tree_method: str = "approx",
     xgboost_n_jobs: int = 1,
-    xgboost_diurnal_blend_alpha: float = 0.0,
     xgboost_seed: int = 42,
     temperature: float = 0.2,
     precomputed_window_data: Path | str | None = None,
@@ -303,7 +293,7 @@ def run_pipeline(
     agent_output_dir: Path | str | None = None,
     dataset_spec: DatasetSpec | None = None,
 ) -> dict[str, Path]:
-    forecast_model = normalize_forecast_model_name(forecast_model)
+    backend = normalize_forecast_model_name(backend)
     pipeline_stage = normalize_pipeline_stage(pipeline_stage)
     agent_mode = normalize_agent_mode(agent_mode)
     chain_mode = (
@@ -320,7 +310,7 @@ def run_pipeline(
         cache_dir=cache_dir,
     )
     shared_cache_dir = cache_dir or dataset_spec.resolved_cache_dir
-    run_output_dir = forecast_output_dir(output_dir, forecast_model)
+    run_output_dir = forecast_output_dir(output_dir, backend, diurnal_blend_alpha)
     forecaster_dir = resolve_forecaster_output_dir(
         run_output_dir,
         forecaster_output_dir if pipeline_stage == "agent" else None,
@@ -333,35 +323,26 @@ def run_pipeline(
     forecaster_outputs: dict[str, Path] = {}
     bundle: ForecasterBundle | None = None
     forecast_parameters = make_forecast_parameters(
-        forecast_start=forecast_start,
+        forecast_origin=forecast_origin,
         horizon_days=horizon_days,
         history_days=history_days,
         validation_days=validation_days,
-        forecast_model=forecast_model,
+        backend=backend,
+        diurnal_blend_alpha=diurnal_blend_alpha,
         timesfm_repo=timesfm_repo,
         timesfm_context_hours=timesfm_context_hours,
-        timesfm_step_horizon=timesfm_step_horizon,
         timesfm_exog_cols=timesfm_exog_cols,
-        timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-        timesfm_roll_actuals=timesfm_roll_actuals,
-        ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
         chronos_repo=chronos_repo,
         chronos_context_hours=chronos_context_hours,
-        chronos_step_horizon=chronos_step_horizon,
-        chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
         chronos_device=chronos_device,
-        chronos_roll_actuals=chronos_roll_actuals,
         lstm_context_hours=lstm_context_hours,
-        lstm_step_horizon=lstm_step_horizon,
         lstm_exog_cols=lstm_exog_cols,
         lstm_hidden_size=lstm_hidden_size,
         lstm_num_layers=lstm_num_layers,
         lstm_epochs=lstm_epochs,
         lstm_learning_rate=lstm_learning_rate,
         lstm_batch_size=lstm_batch_size,
-        lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
         lstm_device=lstm_device,
-        lstm_roll_actuals=lstm_roll_actuals,
         lstm_seed=lstm_seed,
         xgboost_lags=xgboost_lags,
         xgboost_exog_cols=xgboost_exog_cols,
@@ -371,7 +352,6 @@ def run_pipeline(
         xgboost_colsample_bytree=xgboost_colsample_bytree,
         xgboost_tree_method=xgboost_tree_method,
         xgboost_n_jobs=xgboost_n_jobs,
-        xgboost_diurnal_blend_alpha=xgboost_diurnal_blend_alpha,
         xgboost_seed=xgboost_seed,
     )
 
@@ -383,7 +363,7 @@ def run_pipeline(
         selected_zones = bundle.selected_zones
         contexts = bundle.contexts
         forecast_parameters = bundle.forecast_parameters
-        forecast_model = str(forecast_parameters["forecast_model"])
+        backend = str(forecast_parameters["backend"])
         source = bundle.manifest.get("data_source") or {}
         validate_forecaster_dataset_source(dataset_spec, source)
         recorded_data_dir = source.get("data_dir")
@@ -414,11 +394,12 @@ def run_pipeline(
                 ),
             )
     effective_forecast_start = (
-        pd.Timestamp(forecast_parameters.get("forecast_start"))
-        if forecast_parameters.get("forecast_start")
+        pd.Timestamp(forecast_parameters.get("forecast_origin"))
+        if forecast_parameters.get("forecast_origin")
         else pd.Timestamp(canonical_dataset.timeseries["timestamp"].max())
         - pd.Timedelta(hours=int(forecast_parameters["horizon_days"]) * 24 - 1)
     )
+    forecast_parameters["forecast_origin"] = effective_forecast_start.isoformat()
     split_key = split_cache_key(
         canonical_dataset.dataset_fingerprint,
         effective_forecast_start,
@@ -435,7 +416,7 @@ def run_pipeline(
     profiles = build_zone_profiles_from_canonical(
         canonical_dataset,
         split_cache_dir,
-        forecast_start=effective_forecast_start,
+        forecast_origin=effective_forecast_start,
         force_cache=force_cache,
     )
     zone_load_thresholds = build_zone_3h_load_policy_thresholds(
@@ -443,7 +424,7 @@ def run_pipeline(
         split_cache_dir,
         force_cache=force_cache,
         source_file="canonical_dataset",
-        forecast_start=effective_forecast_start,
+        forecast_origin=effective_forecast_start,
         load_frame=canonical_dataset.wide_frame(
             "load_kwh",
             profiles["zone_id"].astype(str).tolist(),
@@ -485,7 +466,7 @@ def run_pipeline(
                 pipeline_data=pipeline_data,
                 selected_zones=selected_zones,
                 zone_load_thresholds=zone_load_thresholds,
-                **forecast_parameters,
+                **forecast_runtime_parameters(forecast_parameters),
             )
             scenario_artifacts = {
                 str(zone_id): NativeForecasterArtifact.from_forecast_result(result)
@@ -522,7 +503,7 @@ def run_pipeline(
         cached_contexts, live_contexts, cached_windows_by_zone = partition_precomputed_contexts(
             contexts,
             precomputed_frame,
-            forecast_model=forecast_model,
+            backend=backend,
             agent_mode=agent_mode,
         )
     except Exception as exc:
@@ -632,14 +613,14 @@ def run_pipeline(
         agent_outputs = write_agent_outputs(
             output_dir=resolved_agent_output_dir,
             reports=reports,
-            forecast_model=forecast_model,
+            backend=backend,
             agent_mode=agent_mode,
             manifest=build_agent_manifest(
                 agent_mode=agent_mode,
-                forecast_model=forecast_model,
+                backend=backend,
                 forecaster_dir=forecaster_dir,
                 selected_zone_ids=selected_zone_ids,
-                forecast_origin=forecast_parameters.get("forecast_start"),
+                forecast_origin=forecast_parameters.get("forecast_origin"),
                 dataset_fingerprint=canonical_dataset.dataset_fingerprint,
                 cache_keys=pipeline_data.cache_keys or {},
                 feature_manifest=pipeline_data.feature_manifest or {},
@@ -651,29 +632,39 @@ def run_pipeline(
 
 
 def make_forecast_parameters(**values: Any) -> dict[str, Any]:
-    # Old artifacts predate XGBoost and do not need its optional parameters.
-    values = {**XGBOOST_PARAMETER_DEFAULTS, **values}
-    missing = [name for name in FORECAST_PARAMETER_NAMES if name not in values]
+    """Persist only the resolved run and the active backend's hyperparameters."""
+    defaults = RunConfig()
+    common = ("forecast_origin", "backend", "history_days", "validation_days", "horizon_days", "diurnal_blend_alpha")
+    missing = [name for name in common if name not in values]
     if missing:
         raise ValueError("Missing forecast parameter(s): " + ", ".join(missing))
-    parameters = {name: values[name] for name in FORECAST_PARAMETER_NAMES}
-    parameters["forecast_model"] = normalize_forecast_model_name(
-        str(parameters["forecast_model"])
-    )
+    backend = normalize_forecast_model_name(str(values["backend"]))
+    if backend not in FORECAST_BACKENDS:
+        raise ValueError(f"Unsupported forecast backend: {backend}")
+    alpha = values["diurnal_blend_alpha"]
+    if isinstance(alpha, (list, tuple, dict)) or alpha is None:
+        raise ValueError("A resolved forecast requires one scalar diurnal_blend_alpha")
+    if values.get("calibration_method", CALIBRATION_METHOD) != CALIBRATION_METHOD:
+        raise ValueError("Unsupported forecast calibration method; rerun the forecaster stage")
+    parameters = {name: values[name] for name in common}
+    parameters["backend"] = backend
+    parameters["diurnal_blend_alpha"] = normalize_float_list(alpha)[0]
+    parameters.update({name: values.get(name, getattr(defaults, name))
+                       for name in BACKEND_PARAMETER_NAMES if name.startswith(backend.lower() + "_")})
+    parameters["calibration_method"] = CALIBRATION_METHOD
     return parameters
 
 
+def forecast_runtime_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Expand defaults only while dispatching; do not add them to provenance."""
+    defaults = RunConfig()
+    return {**{name: getattr(defaults, name) for name in BACKEND_PARAMETER_NAMES},
+            **{name: parameters[name] for name in FORECAST_PARAMETER_NAMES if name in parameters}}
+
+
 def price_conditioned_parameters(forecast_parameters: dict[str, Any]) -> dict[str, Any]:
-    forecast_parameters = {**XGBOOST_PARAMETER_DEFAULTS, **forecast_parameters}
-    missing = [
-        name for name in PRICE_CONDITIONED_PARAMETER_NAMES if name not in forecast_parameters
-    ]
-    if missing:
-        raise ValueError(
-            "Forecaster output is missing price-conditioned forecast parameter(s): "
-            + ", ".join(missing)
-        )
-    return {name: forecast_parameters[name] for name in PRICE_CONDITIONED_PARAMETER_NAMES}
+    return forecast_runtime_parameters(forecast_parameters)
+
 
 
 def resolve_forecaster_output_dir(
@@ -719,7 +710,7 @@ def build_forecaster_manifest(
 def build_agent_manifest(
     *,
     agent_mode: str,
-    forecast_model: str,
+    backend: str,
     forecaster_dir: Path,
     selected_zone_ids: list[str],
     forecast_origin: Any = None,
@@ -732,7 +723,7 @@ def build_agent_manifest(
         "stage": "agent",
         "completed_at": pd.Timestamp.now().isoformat(),
         "agent_mode": agent_mode,
-        "forecast_model": forecast_model,
+        "backend": backend,
         "forecast_origin": pd.Timestamp(forecast_origin).isoformat()
         if forecast_origin is not None
         else None,
@@ -765,6 +756,8 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
     raw_parameters = manifest.get("forecast_parameters")
     if not isinstance(raw_parameters, dict):
         raise ValueError("Forecaster manifest is missing forecast_parameters")
+    if raw_parameters.get("calibration_method") != CALIBRATION_METHOD:
+        raise ValueError("Forecaster manifest is missing the current daily calibration method; rerun the forecaster stage")
     forecast_parameters = make_forecast_parameters(**raw_parameters)
 
     artifacts = manifest.get("artifacts")
@@ -823,6 +816,14 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
         raise ValueError(
             "Forecaster artifact Zone set does not match the no-leakage handoff."
         )
+    for zone_id, artifact in scenario_artifacts.items():
+        metadata = artifact.metadata()
+        if metadata.get("backend") != forecast_parameters["backend"]:
+            raise ValueError(f"Forecaster artifact backend differs from the manifest for zone {zone_id}")
+        if pd.Timestamp(metadata.get("forecast_origin")) != pd.Timestamp(forecast_parameters["forecast_origin"]):
+            raise ValueError(f"Forecaster artifact origin differs from the manifest for zone {zone_id}")
+        if float(artifact.forecast_parameters.get("diurnal_blend_alpha", float("nan"))) != forecast_parameters["diurnal_blend_alpha"]:
+            raise ValueError(f"Forecaster artifact blend alpha differs from the manifest for zone {zone_id}")
 
     outputs = {
         "forecaster_output_dir": output_dir,
@@ -907,7 +908,13 @@ def run_experiment_matrix(
     modes = requested_modes
     if matrix_stage == "forecaster":
         modes = modes[:1]
-    blend_alphas = normalize_blend_alphas(diurnal_blend_alphas)
+    global_blend_alphas = normalize_blend_alphas(diurnal_blend_alphas)
+    blend_overrides = {name: normalize_float_list(pipeline_kwargs.pop(name, None))
+                       for name in BACKEND_BLEND_PARAMETER_NAMES}
+    model_blend_alphas = {
+        backend: resolve_backend_blend_alphas(backend, global_blend_alphas, blend_overrides)
+        for backend in models
+    }
     selected_zone_ids = normalize_zone_ids(zone_ids)
     shared_cache_dir = Path(pipeline_kwargs.pop("cache_dir", data_dir / "cache"))
     shared_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -962,7 +969,7 @@ def run_experiment_matrix(
                 / canonical_dataset.dataset_fingerprint
                 / "splits"
                 / selection_split_key,
-                forecast_start=selection_start,
+                forecast_origin=selection_start,
                 force_cache=base_force_cache,
             )
         selected_zone_ids = select_experiment_zone_ids(
@@ -1011,44 +1018,32 @@ def run_experiment_matrix(
     cache_attempted = False
     add_seed_folder = len(seeds) > 1
     add_mode_folder = len(modes) > 1
-    add_blend_folder = len(blend_alphas) > 1
 
-    for forecast_start in starts:
-        time_output_dir = experiment_dir / forecast_start_slug(forecast_start)
-        for forecast_model in models:
+    for forecast_origin in starts:
+        time_output_dir = experiment_dir / forecast_start_slug(forecast_origin)
+        for backend in models:
             for seed in seeds:
                 for agent_mode in modes:
-                    for blend_alpha in blend_alphas:
+                    for blend_alpha in model_blend_alphas[backend]:
                         run_base_dir = time_output_dir
                         if add_seed_folder and seed is not None:
                             run_base_dir = run_base_dir / f"seed_{seed}"
                         if add_mode_folder:
                             run_base_dir = run_base_dir / f"agent_{safe_filename(agent_mode)}"
-                        if add_blend_folder and blend_alpha is not None:
-                            alpha_text = safe_filename(f"{float(blend_alpha):.3f}".rstrip("0").rstrip("."))
-                            run_base_dir = run_base_dir / f"blend_{alpha_text}"
-                        run_output_dir = forecast_output_dir(run_base_dir, forecast_model)
+                        run_output_dir = forecast_output_dir(run_base_dir, backend, blend_alpha)
                         run_kwargs = dict(pipeline_kwargs)
                         run_kwargs["agent_mode"] = agent_mode
                         if seed is not None:
                             run_kwargs["lstm_seed"] = seed
                             run_kwargs["xgboost_seed"] = seed
-                        if blend_alpha is not None:
-                            alpha_value = float(blend_alpha)
-                            run_kwargs["timesfm_diurnal_blend_alpha"] = alpha_value
-                            run_kwargs["ar_diurnal_blend_alpha"] = alpha_value
-                            run_kwargs["chronos_diurnal_blend_alpha"] = alpha_value
-                            run_kwargs["lstm_diurnal_blend_alpha"] = alpha_value
-                            run_kwargs["xgboost_diurnal_blend_alpha"] = alpha_value
+                        run_kwargs["diurnal_blend_alpha"] = blend_alpha
                         if matrix_stage == "agent":
                             shared_run_base_dir = time_output_dir
                             if add_seed_folder and seed is not None:
                                 shared_run_base_dir = shared_run_base_dir / f"seed_{seed}"
-                            if add_blend_folder and blend_alpha is not None:
-                                shared_run_base_dir = shared_run_base_dir / f"blend_{alpha_text}"
                             if not run_kwargs.get("forecaster_output_dir"):
                                 mode_forecaster = run_output_dir / "forecaster"
-                                shared_forecaster = forecast_output_dir(shared_run_base_dir, forecast_model) / "forecaster"
+                                shared_forecaster = forecast_output_dir(shared_run_base_dir, backend, blend_alpha) / "forecaster"
                                 run_kwargs["forecaster_output_dir"] = (
                                     mode_forecaster
                                     if (mode_forecaster / "forecaster_manifest.json").is_file()
@@ -1058,8 +1053,8 @@ def run_experiment_matrix(
                                 run_kwargs["agent_output_dir"] = run_output_dir / "agent"
                         record: dict[str, Any] = {
                             "experiment_name": resolved_experiment_name,
-                            "forecast_start": forecast_start,
-                            "forecast_model": forecast_model,
+                            "forecast_origin": forecast_origin,
+                            "backend": backend,
                             "experiment_seed": seed,
                             "agent_mode": agent_mode,
                             "diurnal_blend_alpha": blend_alpha,
@@ -1085,16 +1080,16 @@ def run_experiment_matrix(
                                 output_dir=run_base_dir,
                                 cache_dir=shared_cache_dir,
                                 force_cache=base_force_cache and not cache_attempted,
-                                forecast_start=forecast_start,
-                                forecast_model=forecast_model,
+                                forecast_origin=forecast_origin,
+                                backend=backend,
                                 zone_ids=selected_zone_ids,
                                 **run_kwargs,
                             )
                             record["status"] = "success"
                             record["completed_at"] = pd.Timestamp.now().isoformat()
                             metadata = {
-                                "forecast_start": forecast_start,
-                                "forecast_model": forecast_model,
+                                "forecast_origin": forecast_origin,
+                                "backend": backend,
                                 "experiment_seed": seed,
                                 "agent_mode": agent_mode,
                                 "diurnal_blend_alpha": blend_alpha,
@@ -1236,19 +1231,9 @@ def normalize_agent_modes(agent_modes: Iterable[str] | None, default: str) -> li
     return modes or [normalize_agent_mode(default)]
 
 
-def normalize_blend_alphas(diurnal_blend_alphas: Iterable[float] | None) -> list[float | None]:
-    if diurnal_blend_alphas is None:
-        return [None]
-    values: list[float | None] = []
-    seen: set[float] = set()
-    for value in diurnal_blend_alphas:
-        alpha = round(float(value), 6)
-        if alpha < 0.0 or alpha > 1.0:
-            raise ValueError(f"Diurnal blend alpha must be between 0 and 1: {value}")
-        if alpha not in seen:
-            values.append(alpha)
-            seen.add(alpha)
-    return values or [None]
+def normalize_blend_alphas(diurnal_blend_alphas: Iterable[float] | None) -> list[float]:
+    values = normalize_float_list(list(diurnal_blend_alphas) if diurnal_blend_alphas is not None else None)
+    return values if values is not None else [0.0]
 
 
 def experiment_slug(
@@ -1261,8 +1246,8 @@ def experiment_slug(
     return f"{int(zone_count)}zonesx{int(time_count)}timesx{int(mode_count)}modes_{int(blend_count)}blends"
 
 
-def forecast_start_slug(forecast_start: str) -> str:
-    return pd.Timestamp(forecast_start).strftime("%Y-%m-%d_%H%M%S")
+def forecast_start_slug(forecast_origin: str) -> str:
+    return pd.Timestamp(forecast_origin).strftime("%Y-%m-%d_%H%M%S")
 
 
 def append_experiment_frame(
@@ -1408,8 +1393,8 @@ def write_error_traceback(
     name_parts = [
         f"{run_index:04d}",
         error_code,
-        forecast_start_slug(str(record.get("forecast_start") or "unknown")),
-        safe_filename(record.get("forecast_model") or "model"),
+        forecast_start_slug(str(record.get("forecast_origin") or "unknown")),
+        safe_filename(record.get("backend") or "model"),
         safe_filename(record.get("agent_mode") or "mode"),
         safe_filename(blend_text),
     ]
@@ -1428,7 +1413,7 @@ def write_numeric_summary(
     metric_columns: list[str],
     group_columns: list[str] | None = None,
 ) -> pd.DataFrame:
-    group_columns = group_columns or ["forecast_model", "agent_mode", "diurnal_blend_alpha"]
+    group_columns = group_columns or ["backend", "agent_mode", "diurnal_blend_alpha"]
     output_columns = [
         *group_columns,
         "metric",
@@ -1504,7 +1489,7 @@ def write_decision_quality_summary(
         )
     combined = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     columns = [
-        "forecast_model",
+        "backend",
         "agent_mode",
         "diurnal_blend_alpha",
         "metric_family",
@@ -1523,7 +1508,7 @@ def write_decision_quality_summary(
 
     groups = [
         column
-        for column in ["forecast_model", "agent_mode", "diurnal_blend_alpha", "metric_family", "metric"]
+        for column in ["backend", "agent_mode", "diurnal_blend_alpha", "metric_family", "metric"]
         if column in combined.columns
     ]
     rows = []
@@ -1553,7 +1538,7 @@ def write_decision_quality_summary(
 
 
 def long_metric_frame(frame: pd.DataFrame, *, metrics: list[str], metric_family: str) -> pd.DataFrame:
-    group_cols = [col for col in ["forecast_model", "agent_mode", "diurnal_blend_alpha"] if col in frame.columns]
+    group_cols = [col for col in ["backend", "agent_mode", "diurnal_blend_alpha"] if col in frame.columns]
     rows = []
     for metric in metrics:
         if metric not in frame.columns:
@@ -1628,9 +1613,11 @@ def select_representative_zone_ids(profiles: pd.DataFrame, *, count: int) -> lis
     return selected
 
 
-def forecast_output_dir(output_dir: Path, forecast_model: str) -> Path:
-    normalized = normalize_forecast_model_name(forecast_model)
-    return output_dir / safe_filename(normalized or "forecast")
+def forecast_output_dir(output_dir: Path, backend: str, diurnal_blend_alpha: float = 0.0) -> Path:
+    normalized = normalize_forecast_model_name(backend)
+    alpha = normalize_float_list(diurnal_blend_alpha)[0]
+    alpha_text = f"{alpha:.6f}".rstrip("0").rstrip(".")
+    return output_dir / f"blend_{alpha_text}" / safe_filename(normalized or "forecast")
 
 
 def normalize_experiment_name(value: Any, *, default: str) -> str:
@@ -1680,17 +1667,17 @@ def partition_precomputed_contexts(
     contexts: list[dict[str, Any]],
     frame: pd.DataFrame,
     *,
-    forecast_model: str,
+    backend: str,
     agent_mode: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[tuple[str, str, str], dict[str, Any]]]]:
     if frame.empty:
         return [], list(contexts), {}
 
     candidates = frame.copy()
-    if "forecast_model" in candidates:
-        model_values = candidates["forecast_model"].fillna("").astype(str).str.strip()
+    if "backend" in candidates:
+        model_values = candidates["backend"].fillna("").astype(str).str.strip()
         model_matches = model_values.map(
-            lambda value: not value or normalize_forecast_model_name(value) == forecast_model
+            lambda value: not value or normalize_forecast_model_name(value) == backend
         )
         candidates = candidates[model_matches]
     if "agent_mode" in candidates:
@@ -1896,31 +1883,25 @@ def apply_price_conditioned_baseline_forecasts(
     pipeline_data,
     zone_load_thresholds: pd.DataFrame,
     scenario_artifacts: dict[str, NativeForecasterArtifact],
-    forecast_start: str | None,
+    forecast_origin: str | None,
     horizon_days: int,
     history_days: int,
     validation_days: int,
-    forecast_model: str,
+    backend: str,
+    diurnal_blend_alpha: float,
     timesfm_repo: str,
     timesfm_context_hours: int,
-    timesfm_step_horizon: int,
     timesfm_exog_cols: list[str] | None,
-    timesfm_diurnal_blend_alpha: float,
-    ar_diurnal_blend_alpha: float,
     chronos_repo: str,
     chronos_context_hours: int,
-    chronos_step_horizon: int,
-    chronos_diurnal_blend_alpha: float,
     chronos_device: str,
     lstm_context_hours: int,
-    lstm_step_horizon: int,
     lstm_exog_cols: list[str] | None,
     lstm_hidden_size: int,
     lstm_num_layers: int,
     lstm_epochs: int,
     lstm_learning_rate: float,
     lstm_batch_size: int,
-    lstm_diurnal_blend_alpha: float,
     lstm_device: str,
     lstm_seed: int,
     xgboost_lags: list[int] | None = None,
@@ -1931,10 +1912,9 @@ def apply_price_conditioned_baseline_forecasts(
     xgboost_colsample_bytree: float = 0.9,
     xgboost_tree_method: str = "approx",
     xgboost_n_jobs: int = 1,
-    xgboost_diurnal_blend_alpha: float = 0.0,
     xgboost_seed: int = 42,
 ) -> list[dict[str, Any]]:
-    normalized_model = normalize_forecast_model_name(forecast_model)
+    normalized_model = normalize_forecast_model_name(backend)
     if normalized_model not in {"timesfm", "lstm", "chronos", "xgboost", "AR"}:
         return [
             mark_price_conditioned_baseline_unavailable(
@@ -2022,7 +2002,7 @@ def apply_price_conditioned_baseline_forecasts(
         updated_report = attach_price_conditioned_baselines(
             report,
             conditioned_windows,
-            forecast_model=normalized_model,
+            backend=normalized_model,
             forecast_metadata=batch.metadata,
         )
         updated_reports.append(updated_report)
@@ -2759,7 +2739,7 @@ def attach_price_conditioned_baselines(
     report: dict[str, Any],
     conditioned_windows: list[dict[str, Any]],
     *,
-    forecast_model: str,
+    backend: str,
     forecast_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     conditioned_by_window = {
@@ -2785,7 +2765,7 @@ def attach_price_conditioned_baselines(
             )
             updated["price_conditioned_energy_price"] = conditioned.get("mean_energy_price")
             updated["price_conditioned_baseline_source"] = (
-                f"{forecast_model}_native_backend_reforecast_with_proposed_energy_price"
+                f"{backend}_native_backend_reforecast_with_proposed_energy_price"
             )
         updated_windows.append(updated)
 
@@ -2824,36 +2804,27 @@ def build_contexts(
     *,
     pipeline_data,
     selected_zones: pd.DataFrame,
-    forecast_start: str | None,
+    forecast_origin: str | None,
     horizon_days: int,
     history_days: int,
     validation_days: int,
-    forecast_model: str,
+    backend: str,
+    diurnal_blend_alpha: float,
     zone_load_thresholds: pd.DataFrame,
     timesfm_repo: str,
     timesfm_context_hours: int,
-    timesfm_step_horizon: int,
     timesfm_exog_cols: list[str] | None,
-    timesfm_diurnal_blend_alpha: float,
-    timesfm_roll_actuals: bool,
-    ar_diurnal_blend_alpha: float,
     chronos_repo: str,
     chronos_context_hours: int,
-    chronos_step_horizon: int,
-    chronos_diurnal_blend_alpha: float,
     chronos_device: str,
-    chronos_roll_actuals: bool,
     lstm_context_hours: int,
-    lstm_step_horizon: int,
     lstm_exog_cols: list[str] | None,
     lstm_hidden_size: int,
     lstm_num_layers: int,
     lstm_epochs: int,
     lstm_learning_rate: float,
     lstm_batch_size: int,
-    lstm_diurnal_blend_alpha: float,
     lstm_device: str,
-    lstm_roll_actuals: bool,
     lstm_seed: int,
     xgboost_lags: list[int] | None = None,
     xgboost_exog_cols: list[str] | None = None,
@@ -2863,10 +2834,9 @@ def build_contexts(
     xgboost_colsample_bytree: float = 0.9,
     xgboost_tree_method: str = "approx",
     xgboost_n_jobs: int = 1,
-    xgboost_diurnal_blend_alpha: float = 0.0,
     xgboost_seed: int = 42,
 ) -> tuple[list[dict[str, Any]], dict[str, ForecastResult]]:
-    start = pd.Timestamp(forecast_start) if forecast_start else None
+    start = pd.Timestamp(forecast_origin) if forecast_origin else None
     contexts = []
     forecast_results = {}
     profiles_by_zone = pipeline_data.profiles.set_index("zone_id", drop=False)
@@ -2889,35 +2859,26 @@ def build_contexts(
                 occupancy=pipeline_data.occupancy,
                 weather=pipeline_data.weather,
                 profile=profile,
-                forecast_start=start,
+                forecast_origin=start,
                 horizon_days=horizon_days,
                 history_days=history_days,
                 validation_days=validation_days,
-                forecast_model=forecast_model,
+                backend=backend,
+                diurnal_blend_alpha=diurnal_blend_alpha,
                 timesfm_repo=timesfm_repo,
                 timesfm_context_hours=timesfm_context_hours,
-                timesfm_step_horizon=timesfm_step_horizon,
                 timesfm_exog_cols=timesfm_exog_cols,
-                timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-                timesfm_roll_actuals=timesfm_roll_actuals,
-                ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
                 chronos_repo=chronos_repo,
                 chronos_context_hours=chronos_context_hours,
-                chronos_step_horizon=chronos_step_horizon,
-                chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
                 chronos_device=chronos_device,
-                chronos_roll_actuals=chronos_roll_actuals,
                 lstm_context_hours=lstm_context_hours,
-                lstm_step_horizon=lstm_step_horizon,
                 lstm_exog_cols=lstm_exog_cols,
                 lstm_hidden_size=lstm_hidden_size,
                 lstm_num_layers=lstm_num_layers,
                 lstm_epochs=lstm_epochs,
                 lstm_learning_rate=lstm_learning_rate,
                 lstm_batch_size=lstm_batch_size,
-                lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
                 lstm_device=lstm_device,
-                lstm_roll_actuals=lstm_roll_actuals,
                 lstm_seed=lstm_seed,
                 xgboost_lags=xgboost_lags,
                 xgboost_exog_cols=xgboost_exog_cols,
@@ -2927,7 +2888,6 @@ def build_contexts(
                 xgboost_colsample_bytree=xgboost_colsample_bytree,
                 xgboost_tree_method=xgboost_tree_method,
                 xgboost_n_jobs=xgboost_n_jobs,
-                xgboost_diurnal_blend_alpha=xgboost_diurnal_blend_alpha,
                 xgboost_seed=xgboost_seed,
             )
         except Exception as exc:

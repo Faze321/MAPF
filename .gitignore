@@ -8,8 +8,6 @@ __pycache__/
 .pytest_cache/
 
 test/
-tests/
-!tests/test_xgboost.py
 test.py
 test.ipynb
 config.yaml
@@ -20,7 +18,6 @@ tmp/
 .agents/
 .codex/
 
-docs/
 
 # Dataset
 data/

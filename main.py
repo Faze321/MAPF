@@ -8,6 +8,8 @@ from pathlib import Path
 from config import (
     AppConfig,
     BACKEND_PARAMETER_NAMES,
+    BACKEND_BLEND_PARAMETER_NAMES,
+    resolve_backend_blend_alphas,
     normalize_agent_mode,
     normalize_agent_mode_list,
     normalize_float_list,
@@ -26,6 +28,7 @@ from orchestrator import (format_failure_message, run_dataset_batch, run_experim
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python main.py",
+        allow_abbrev=False,
         description="Run Multi-Agent Prescriptive Forecasting on EV charging datasets.",
     )
     parser.add_argument("--config", default="config.yaml", help="YAML config file for run and model settings.")
@@ -63,11 +66,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--weather-file", default=None, help="Weather CSV file under data-dir.")
     parser.add_argument(
-        "--forecast-model",
-        default=None,
-        help="Forecast model: timesfm, chronos, lstm, xgboost, or AR.",
-    )
-    parser.add_argument(
         "--model",
         default=None,
         help=(
@@ -99,7 +97,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "Forecaster output directory (or forecaster_manifest.json) consumed by an "
-            "agent-only run. Defaults to <output-folder>/<forecast-model>/forecaster."
+            "agent-only run. Defaults to the selected backend and blend output folder."
         ),
     )
     parser.add_argument(
@@ -116,7 +114,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--max-poi-rows", type=int, default=None, help="Limit POI rows for quick experiments.")
-    parser.add_argument("--forecast-start", default=None, help="ISO timestamp for the forecast window start.")
     parser.add_argument(
         "--forecast-starts",
         nargs="+",
@@ -168,17 +165,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="One or more supported control-loop agent modes.",
     )
     parser.add_argument(
-        "--diurnal-blend-alpha",
-        type=float,
-        default=None,
-        help="Uniform diurnal blend weight for all forecasters.",
-    )
-    parser.add_argument(
         "--diurnal-blend-alphas",
         nargs="+",
         default=None,
         help="Uniform diurnal blend weights to sweep in an experiment matrix.",
     )
+    for name in BACKEND_BLEND_PARAMETER_NAMES:
+        parser.add_argument(
+            "--" + name.replace("_", "-"), nargs="+", default=None,
+            help="Alpha value(s) for this forecaster; overrides the global alpha list.",
+        )
     parser.add_argument("--temperature", type=float, default=None, help="LLM sampling temperature.")
     return parser
 
@@ -239,24 +235,9 @@ def main(argv: list[str] | None = None):
         else run_config.agent_output_dir
     )
     cli_starts = normalize_string_list(args.forecast_starts)
-    if cli_starts:
-        forecast_starts = cli_starts
-    elif args.forecast_start:
-        forecast_starts = [args.forecast_start]
-    elif run_config.forecast_starts:
-        forecast_starts = run_config.forecast_starts
-    else:
-        forecast_starts = [run_config.forecast_start] if run_config.forecast_start else []
-
+    forecast_starts = cli_starts or run_config.forecast_starts or []
     cli_models = normalize_forecast_model_list(args.forecast_models)
-    if cli_models:
-        forecast_models = cli_models
-    elif args.forecast_model:
-        forecast_models = normalize_forecast_model_list([args.forecast_model]) or [args.forecast_model]
-    elif run_config.forecast_models:
-        forecast_models = run_config.forecast_models
-    else:
-        forecast_models = [run_config.forecast_model]
+    forecast_models = cli_models or run_config.forecast_models or ["timesfm"]
 
     cli_seeds = normalize_int_list(args.experiment_seeds)
     experiment_seeds = cli_seeds if cli_seeds else run_config.experiment_seeds
@@ -270,19 +251,23 @@ def main(argv: list[str] | None = None):
         agent_modes = run_config.agent_modes
 
     cli_alphas = normalize_float_list(args.diurnal_blend_alphas)
-    if cli_alphas:
-        diurnal_blend_alphas = cli_alphas
-    elif args.diurnal_blend_alpha is not None:
-        diurnal_blend_alphas = [float(args.diurnal_blend_alpha)]
-    else:
-        diurnal_blend_alphas = run_config.diurnal_blend_alphas
+    diurnal_blend_alphas = cli_alphas if cli_alphas is not None else run_config.diurnal_blend_alphas
+    backend_blend_alphas = {
+        name: normalize_float_list(getattr(args, name)) if getattr(args, name) is not None
+        else getattr(run_config, name)
+        for name in BACKEND_BLEND_PARAMETER_NAMES
+    }
+    effective_blend_alphas = {
+        backend: resolve_backend_blend_alphas(backend, diurnal_blend_alphas, backend_blend_alphas)
+        for backend in forecast_models
+    }
     run_matrix = pipeline_stage != "agent" or not forecaster_output_dir
     run_matrix = run_matrix and (
         len(forecast_starts) > 1
         or len(forecast_models) > 1
         or bool(experiment_seeds and len(experiment_seeds) > 1)
         or bool(agent_modes and len(agent_modes) > 1)
-        or bool(diurnal_blend_alphas and len(diurnal_blend_alphas) > 1)
+        or any(len(values) > 1 for values in effective_blend_alphas.values())
         or bool(experiment_name)
         or run_config.experiment_zone_selection == "random"
         or bool(run_config.experiment_zone_counts)
@@ -296,13 +281,6 @@ def main(argv: list[str] | None = None):
         agent_mode = agent_modes[0]
     else:
         agent_mode = run_config.agent_mode
-    diurnal_blend_alpha = (
-        args.diurnal_blend_alpha
-        if args.diurnal_blend_alpha is not None
-        else diurnal_blend_alphas[0]
-        if diurnal_blend_alphas and len(diurnal_blend_alphas) == 1
-        else run_config.diurnal_blend_alpha
-    )
 
     resolved_data_dir = Path(data_dirs)
     dataset_spec = resolve_dataset_spec(DatasetSpec(
@@ -351,13 +329,6 @@ def main(argv: list[str] | None = None):
         **{name: getattr(run_config, name) for name in BACKEND_PARAMETER_NAMES},
         "temperature": args.temperature if args.temperature is not None else run_config.temperature,
     }
-    if diurnal_blend_alpha is not None:
-        common_kwargs["timesfm_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
-        common_kwargs["ar_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
-        common_kwargs["chronos_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
-        common_kwargs["lstm_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
-        common_kwargs["xgboost_diurnal_blend_alpha"] = float(diurnal_blend_alpha)
-
     with output_lock(Path(agent_output_dir) if agent_output_dir else common_kwargs["output_dir"]):
         if run_matrix:
             if not forecast_starts:
@@ -382,12 +353,14 @@ def main(argv: list[str] | None = None):
                 experiment_seeds=experiment_seeds,
                 agent_modes=agent_modes,
                 diurnal_blend_alphas=diurnal_blend_alphas,
+                **backend_blend_alphas,
                 **common_kwargs,
             )
         else:
             outputs = run_pipeline(
-                forecast_start=forecast_starts[0] if forecast_starts else None,
-                forecast_model=forecast_models[0],
+                forecast_origin=forecast_starts[0] if forecast_starts else None,
+                backend=forecast_models[0],
+                diurnal_blend_alpha=effective_blend_alphas[forecast_models[0]][0],
                 **common_kwargs,
             )
     print("Generated outputs:")

@@ -1,16 +1,17 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
 
-from config import normalize_forecast_model_name
+from config import CALIBRATION_METHOD, normalize_forecast_model_name
 
 
 _TIMESFM_MODEL_CACHE: dict[tuple[str, int, int], Any] = {}
 _CHRONOS_MODEL_CACHE: dict[tuple[str, str], Any] = {}
 DEFAULT_TIMESFM_EXOG_COLS = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
+KNOWN_FUTURE_COVARIATES = frozenset([*DEFAULT_TIMESFM_EXOG_COLS, "hour", "occupancy"])
 ENERGY_PRICE_FALLBACK_ELASTICITY = 0.1
 ENERGY_PRICE_ADJUSTMENT_MAX_RATIO = 0.3
 ENERGY_PRICE_RESPONSE_MIN_OBS = 12
@@ -47,36 +48,27 @@ def forecast_zone(
     occupancy: pd.DataFrame,
     weather: pd.DataFrame,
     profile: dict[str, Any],
-    forecast_start: pd.Timestamp | None,
-    horizon_days: int,
-    history_days: int,
-    validation_days: int = 1,
-    forecast_model: str = "timesfm",
+    forecast_origin: pd.Timestamp | None,
+    horizon_days: int = 1,
+    history_days: int = 30,
+    validation_days: int = 5,
+    backend: str = "timesfm",
+    diurnal_blend_alpha: float = 0.0,
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch",
     timesfm_context_hours: int = 168,
-    timesfm_step_horizon: int = 24,
     timesfm_exog_cols: list[str] | None = None,
-    timesfm_diurnal_blend_alpha: float = 1.0,
-    timesfm_roll_actuals: bool = False,
-    ar_diurnal_blend_alpha: float = 0.0,
     chronos_repo: str = "amazon/chronos-2",
     chronos_context_hours: int = 512,
-    chronos_step_horizon: int = 24,
     chronos_exog_cols: list[str] | None = None,
-    chronos_diurnal_blend_alpha: float = 0.0,
     chronos_device: str = "auto",
-    chronos_roll_actuals: bool = False,
     lstm_context_hours: int = 24,
-    lstm_step_horizon: int = 24,
     lstm_exog_cols: list[str] | None = None,
     lstm_hidden_size: int = 64,
     lstm_num_layers: int = 1,
     lstm_epochs: int = 50,
     lstm_learning_rate: float = 0.001,
     lstm_batch_size: int = 32,
-    lstm_diurnal_blend_alpha: float = 0.0,
     lstm_device: str = "auto",
-    lstm_roll_actuals: bool = False,
     lstm_seed: int = 42,
     xgboost_lags: list[int] | None = None,
     xgboost_exog_cols: list[str] | None = None,
@@ -86,66 +78,61 @@ def forecast_zone(
     xgboost_colsample_bytree: float = 0.9,
     xgboost_tree_method: str = "approx",
     xgboost_n_jobs: int = 1,
-    xgboost_diurnal_blend_alpha: float = 0.0,
     xgboost_seed: int = 42,
 ) -> ForecastResult:
+    for name, value, minimum in (("history_days", history_days, 1), ("validation_days", validation_days, 0), ("horizon_days", horizon_days, 1)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            raise ValueError(f"{name} must be an integer >= {minimum}")
     zone_id = str(zone_id)
-    normalized_model = normalize_forecast_model_name(forecast_model)
+    normalized_model = normalize_forecast_model_name(backend)
     if normalized_model == "xgboost":
         from xgboost_forecaster import DEFAULT_XGBOOST_LAGS
 
         xgboost_lags = list(DEFAULT_XGBOOST_LAGS if xgboost_lags is None else xgboost_lags)
         xgboost_exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if xgboost_exog_cols is None else xgboost_exog_cols)
     horizon_hours = horizon_days * 24
-    if forecast_start is None:
-        forecast_start = load["time"].max() - pd.Timedelta(hours=horizon_hours - 1)
-    forecast_start = pd.Timestamp(forecast_start)
-    forecast_end = forecast_start + pd.Timedelta(hours=horizon_hours - 1)
+    if forecast_origin is None:
+        forecast_origin = load["time"].max() - pd.Timedelta(hours=horizon_hours - 1)
+    forecast_origin = pd.Timestamp(forecast_origin)
+    forecast_end = forecast_origin + pd.Timedelta(hours=horizon_hours - 1)
     validation_hours = max(0, int(validation_days) * 24)
-    validation_start = forecast_start - pd.Timedelta(hours=validation_hours) if validation_hours else forecast_start
-    validation_end = forecast_start - pd.Timedelta(hours=1)
+    validation_start = forecast_origin - pd.Timedelta(hours=validation_hours) if validation_hours else forecast_origin
+    validation_end = forecast_origin - pd.Timedelta(hours=1)
     history_start = validation_start - pd.Timedelta(days=history_days)
     history_end = validation_start - pd.Timedelta(hours=1)
 
     zone_frame = build_zone_model_frame(load, service_price, energy_price, occupancy, weather, zone_id)
     history = zone_frame[(zone_frame["time"] >= history_start) & (zone_frame["time"] <= history_end)]
     validation = zone_frame[(zone_frame["time"] >= validation_start) & (zone_frame["time"] <= validation_end)]
-    forecast_features = zone_frame[(zone_frame["time"] >= forecast_start) & (zone_frame["time"] <= forecast_end)].copy()
-    if len(history) < 24:
-        raise ValueError(f"Not enough history for zone {zone_id}: found {len(history)} hours")
+    forecast_features = zone_frame[(zone_frame["time"] >= forecast_origin) & (zone_frame["time"] <= forecast_end)].copy()
+    if len(history) != history_days * 24 or len(validation) != validation_hours:
+        raise ValueError(f"Zone {zone_id} requires complete history and validation windows")
+    future_times = pd.date_range(forecast_origin, periods=horizon_hours, freq="h")
+    forecast_features = forecast_features.set_index("time").reindex(future_times).rename_axis("time").reset_index()
 
     hourly = forecast_load(
         history,
         validation,
         zone_frame,
-        forecast_start,
+        forecast_origin,
         horizon_hours,
-        model_name=forecast_model,
+        backend=backend,
+        diurnal_blend_alpha=diurnal_blend_alpha,
         timesfm_repo=timesfm_repo,
         timesfm_context_hours=timesfm_context_hours,
-        timesfm_step_horizon=timesfm_step_horizon,
         timesfm_exog_cols=timesfm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS,
-        timesfm_diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-        timesfm_roll_actuals=timesfm_roll_actuals,
-        ar_diurnal_blend_alpha=ar_diurnal_blend_alpha,
         chronos_repo=chronos_repo,
         chronos_context_hours=chronos_context_hours,
-        chronos_step_horizon=chronos_step_horizon,
         chronos_exog_cols=chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS,
-        chronos_diurnal_blend_alpha=chronos_diurnal_blend_alpha,
         chronos_device=chronos_device,
-        chronos_roll_actuals=chronos_roll_actuals,
         lstm_context_hours=lstm_context_hours,
-        lstm_step_horizon=lstm_step_horizon,
         lstm_exog_cols=lstm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS,
         lstm_hidden_size=lstm_hidden_size,
         lstm_num_layers=lstm_num_layers,
         lstm_epochs=lstm_epochs,
         lstm_learning_rate=lstm_learning_rate,
         lstm_batch_size=lstm_batch_size,
-        lstm_diurnal_blend_alpha=lstm_diurnal_blend_alpha,
         lstm_device=lstm_device,
-        lstm_roll_actuals=lstm_roll_actuals,
         lstm_seed=lstm_seed,
         xgboost_lags=xgboost_lags,
         xgboost_exog_cols=xgboost_exog_cols,
@@ -155,7 +142,6 @@ def forecast_zone(
         xgboost_colsample_bytree=xgboost_colsample_bytree,
         xgboost_tree_method=xgboost_tree_method,
         xgboost_n_jobs=xgboost_n_jobs,
-        xgboost_diurnal_blend_alpha=xgboost_diurnal_blend_alpha,
         xgboost_seed=xgboost_seed,
     )
     forecast_attrs = dict(hourly.attrs)
@@ -184,7 +170,7 @@ def forecast_zone(
         **summarize_price(service_price, zone_id, history_start, forecast_end, "service"),
         **summarize_price(energy_price, zone_id, history_start, forecast_end, "energy"),
     }
-    weather_summary = summarize_weather(weather, forecast_start, forecast_end)
+    weather_summary = summarize_weather(weather, forecast_origin, forecast_end)
     occupancy_summary = summarize_occupancy(occupancy, zone_id, history_start, forecast_end)
     capacity = float(profile.get("capacity_kw_proxy", 0.0) or 0.0)
     forecast_total = float(hourly["predicted_kwh"].sum())
@@ -197,14 +183,6 @@ def forecast_zone(
 
     peak_capacity_ratio = forecast_peak / capacity if capacity > 0 else 0.0
     stress_level = str(profile.get("grid_stress_level") or "Low")
-    active_diurnal_blend_alpha = {
-        "timesfm": timesfm_diurnal_blend_alpha,
-        "AR": ar_diurnal_blend_alpha,
-        "chronos": chronos_diurnal_blend_alpha,
-        "lstm": lstm_diurnal_blend_alpha,
-        "xgboost": xgboost_diurnal_blend_alpha,
-    }.get(normalized_model)
-
     summary = {
         "zone_id": zone_id,
         "category": category,
@@ -212,39 +190,31 @@ def forecast_zone(
         "history_end": history_end.isoformat(),
         "validation_start": validation_start.isoformat() if validation_hours else None,
         "validation_end": validation_end.isoformat() if validation_hours else None,
-        "forecast_start": forecast_start.isoformat(),
+        "forecast_origin": forecast_origin.isoformat(),
         "forecast_end": forecast_end.isoformat(),
         "forecast_horizon_days": int(horizon_days),
         "forecast_horizon_hours": int(horizon_hours),
-        "forecast_model": normalized_model,
-        "diurnal_blend_alpha": round(float(active_diurnal_blend_alpha), 4)
-        if active_diurnal_blend_alpha is not None
-        else None,
+        "backend": normalized_model,
+        "diurnal_blend_alpha": float(diurnal_blend_alpha),
+        "calibration_method": CALIBRATION_METHOD,
+        "timesfm_repo": timesfm_repo if normalized_model == "timesfm" else None,
+        "timesfm_context_hours": int(timesfm_context_hours) if normalized_model == "timesfm" else None,
         "timesfm_covariates": (timesfm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS) if normalized_model == "timesfm" else None,
-        "timesfm_diurnal_blend_alpha": round(float(timesfm_diurnal_blend_alpha), 4) if normalized_model == "timesfm" else None,
-        "timesfm_roll_actuals": bool(timesfm_roll_actuals) if normalized_model == "timesfm" else None,
-        "ar_diurnal_blend_alpha": round(float(ar_diurnal_blend_alpha), 4) if normalized_model == "AR" else None,
         "chronos_repo": chronos_repo if normalized_model.startswith("chronos") else None,
         "chronos_context_hours": int(chronos_context_hours) if normalized_model.startswith("chronos") else None,
-        "chronos_step_horizon": int(chronos_step_horizon) if normalized_model.startswith("chronos") else None,
         "chronos_covariates": (chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS)
         if normalized_model.startswith("chronos")
         else None,
-        "chronos_diurnal_blend_alpha": round(float(chronos_diurnal_blend_alpha), 4) if normalized_model.startswith("chronos") else None,
         "chronos_device": chronos_device if normalized_model.startswith("chronos") else None,
-        "chronos_roll_actuals": bool(chronos_roll_actuals) if normalized_model.startswith("chronos") else None,
         "energy_price_adjustment": forecast_attrs.get("energy_price_adjustment"),
         "lstm_context_hours": int(lstm_context_hours) if normalized_model == "lstm" else None,
-        "lstm_step_horizon": int(lstm_step_horizon) if normalized_model == "lstm" else None,
         "lstm_exog_cols": (lstm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS) if normalized_model == "lstm" else None,
         "lstm_hidden_size": int(lstm_hidden_size) if normalized_model == "lstm" else None,
         "lstm_num_layers": int(lstm_num_layers) if normalized_model == "lstm" else None,
         "lstm_epochs": int(lstm_epochs) if normalized_model == "lstm" else None,
         "lstm_learning_rate": float(lstm_learning_rate) if normalized_model == "lstm" else None,
         "lstm_batch_size": int(lstm_batch_size) if normalized_model == "lstm" else None,
-        "lstm_diurnal_blend_alpha": round(float(lstm_diurnal_blend_alpha), 4) if normalized_model == "lstm" else None,
         "lstm_device": lstm_device if normalized_model == "lstm" else None,
-        "lstm_roll_actuals": bool(lstm_roll_actuals) if normalized_model == "lstm" else None,
         "lstm_seed": int(lstm_seed) if normalized_model == "lstm" else None,
         "xgboost_lags": xgboost_lags if normalized_model == "xgboost" else None,
         "xgboost_exog_cols": xgboost_exog_cols if normalized_model == "xgboost" else None,
@@ -254,7 +224,6 @@ def forecast_zone(
         "xgboost_colsample_bytree": xgboost_colsample_bytree if normalized_model == "xgboost" else None,
         "xgboost_tree_method": xgboost_tree_method if normalized_model == "xgboost" else None,
         "xgboost_n_jobs": xgboost_n_jobs if normalized_model == "xgboost" else None,
-        "xgboost_diurnal_blend_alpha": xgboost_diurnal_blend_alpha if normalized_model == "xgboost" else None,
         "xgboost_seed": xgboost_seed if normalized_model == "xgboost" else None,
         "calibration": forecast_attrs.get("calibration"),
         "forecast_total_kwh": round(forecast_total, 2),
@@ -279,11 +248,16 @@ def forecast_zone(
         "hourly_shape": hourly_shape(history),
         "metrics": metrics,
     }
-    known_future = forecast_features.drop(columns=["actual_kwh"], errors="ignore").copy()
+    summary = {
+        key: value for key, value in summary.items()
+        if not key.startswith(("timesfm_", "chronos_", "lstm_", "xgboost_", "ar_"))
+        or key.startswith(normalized_model.lower() + "_")
+    }
+    known_future = forecast_features.drop(columns=["actual_kwh", "load"], errors="ignore").copy()
     reusable_forecaster = {
         "zone": zone_id,
         "backend": normalized_model,
-        "forecast_start": forecast_start.isoformat(),
+        "forecast_origin": forecast_origin.isoformat(),
         "horizon_hours": int(horizon_hours),
         "history": history.copy(),
         "validation": validation.copy(),
@@ -291,25 +265,18 @@ def forecast_zone(
         "forecast_parameters": {
             "timesfm_repo": timesfm_repo,
             "timesfm_context_hours": int(timesfm_context_hours),
-            "timesfm_step_horizon": int(timesfm_step_horizon),
             "timesfm_exog_cols": list(timesfm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS),
-            "timesfm_diurnal_blend_alpha": float(timesfm_diurnal_blend_alpha),
-            "ar_diurnal_blend_alpha": float(ar_diurnal_blend_alpha),
             "chronos_repo": chronos_repo,
             "chronos_context_hours": int(chronos_context_hours),
-            "chronos_step_horizon": int(chronos_step_horizon),
             "chronos_exog_cols": list(chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS),
-            "chronos_diurnal_blend_alpha": float(chronos_diurnal_blend_alpha),
             "chronos_device": chronos_device,
             "lstm_context_hours": int(lstm_context_hours),
-            "lstm_step_horizon": int(lstm_step_horizon),
             "lstm_exog_cols": list(lstm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS),
             "lstm_hidden_size": int(lstm_hidden_size),
             "lstm_num_layers": int(lstm_num_layers),
             "lstm_epochs": int(lstm_epochs),
             "lstm_learning_rate": float(lstm_learning_rate),
             "lstm_batch_size": int(lstm_batch_size),
-            "lstm_diurnal_blend_alpha": float(lstm_diurnal_blend_alpha),
             "lstm_device": lstm_device,
             "lstm_seed": int(lstm_seed),
             "xgboost_lags": xgboost_lags,
@@ -320,11 +287,17 @@ def forecast_zone(
             "xgboost_colsample_bytree": xgboost_colsample_bytree,
             "xgboost_tree_method": xgboost_tree_method,
             "xgboost_n_jobs": xgboost_n_jobs,
-            "xgboost_diurnal_blend_alpha": xgboost_diurnal_blend_alpha,
             "xgboost_seed": xgboost_seed,
         },
         "fitted_state": forecast_attrs.get("reusable_forecaster_state"),
     }
+    reusable_forecaster["forecast_parameters"] = {
+        key: value for key, value in reusable_forecaster["forecast_parameters"].items()
+        if key.startswith(normalized_model.lower() + "_")
+    }
+    reusable_forecaster["forecast_parameters"].update(
+        diurnal_blend_alpha=float(diurnal_blend_alpha), calibration_method=CALIBRATION_METHOD,
+    )
     return ForecastResult(
         hourly=hourly,
         summary=summary,
@@ -336,601 +309,249 @@ def forecast_load(
     history: pd.DataFrame,
     validation: pd.DataFrame,
     full_frame: pd.DataFrame,
-    forecast_start: pd.Timestamp,
+    forecast_origin: pd.Timestamp,
     horizon_hours: int,
     *,
-    model_name: str,
-    timesfm_repo: str,
-    timesfm_context_hours: int,
-    timesfm_step_horizon: int,
-    timesfm_exog_cols: list[str],
-    timesfm_diurnal_blend_alpha: float,
-    timesfm_roll_actuals: bool,
-    ar_diurnal_blend_alpha: float,
-    chronos_repo: str,
-    chronos_context_hours: int,
-    chronos_step_horizon: int,
-    chronos_exog_cols: list[str],
-    chronos_diurnal_blend_alpha: float,
-    chronos_device: str,
-    chronos_roll_actuals: bool,
-    lstm_context_hours: int,
-    lstm_step_horizon: int,
-    lstm_exog_cols: list[str],
-    lstm_hidden_size: int,
-    lstm_num_layers: int,
-    lstm_epochs: int,
-    lstm_learning_rate: float,
-    lstm_batch_size: int,
-    lstm_diurnal_blend_alpha: float,
-    lstm_device: str,
-    lstm_roll_actuals: bool,
-    lstm_seed: int,
+    backend: str,
+    diurnal_blend_alpha: float = 0.0,
+    timesfm_repo: str = 'google/timesfm-2.5-200m-pytorch',
+    timesfm_context_hours: int = 168,
+    timesfm_exog_cols: list[str] | None = None,
+    chronos_repo: str = 'amazon/chronos-2',
+    chronos_context_hours: int = 512,
+    chronos_exog_cols: list[str] | None = None,
+    chronos_device: str = 'auto',
+    lstm_context_hours: int = 24,
+    lstm_exog_cols: list[str] | None = None,
+    lstm_hidden_size: int = 64,
+    lstm_num_layers: int = 1,
+    lstm_epochs: int = 50,
+    lstm_learning_rate: float = 0.001,
+    lstm_batch_size: int = 32,
+    lstm_device: str = 'auto',
+    lstm_seed: int = 42,
     xgboost_lags: list[int] | None = None,
     xgboost_exog_cols: list[str] | None = None,
     xgboost_n_estimators: int = 300,
     xgboost_max_depth: int = 9,
     xgboost_learning_rate: float = 0.1,
     xgboost_colsample_bytree: float = 0.9,
-    xgboost_tree_method: str = "approx",
+    xgboost_tree_method: str = 'approx',
     xgboost_n_jobs: int = 1,
-    xgboost_diurnal_blend_alpha: float = 0.0,
     xgboost_seed: int = 42,
     fitted_state: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
-    normalized = normalize_forecast_model_name(model_name)
-    if normalized == "AR":
-        return ar_forecast(
-            history,
-            forecast_start,
-            horizon_hours,
-            validation=validation,
-            full_frame=full_frame,
-            diurnal_blend_alpha=ar_diurnal_blend_alpha,
-            fitted_state=fitted_state,
-        )
-    if normalized == "timesfm":
-        return timesfm_forecast(
-            history,
-            validation,
-            full_frame,
-            forecast_start,
-            horizon_hours,
-            repo=timesfm_repo,
-            context_hours=timesfm_context_hours,
-            step_horizon=timesfm_step_horizon,
-            exog_cols=timesfm_exog_cols,
-            diurnal_blend_alpha=timesfm_diurnal_blend_alpha,
-            roll_actuals=timesfm_roll_actuals,
-            fitted_state=fitted_state,
-        )
-    if normalized in {"chronos"}:
-        return chronos_forecast(
-            history,
-            validation,
-            full_frame,
-            forecast_start,
-            horizon_hours,
-            repo=chronos_repo,
-            context_hours=chronos_context_hours,
-            step_horizon=chronos_step_horizon,
-            exog_cols=chronos_exog_cols,
-            diurnal_blend_alpha=chronos_diurnal_blend_alpha,
-            device=chronos_device,
-            roll_actuals=chronos_roll_actuals,
-            fitted_state=fitted_state,
-        )
-    if normalized == "lstm":
-        return lstm_forecast(
-            history,
-            validation,
-            full_frame,
-            forecast_start,
-            horizon_hours,
-            context_hours=lstm_context_hours,
-            step_horizon=lstm_step_horizon,
-            exog_cols=lstm_exog_cols,
-            hidden_size=lstm_hidden_size,
-            num_layers=lstm_num_layers,
-            epochs=lstm_epochs,
-            learning_rate=lstm_learning_rate,
-            batch_size=lstm_batch_size,
-            diurnal_blend_alpha=lstm_diurnal_blend_alpha,
-            device=lstm_device,
-            roll_actuals=lstm_roll_actuals,
-            seed=lstm_seed,
-            fitted_state=fitted_state,
-        )
-    if normalized == "xgboost":
-        from xgboost_forecaster import xgboost_forecast
+    """Fit once, calibrate daily forecasts, then forecast without future observations."""
+    parameters = {name: value for name, value in locals().copy().items()
+                  if name.startswith(("timesfm_", "chronos_", "lstm_", "xgboost_"))}
+    backend = normalize_forecast_model_name(backend)
+    if backend not in {"timesfm", "chronos", "lstm", "xgboost", "AR"}:
+        raise ValueError(f"Unsupported backend: {backend}")
+    if isinstance(horizon_hours, bool) or not isinstance(horizon_hours, (int, np.integer)) or horizon_hours < 1:
+        raise ValueError("horizon_hours must be a positive integer")
+    alpha = float(diurnal_blend_alpha)
+    if not np.isfinite(alpha) or not 0 <= alpha <= 1:
+        raise ValueError("diurnal_blend_alpha must be finite and between 0 and 1")
+    origin = pd.Timestamp(forecast_origin)
+    if pd.isna(origin) or origin != origin.floor("h"):
+        raise ValueError("forecast_origin must be a valid whole-hour timestamp")
+    history = checked_hourly_history(history, "history")
+    validation = checked_hourly_history(validation, "validation", allow_empty=True)
+    history_hours = len(history)
+    if history_hours < 24:
+        raise ValueError("Forecasting requires at least 24 historical hours")
+    if len(validation) % 24:
+        raise ValueError("validation must contain complete 24-hour days")
+    past = pd.concat([history, validation], ignore_index=True)
+    expected_past = pd.date_range(end=origin - pd.Timedelta(hours=1), periods=len(past), freq="h")
+    if not pd.DatetimeIndex(past["time"]).equals(expected_past):
+        raise ValueError("history and validation must be consecutive hourly rows ending before forecast_origin")
+    future_times = pd.date_range(origin, periods=horizon_hours, freq="h")
+    future_source = full_frame.copy()
+    future_source["time"] = pd.to_datetime(future_source["time"])
+    if future_source["time"].duplicated().any():
+        raise ValueError("Forecast covariates contain duplicate timestamps")
+    # Actuals may exist for evaluation but must never reach a backend's future features.
+    future = (future_source.drop(columns=["actual_kwh", "load"], errors="ignore")
+              .set_index("time").reindex(future_times).rename_axis("time").reset_index())
 
-        return xgboost_forecast(
-            history, validation, full_frame, forecast_start, horizon_hours,
-            lags=xgboost_lags,
-            exog_cols=xgboost_exog_cols,
-            n_estimators=xgboost_n_estimators,
-            max_depth=xgboost_max_depth,
-            learning_rate=xgboost_learning_rate,
-            colsample_bytree=xgboost_colsample_bytree,
-            tree_method=xgboost_tree_method,
-            n_jobs=xgboost_n_jobs,
-            diurnal_blend_alpha=xgboost_diurnal_blend_alpha,
-            seed=xgboost_seed,
-            fitted_state=fitted_state,
-        )
-    raise ValueError(f"Unsupported forecast_model: {model_name}")
-
-
-def forecast_chunks(
-    full_frame: pd.DataFrame,
-    forecast_start: pd.Timestamp,
-    horizon_hours: int,
-    step: int,
-) -> Iterator[tuple[int, pd.DatetimeIndex, pd.DataFrame]]:
-    """Yield aligned forecast chunks, building the shared time index only once."""
-    if horizon_hours <= 0:
-        return
-    indexed = full_frame.set_index("time")
-    remaining, offset = horizon_hours, 0
-    while remaining > 0:
-        size = min(step, remaining)
-        times = pd.date_range(forecast_start + pd.Timedelta(hours=offset), periods=size, freq="h")
-        frame = indexed.reindex(times).rename_axis("time").reset_index()
-        yield size, times, frame
-        remaining -= size
-        offset += size
-
-
-def timesfm_forecast(
-    history: pd.DataFrame,
-    validation: pd.DataFrame,
-    full_frame: pd.DataFrame,
-    forecast_start: pd.Timestamp,
-    horizon_hours: int,
-    *,
-    repo: str,
-    context_hours: int,
-    step_horizon: int,
-    exog_cols: list[str],
-    diurnal_blend_alpha: float,
-    roll_actuals: bool,
-    fitted_state: dict[str, Any] | None = None,
-) -> pd.DataFrame:
-    step = max(1, int(step_horizon))
-    compile_horizon = max(step, 32)
-    model = load_timesfm_model(repo, context_hours, compile_horizon)
     if fitted_state is not None:
-        require_fitted_backend(fitted_state, "timesfm")
-        rolling_load = state_vector(fitted_state, "rolling_load")
-        rolling_exog = state_matrix(
-            fitted_state,
-            "rolling_exog",
-            len(exog_cols),
-            row_count=len(rolling_load),
-        )
-        diurnal_by_hour = state_diurnal_profile(fitted_state)
-        bias_vec = align_vector(state_vector(fitted_state, "bias_vec"), step)
-        calibration = dict(fitted_state.get("calibration") or {})
+        require_fitted_backend(fitted_state, backend)
+        if (fitted_state.get("calibration", {}).get("method") != CALIBRATION_METHOD
+                or pd.Timestamp(fitted_state.get("forecast_origin")) != origin
+                or fitted_state.get("history_hours") != history_hours
+                or fitted_state.get("diurnal_blend_alpha") != alpha):
+            raise ValueError("Reusable forecaster state does not match the origin, history, alpha or calibration protocol")
+        bias = state_vector(fitted_state, "bias_vec")
+        if bias.shape != (24,) or not np.isfinite(bias).all():
+            raise ValueError("Reusable bias_vec must contain 24 finite hourly values")
+        diurnal = state_diurnal_profile(fitted_state)
+        calibration = dict(fitted_state["calibration"])
     else:
-        context_load = history["actual_kwh"].astype(float).to_numpy(dtype=np.float64)
-        if len(context_load) == 0:
-            raise ValueError("TimesFM requires at least one historical value")
-        rolling_load = context_load.copy()
-        rolling_exog = build_exog_matrix(history, exog_cols)
-        diurnal_by_hour = build_diurnal_profile(history)
-        calibration = disabled_calibration()
-        bias_vec = np.zeros(step, dtype=np.float64)
-        if not validation.empty:
-            val_horizon = min(step, len(validation))
-            val_exog = align_exog(build_exog_matrix(validation, exog_cols), step)
-            val_raw, _, _ = run_timesfm_prediction(
-                model,
-                rolling_load,
-                rolling_exog,
-                val_exog,
-                step,
-                context_hours,
-                exog_cols,
-            )
-            val_times = pd.to_datetime(validation["time"].iloc[:val_horizon])
-            val_blended = blend_with_diurnal(
-                val_raw[:val_horizon],
-                diurnal_for_times(val_times, diurnal_by_hour),
-                diurnal_blend_alpha,
-            )
-            val_actual = validation["actual_kwh"].astype(float).to_numpy(dtype=np.float64)[
-                :val_horizon
-            ]
-            bias_vec = align_vector(val_blended - val_actual, step)
-            val_cmp = pd.DataFrame({"actual_kwh": val_actual, "predicted_kwh": val_blended})
-            calibration = {
-                "enabled": True,
-                "bias_mean": round(float(np.nanmean(bias_vec)), 4),
-                "bias_max_abs": round(float(np.nanmax(np.abs(bias_vec))), 4),
-                "metrics": compute_forecast_metrics(val_cmp),
-            }
-            rolling_load = np.concatenate(
-                [
-                    rolling_load,
-                    validation["actual_kwh"].astype(float).to_numpy(dtype=np.float64),
-                ]
-            )
-            rolling_exog = np.vstack(
-                [rolling_exog, build_exog_matrix(validation, exog_cols)]
-            )
+        diurnal = build_diurnal_profile(history)
+        bias = np.zeros(24, dtype=np.float64)
 
-    fitted_rolling_load = rolling_load.copy()
-    fitted_rolling_exog = rolling_exog.copy()
+    predict_raw, model_state = prepare_forecast_backend(
+        backend, history, parameters, max(24, int(horizon_hours)), fitted_state=fitted_state,
+    )
+    if fitted_state is None:
+        validation_rows: list[dict[str, Any]] = []
+        residual_days = []
+        for day, offset in enumerate(range(0, len(validation), 24)):
+            day_frame = validation.iloc[offset:offset + 24].copy()
+            context = pd.concat([history, validation.iloc[:offset]], ignore_index=True).tail(history_hours)
+            raw_frame = predict_raw(context, day_frame.drop(columns=["actual_kwh", "load"], errors="ignore"))
+            raw = checked_raw_prediction(raw_frame, day_frame["time"])
+            blended = blend_with_diurnal(raw, diurnal_for_times(day_frame["time"], diurnal), alpha)
+            actual = day_frame["actual_kwh"].to_numpy(dtype=np.float64)
+            residual = blended - actual
+            residual_days.append(residual)
+            for hour, timestamp in enumerate(day_frame["time"]):
+                validation_rows.append({
+                    "time": pd.Timestamp(timestamp).isoformat(), "validation_day": day + 1,
+                    "horizon_offset": hour, "raw_predicted_kwh": float(raw[hour]),
+                    "blended_predicted_kwh": float(blended[hour]), "actual_kwh": float(actual[hour]),
+                    "residual_kwh": float(residual[hour]),
+                })
+        days = len(residual_days)
+        half_width = np.nan
+        metrics = None
+        if days:
+            residual_matrix = np.asarray(residual_days, dtype=np.float64)
+            bias = residual_matrix.mean(axis=0)
+            # All validation days contribute, after the same hourly mean correction.
+            half_width = estimate_interval_half_width((residual_matrix - bias).ravel())
+            comparison = pd.DataFrame(validation_rows).rename(columns={"blended_predicted_kwh": "predicted_kwh"})
+            metrics = compute_forecast_metrics(comparison)
+        calibration = {
+            "method": CALIBRATION_METHOD, "enabled": bool(days), "validation_days": days,
+            "bias_by_hour": bias.tolist(), "samples_per_hour": [days] * 24,
+            "bias_mean": float(bias.mean()), "bias_max_abs": float(np.max(np.abs(bias))),
+            "interval_half_width": float(half_width) if np.isfinite(half_width) else None,
+            "metrics": metrics, "validation_predictions": validation_rows,
+        }
+        fitted_state = {
+            **model_state, "backend": backend, "forecast_origin": origin.isoformat(),
+            "history_hours": history_hours, "diurnal_blend_alpha": alpha,
+            "diurnal_by_hour": serialize_diurnal_profile(diurnal),
+            "bias_vec": bias.tolist(), "calibration": calibration,
+        }
 
-    rows: list[pd.DataFrame] = []
-    for chunk_horizon, chunk_times, chunk_frame in forecast_chunks(
-        full_frame, forecast_start, horizon_hours, step
-    ):
-        chunk_exog = align_exog(build_exog_matrix(chunk_frame, exog_cols), chunk_horizon)
-        raw, q10, q90 = run_timesfm_prediction(
-            model,
-            rolling_load,
-            rolling_exog,
-            chunk_exog,
-            chunk_horizon,
-            context_hours,
-            exog_cols,
-        )
-        raw_point = raw[:chunk_horizon]
-        raw_q10 = q10[:chunk_horizon]
-        raw_q90 = q90[:chunk_horizon]
-        bias = align_vector(bias_vec, chunk_horizon)
-        bias_corrected = np.clip(raw_point - bias, 0, None)
-        point = blend_with_diurnal(
-            bias_corrected,
-            diurnal_for_times(chunk_times, diurnal_by_hour),
-            diurnal_blend_alpha,
-        )
-        q10, q90 = rebuild_quantile_interval(point, raw_q10, raw_q90)
-
-        rows.append(
-            pd.DataFrame(
-                {
-                    "time": chunk_times,
-                    "raw_predicted_kwh": raw_point,
-                    "bias_corrected_kwh": bias_corrected,
-                    "predicted_kwh": point,
-                    "q10_kwh": q10,
-                    "q50_kwh": point,
-                    "q90_kwh": q90,
-                }
-            )
-        )
-
-        actual_chunk = chunk_frame.get("actual_kwh")
-        if roll_actuals and actual_chunk is not None and actual_chunk.notna().all():
-            roll_values = actual_chunk.astype(float).to_numpy(dtype=np.float64)
-        else:
-            roll_values = point
-        rolling_load = np.concatenate([rolling_load, roll_values])
-        rolling_exog = np.vstack([rolling_exog, chunk_exog])
-
-    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["time", "predicted_kwh"])
+    result = predict_raw(past.tail(history_hours), future).copy()
+    raw = checked_raw_prediction(result, future_times)
+    blended = blend_with_diurnal(raw, diurnal_for_times(future_times, diurnal), alpha)
+    hourly_bias = bias[np.arange(horizon_hours) % 24]
+    point = np.clip(blended - hourly_bias, 0, None)
+    width = calibration.get("interval_half_width")
+    residual_q10, residual_q90 = deterministic_interval(point, np.nan if width is None else float(width))
+    if "q10_kwh" in result and "q90_kwh" in result:
+        q10, q90 = rebuild_quantile_interval(point, result["q10_kwh"], result["q90_kwh"])
+        available = np.isfinite(q10) & np.isfinite(q90)
+        q10, q90 = np.where(available, q10, residual_q10), np.where(available, q90, residual_q90)
+    else:
+        q10, q90 = residual_q10, residual_q90
+    result["raw_predicted_kwh"] = raw
+    result["blended_predicted_kwh"] = blended
+    result["bias_kwh"] = hourly_bias
+    result["bias_corrected_kwh"] = point
+    result["predicted_kwh"] = point
+    result["q10_kwh"], result["q50_kwh"], result["q90_kwh"] = q10, point, q90
     result.attrs["calibration"] = calibration
-    result.attrs["reusable_forecaster_state"] = {
-        "backend": "timesfm",
-        "rolling_load": fitted_rolling_load.tolist(),
-        "rolling_exog": fitted_rolling_exog.tolist(),
-        "bias_vec": np.asarray(bias_vec, dtype=np.float64).tolist(),
-        "diurnal_by_hour": serialize_diurnal_profile(diurnal_by_hour),
-        "calibration": calibration,
-    }
+    result.attrs["reusable_forecaster_state"] = fitted_state
     return result
 
 
-def chronos_forecast(
-    history: pd.DataFrame,
-    validation: pd.DataFrame,
-    full_frame: pd.DataFrame,
-    forecast_start: pd.Timestamp,
-    horizon_hours: int,
-    *,
-    repo: str,
-    context_hours: int,
-    step_horizon: int,
-    diurnal_blend_alpha: float,
-    device: str,
-    roll_actuals: bool,
-    exog_cols: list[str] | None = None,
-    fitted_state: dict[str, Any] | None = None,
-) -> pd.DataFrame:
-    step = max(1, int(step_horizon))
-    exog_cols = list(exog_cols or [])
-    pipeline = load_chronos_model(repo, device)
-    if fitted_state is not None:
-        require_fitted_backend(fitted_state, "chronos")
-        rolling_load = state_vector(fitted_state, "rolling_load")
-        rolling_exog = state_matrix(
-            fitted_state,
-            "rolling_exog",
-            len(exog_cols),
-            row_count=len(rolling_load),
-        )
-        diurnal_by_hour = state_diurnal_profile(fitted_state)
-        bias_vec = align_vector(state_vector(fitted_state, "bias_vec"), step)
-        calibration = dict(fitted_state.get("calibration") or {})
-    else:
-        context_load = history["actual_kwh"].astype(float).to_numpy(dtype=np.float64)
-        if len(context_load) == 0:
-            raise ValueError("Chronos requires at least one historical value")
-        rolling_load = context_load.copy()
-        rolling_exog = build_exog_matrix(history, exog_cols)
-        diurnal_by_hour = build_diurnal_profile(history)
-        calibration = disabled_calibration()
-        bias_vec = np.zeros(step, dtype=np.float64)
-        if not validation.empty:
-            val_horizon = min(step, len(validation))
-            val_exog = align_exog(
-                build_exog_matrix(validation.iloc[:val_horizon], exog_cols),
-                val_horizon,
-            )
-            val_raw, _, _ = run_chronos_prediction(
-                pipeline,
-                rolling_load,
-                val_horizon,
-                context_hours,
-                exog_context=rolling_exog,
-                exog_horizon=val_exog,
-                exog_cols=exog_cols,
-            )
-            val_times = pd.to_datetime(validation["time"].iloc[:val_horizon])
-            val_point = blend_with_diurnal(
-                val_raw[:val_horizon],
-                diurnal_for_times(val_times, diurnal_by_hour),
-                diurnal_blend_alpha,
-            )
-            val_actual = validation["actual_kwh"].astype(float).to_numpy(dtype=np.float64)[
-                :val_horizon
-            ]
-            bias_vec = align_vector(val_point - val_actual, step)
-            val_cmp = pd.DataFrame(
-                {"actual_kwh": val_actual, "predicted_kwh": val_point}
-            )
-            calibration = {
-                "enabled": True,
-                "bias_mean": round(float(np.nanmean(bias_vec)), 4),
-                "bias_max_abs": round(float(np.nanmax(np.abs(bias_vec))), 4),
-                "metrics": compute_forecast_metrics(val_cmp),
-            }
-            rolling_load = np.concatenate(
-                [
-                    rolling_load,
-                    validation["actual_kwh"].astype(float).to_numpy(dtype=np.float64),
-                ]
-            )
-            rolling_exog = np.vstack(
-                [rolling_exog, build_exog_matrix(validation, exog_cols)]
-            )
-
-    fitted_rolling_load = rolling_load.copy()
-    fitted_rolling_exog = rolling_exog.copy()
-
-    rows: list[pd.DataFrame] = []
-    for chunk_horizon, chunk_times, chunk_frame in forecast_chunks(
-        full_frame, forecast_start, horizon_hours, step
-    ):
-        chunk_exog = align_exog(build_exog_matrix(chunk_frame, exog_cols), chunk_horizon)
-        raw, raw_q10, raw_q90 = run_chronos_prediction(
-            pipeline,
-            rolling_load,
-            chunk_horizon,
-            context_hours,
-            exog_context=rolling_exog,
-            exog_horizon=chunk_exog,
-            exog_cols=exog_cols,
-        )
-        bias = align_vector(bias_vec, chunk_horizon)
-        bias_corrected = np.clip(raw[:chunk_horizon] - bias, 0, None)
-        point = blend_with_diurnal(
-            bias_corrected,
-            diurnal_for_times(chunk_times, diurnal_by_hour),
-            diurnal_blend_alpha,
-        )
-        q10, q90 = rebuild_quantile_interval(point, raw_q10[:chunk_horizon], raw_q90[:chunk_horizon])
-        rows.append(
-            pd.DataFrame(
-                {
-                    "time": chunk_times,
-                    "raw_predicted_kwh": raw[:chunk_horizon],
-                    "bias_corrected_kwh": bias_corrected,
-                    "predicted_kwh": point,
-                    "q10_kwh": q10,
-                    "q50_kwh": point,
-                    "q90_kwh": q90,
-                }
-            )
-        )
-
-        actual_chunk = chunk_frame.get("actual_kwh")
-        if roll_actuals and actual_chunk is not None and actual_chunk.notna().all():
-            roll_values = actual_chunk.astype(float).to_numpy(dtype=np.float64)
-        else:
-            roll_values = point
-        rolling_load = np.concatenate([rolling_load, roll_values])
-        rolling_exog = np.vstack([rolling_exog, chunk_exog])
-
-    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["time", "predicted_kwh"])
-    result.attrs["calibration"] = calibration
-    result.attrs["chronos_covariates"] = exog_cols
-    result.attrs["reusable_forecaster_state"] = {
-        "backend": "chronos",
-        "rolling_load": fitted_rolling_load.tolist(),
-        "rolling_exog": fitted_rolling_exog.tolist(),
-        "bias_vec": np.asarray(bias_vec, dtype=np.float64).tolist(),
-        "diurnal_by_hour": serialize_diurnal_profile(diurnal_by_hour),
-        "calibration": calibration,
-    }
+def checked_hourly_history(frame: pd.DataFrame, label: str, *, allow_empty: bool = False) -> pd.DataFrame:
+    if frame.empty and allow_empty:
+        return frame.copy()
+    if "time" not in frame or "actual_kwh" not in frame or frame.empty:
+        raise ValueError(f"{label} must contain hourly time and actual_kwh values")
+    result = frame.copy()
+    result["time"] = pd.to_datetime(result["time"])
+    result = result.sort_values("time").reset_index(drop=True)
+    times = pd.DatetimeIndex(result["time"])
+    if times.hasnans or times.has_duplicates or not times.equals(pd.date_range(times[0], periods=len(times), freq="h")):
+        raise ValueError(f"{label} must contain complete consecutive hourly observations")
+    result["actual_kwh"] = pd.to_numeric(result["actual_kwh"], errors="coerce")
+    if not np.isfinite(result["actual_kwh"].to_numpy(dtype=float)).all():
+        raise ValueError(f"{label} load must contain finite observations")
+    if (result["actual_kwh"] < 0).any():
+        raise ValueError(f"{label} load must contain non-negative observations")
     return result
 
 
-def lstm_forecast(
-    history: pd.DataFrame,
-    validation: pd.DataFrame,
-    full_frame: pd.DataFrame,
-    forecast_start: pd.Timestamp,
-    horizon_hours: int,
-    *,
-    context_hours: int,
-    step_horizon: int,
-    exog_cols: list[str],
-    hidden_size: int,
-    num_layers: int,
-    epochs: int,
-    learning_rate: float,
-    batch_size: int,
-    diurnal_blend_alpha: float,
-    device: str,
-    roll_actuals: bool,
-    seed: int,
-    fitted_state: dict[str, Any] | None = None,
-) -> pd.DataFrame:
-    step = max(1, int(step_horizon))
-    if fitted_state is not None:
-        require_fitted_backend(fitted_state, "lstm")
-        raw_bundle = fitted_state.get("lstm_bundle")
-        if not isinstance(raw_bundle, dict):
-            raise ValueError("Reusable LSTM state is missing trained model parameters.")
-        bundle = deserialize_lstm_bundle(raw_bundle, requested_device=device)
-        rolling_load = state_vector(fitted_state, "rolling_load")
-        rolling_exog = state_matrix(
-            fitted_state,
-            "rolling_exog",
-            len(exog_cols) + 4,
-            row_count=len(rolling_load),
-        )
-        diurnal_by_hour = state_diurnal_profile(fitted_state)
-        bias_vec = align_vector(state_vector(fitted_state, "bias_vec"), step)
-        calibration = dict(fitted_state.get("calibration") or {})
-        interval_value = fitted_state.get("interval_half_width")
-        interval_half_width = (
-            float(interval_value) if interval_value is not None else np.nan
-        )
-    else:
-        context_load = history["actual_kwh"].astype(float).to_numpy(dtype=np.float64)
-        if len(context_load) < 2:
-            raise ValueError("LSTM requires at least two historical values")
-        bundle = train_lstm_model(
-            history,
-            context_hours=context_hours,
-            exog_cols=exog_cols,
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            epochs=epochs,
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            device=device,
-            seed=seed,
-        )
-        rolling_load = context_load.copy()
-        rolling_exog = build_lstm_exog_matrix(history, exog_cols)
-        diurnal_by_hour = build_diurnal_profile(history)
-        calibration = disabled_calibration(interval_half_width=None)
-        bias_vec = np.zeros(step, dtype=np.float64)
-        interval_half_width = np.nan
-        if not validation.empty:
-            val_horizon = min(step, len(validation))
-            val_exog = build_lstm_exog_matrix(
-                validation.iloc[:val_horizon], exog_cols
-            )
-            val_raw = run_lstm_prediction(
-                bundle,
-                rolling_load,
-                rolling_exog,
-                val_exog,
-                val_horizon,
-            )
-            val_times = pd.to_datetime(validation["time"].iloc[:val_horizon])
-            val_point = blend_with_diurnal(
-                val_raw[:val_horizon],
-                diurnal_for_times(val_times, diurnal_by_hour),
-                diurnal_blend_alpha,
-            )
-            val_actual = validation["actual_kwh"].astype(float).to_numpy(
-                dtype=np.float64
-            )[:val_horizon]
-            residual = val_point - val_actual
-            bias_vec = align_vector(residual, step)
-            interval_half_width = estimate_interval_half_width(residual)
-            val_cmp = pd.DataFrame(
-                {"actual_kwh": val_actual, "predicted_kwh": val_point}
-            )
-            calibration = {
-                "enabled": True,
-                "bias_mean": round(float(np.nanmean(bias_vec)), 4),
-                "bias_max_abs": round(float(np.nanmax(np.abs(bias_vec))), 4),
-                "interval_half_width": finite_round(interval_half_width, 4),
-                "metrics": compute_forecast_metrics(val_cmp),
-            }
-            rolling_load = np.concatenate(
-                [
-                    rolling_load,
-                    validation["actual_kwh"].astype(float).to_numpy(dtype=np.float64),
-                ]
-            )
-            rolling_exog = np.vstack(
-                [rolling_exog, build_lstm_exog_matrix(validation, exog_cols)]
-            )
+def checked_raw_prediction(frame: pd.DataFrame, times) -> np.ndarray:
+    if len(frame) != len(times) or not pd.DatetimeIndex(frame["time"]).equals(pd.DatetimeIndex(times)):
+        raise ValueError("Backend prediction timestamps do not match the requested horizon")
+    raw = frame["raw_predicted_kwh"].to_numpy(dtype=np.float64)
+    if not np.isfinite(raw).all():
+        raise ValueError("Backend returned non-finite load predictions")
+    return raw
 
-    fitted_rolling_load = rolling_load.copy()
-    fitted_rolling_exog = rolling_exog.copy()
 
-    rows: list[pd.DataFrame] = []
-    for chunk_horizon, chunk_times, chunk_frame in forecast_chunks(
-        full_frame, forecast_start, horizon_hours, step
-    ):
-        chunk_exog = build_lstm_exog_matrix(chunk_frame, exog_cols)
-        raw = run_lstm_prediction(bundle, rolling_load, rolling_exog, chunk_exog, chunk_horizon)
-        bias = align_vector(bias_vec, chunk_horizon)
-        bias_corrected = np.clip(raw[:chunk_horizon] - bias, 0, None)
-        point = blend_with_diurnal(
-            bias_corrected,
-            diurnal_for_times(chunk_times, diurnal_by_hour),
-            diurnal_blend_alpha,
-        )
-        q10, q90 = deterministic_interval(point, interval_half_width)
+def prepare_forecast_backend(
+    backend: str, history: pd.DataFrame, parameters: dict[str, Any], max_horizon: int,
+    *, fitted_state: dict[str, Any] | None = None,
+) -> tuple[Callable[[pd.DataFrame, pd.DataFrame], pd.DataFrame], dict[str, Any]]:
+    """Prepare one frozen model and return an uncalibrated inference callable."""
+    p = parameters
+    state = fitted_state or {}
+    prefix = backend.lower() + "_"
+    cols = p.get(prefix + "exog_cols")
+    exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if cols is None else cols)
+    if set(exog_cols) - KNOWN_FUTURE_COVARIATES:
+        raise ValueError("Forecaster covariates must be known future features, never load or evaluation fields")
 
-        rows.append(
-            pd.DataFrame(
-                {
-                    "time": chunk_times,
-                    "raw_predicted_kwh": raw[:chunk_horizon],
-                    "bias_corrected_kwh": bias_corrected,
-                    "predicted_kwh": point,
-                    "q10_kwh": q10,
-                    "q50_kwh": point,
-                    "q90_kwh": q90,
-                }
+    if backend == "timesfm":
+        context_hours = p["timesfm_context_hours"]
+        model = load_timesfm_model(p["timesfm_repo"], context_hours, max(32, max_horizon))
+        def predict(context, future):
+            raw, q10, q90 = run_timesfm_prediction(
+                model, context["actual_kwh"].to_numpy(dtype=float), build_exog_matrix(context, exog_cols),
+                build_exog_matrix(future, exog_cols), len(future), context_hours, exog_cols,
             )
-        )
-
-        actual_chunk = chunk_frame.get("actual_kwh")
-        if roll_actuals and actual_chunk is not None and actual_chunk.notna().all():
-            roll_values = actual_chunk.astype(float).to_numpy(dtype=np.float64)
+            return pd.DataFrame({"time": future["time"].to_numpy(), "raw_predicted_kwh": raw,
+                                 "q10_kwh": q10, "q90_kwh": q90})
+        return predict, {}
+    if backend == "chronos":
+        context_hours = p["chronos_context_hours"]
+        model = load_chronos_model(p["chronos_repo"], p["chronos_device"])
+        def predict(context, future):
+            raw, q10, q90 = run_chronos_prediction(
+                model, context["actual_kwh"].to_numpy(dtype=float), len(future), context_hours,
+                exog_context=build_exog_matrix(context, exog_cols),
+                exog_horizon=build_exog_matrix(future, exog_cols), exog_cols=exog_cols,
+            )
+            return pd.DataFrame({"time": future["time"].to_numpy(), "raw_predicted_kwh": raw,
+                                 "q10_kwh": q10, "q90_kwh": q90})
+        return predict, {}
+    if backend == "lstm":
+        if fitted_state is None:
+            bundle = train_lstm_model(
+                history, context_hours=p["lstm_context_hours"], exog_cols=exog_cols,
+                hidden_size=p["lstm_hidden_size"], num_layers=p["lstm_num_layers"], epochs=p["lstm_epochs"],
+                learning_rate=p["lstm_learning_rate"], batch_size=p["lstm_batch_size"],
+                device=p["lstm_device"], seed=p["lstm_seed"],
+            )
+            model_state = {"lstm_bundle": serialize_lstm_bundle(bundle)}
         else:
-            roll_values = point
-        rolling_load = np.concatenate([rolling_load, roll_values])
-        rolling_exog = np.vstack([rolling_exog, chunk_exog])
-
-    result = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=["time", "predicted_kwh"])
-    result.attrs["calibration"] = calibration
-    result.attrs["reusable_forecaster_state"] = {
-        "backend": "lstm",
-        "rolling_load": fitted_rolling_load.tolist(),
-        "rolling_exog": fitted_rolling_exog.tolist(),
-        "bias_vec": np.asarray(bias_vec, dtype=np.float64).tolist(),
-        "diurnal_by_hour": serialize_diurnal_profile(diurnal_by_hour),
-        "interval_half_width": (
-            float(interval_half_width) if np.isfinite(interval_half_width) else None
-        ),
-        "calibration": calibration,
-        "lstm_bundle": serialize_lstm_bundle(bundle),
-    }
-    return result
+            bundle = deserialize_lstm_bundle(state["lstm_bundle"], requested_device=p["lstm_device"])
+            model_state = {"lstm_bundle": state["lstm_bundle"]}
+        def predict(context, future):
+            raw = run_lstm_prediction(bundle, context["actual_kwh"].to_numpy(dtype=float),
+                                      build_lstm_exog_matrix(context, exog_cols),
+                                      build_lstm_exog_matrix(future, exog_cols), len(future))
+            return pd.DataFrame({"time": future["time"].to_numpy(), "raw_predicted_kwh": raw})
+        return predict, model_state
+    if backend == "xgboost":
+        from xgboost_forecaster import prepare_xgboost_backend
+        return prepare_xgboost_backend(history, p, fitted_state=fitted_state)
+    if backend == "AR":
+        response = state["energy_price_response"] if fitted_state is not None else estimate_energy_price_response(history)
+        def predict(context, future):
+            return run_ar_prediction(context, future, training_history=history, fitted_response=response)
+        return predict, {"energy_price_response": response}
+    raise ValueError(f"Unsupported backend: {backend}")
 
 
 def load_timesfm_model(repo: str, context_hours: int, max_horizon: int):
@@ -942,7 +563,7 @@ def load_timesfm_model(repo: str, context_hours: int, max_horizon: int):
         from timesfm import ForecastConfig, TimesFM_2p5_200M_torch
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "timesfm is required for forecast_model: timesfm. "
+            "timesfm is required for backend: timesfm. "
             "Install the official google-research/timesfm package and make sure "
             "this Python environment can import it."
         ) from exc
@@ -989,7 +610,7 @@ def load_chronos_model(repo: str, device: str):
         from chronos import Chronos2Pipeline
     except ModuleNotFoundError as exc:
         raise RuntimeError(
-            "chronos-forecasting with Chronos2Pipeline is required for forecast_model: chronos. "
+            "chronos-forecasting with Chronos2Pipeline is required for backend: chronos. "
             "Install it in this Python environment."
         ) from exc
 
@@ -1068,7 +689,7 @@ def run_chronos_prediction(
     try:
         import torch
     except ModuleNotFoundError as exc:
-        raise RuntimeError("torch is required for forecast_model: chronos.") from exc
+        raise RuntimeError("torch is required for backend: chronos.") from exc
 
     ctx = context_load[-context_hours:].astype(np.float32)
     inputs: list[Any]
@@ -1154,7 +775,7 @@ def train_lstm_model(
     try:
         import torch
     except ModuleNotFoundError as exc:
-        raise RuntimeError("torch is required for forecast_model: lstm.") from exc
+        raise RuntimeError("torch is required for backend: lstm.") from exc
 
     load = history["actual_kwh"].astype(float).to_numpy(dtype=np.float64)
     exog = build_lstm_exog_matrix(history, exog_cols)
@@ -1248,7 +869,7 @@ def deserialize_lstm_bundle(
     try:
         import torch
     except ModuleNotFoundError as exc:
-        raise RuntimeError("torch is required for forecast_model: lstm.") from exc
+        raise RuntimeError("torch is required for backend: lstm.") from exc
 
     input_size = int(payload["input_size"])
     hidden_size = int(payload["hidden_size"])
@@ -1658,13 +1279,8 @@ def diurnal_for_times(times: pd.Series | pd.DatetimeIndex, diurnal_by_hour: pd.S
 
 
 def blend_with_diurnal(fc: np.ndarray, diurnal: np.ndarray, alpha: float) -> np.ndarray:
-    alpha = float(np.clip(alpha, 0.0, 1.0))
-    if alpha == 0.0 or len(fc) == 0:
-        return np.clip(fc, 0, None)
-    fc_mean = float(np.nanmean(fc))
-    diurnal_mean = float(np.nanmean(diurnal))
-    scaled = diurnal * (fc_mean / diurnal_mean) if abs(diurnal_mean) > 1e-9 else diurnal
-    return np.clip((1.0 - alpha) * fc + alpha * scaled, 0, None)
+    """Mix once with the frozen training mean curve, without rescaling that curve."""
+    return np.clip((1.0 - alpha) * np.asarray(fc) + alpha * np.asarray(diurnal), 0, None)
 
 
 def add_error_columns(hourly: pd.DataFrame) -> pd.DataFrame:
@@ -1831,18 +1447,12 @@ def apply_energy_price_response_adjustment(
     return adjusted, adjustment, metadata
 
 
-def ar_forecast(
-    history: pd.DataFrame,
-    forecast_start: pd.Timestamp,
-    horizon_hours: int,
-    *,
-    validation: pd.DataFrame | None = None,
-    full_frame: pd.DataFrame | None = None,
-    diurnal_blend_alpha: float = 0.0,
-    fitted_state: dict[str, Any] | None = None,
+def run_ar_prediction(
+    history: pd.DataFrame, future: pd.DataFrame, *, training_history: pd.DataFrame,
+    fitted_response: dict[str, Any],
 ) -> pd.DataFrame:
     hist = history.set_index("time")["actual_kwh"].astype(float).sort_index()
-    target_index = pd.date_range(forecast_start, periods=horizon_hours, freq="h")
+    target_index = pd.DatetimeIndex(future["time"])
     hourly_mean = hist.groupby(hist.index.hour).mean()
     autoregressive_values = hist.reindex(target_index - pd.Timedelta(days=7)).to_numpy()
     fallback = np.array([hourly_mean.loc[t.hour] for t in target_index], dtype=float)
@@ -1852,51 +1462,17 @@ def ar_forecast(
     mean_daily = hist.resample("D").sum().mean()
     trend_scale = 1.0 if mean_daily == 0 or np.isnan(mean_daily) else np.clip(last_24 / mean_daily, 0.75, 1.25)
     predicted = np.maximum(predicted * trend_scale, 0.0)
-    predicted = blend_with_diurnal(
-        predicted,
-        diurnal_for_times(target_index, build_diurnal_profile(history)),
-        diurnal_blend_alpha,
-    )
-    horizon_frame = None
-    if full_frame is not None and "time" in full_frame:
-        horizon_frame = (
-            full_frame.set_index("time")
-            .reindex(target_index)
-            .rename_axis("time")
-            .reset_index()
-        )
-    training_parts = [history]
-    if validation is not None and not validation.empty:
-        training_parts.append(validation)
-    training_frame = pd.concat(training_parts, ignore_index=True)
-    if fitted_state is not None:
-        require_fitted_backend(fitted_state, "AR")
-        fitted_response = fitted_state.get("energy_price_response")
-        if not isinstance(fitted_response, dict):
-            raise ValueError(
-                "Reusable AR state is missing the fitted energy-price response."
-            )
-    else:
-        fitted_response = estimate_energy_price_response(training_frame)
     adjusted, energy_price_adjustment, adjustment_meta = apply_energy_price_response_adjustment(
         predicted,
-        horizon_frame,
-        training_frame,
+        future,
+        training_history,
         fitted_response=fitted_response,
     )
-    result = pd.DataFrame(
-        {
-            "time": target_index,
-            "base_predicted_kwh": predicted,
-            "energy_price_adjustment_kwh": energy_price_adjustment,
-            "predicted_kwh": adjusted,
-        }
-    )
+    result = pd.DataFrame({
+        "time": target_index, "base_predicted_kwh": predicted,
+        "energy_price_adjustment_kwh": energy_price_adjustment, "raw_predicted_kwh": adjusted,
+    })
     result.attrs["energy_price_adjustment"] = adjustment_meta
-    result.attrs["reusable_forecaster_state"] = {
-        "backend": "AR",
-        "energy_price_response": fitted_response,
-    }
     return result
 
 

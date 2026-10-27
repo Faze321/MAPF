@@ -58,9 +58,9 @@ class ForecastConfigV2Tests(unittest.TestCase):
     def test_provenance_contains_active_backend_only(self):
         values = {"forecast_origin": "2024-02-01", "backend": "lstm", "history_days": 30,
                   "validation_days": 5, "horizon_days": 1, "diurnal_blend_alpha": 0.3,
-                  "lstm_hidden_size": 32, "xgboost_seed": 99}
+                  "model_ids": {"A": "saved-lstm-model"}}
         parameters = make_forecast_parameters(**values)
-        self.assertEqual(parameters["lstm_hidden_size"], 32)
+        self.assertEqual(parameters["model_ids"], {"A": "saved-lstm-model"})
         self.assertEqual(parameters["calibration_method"], "daily_hour_mean_v1")
         self.assertNotIn("xgboost_seed", parameters)
         self.assertNotIn("forecast_start", parameters)
@@ -69,7 +69,7 @@ class ForecastConfigV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "calibration"):
             make_forecast_parameters(**{**values, "calibration_method": "first_day_only"})
         expanded = forecast_runtime_parameters(parameters)
-        self.assertEqual(expanded["xgboost_seed"], 42)
+        self.assertNotIn("xgboost_seed", expanded)
         self.assertNotIn("calibration_method", expanded)
         self.assertNotEqual(forecast_output_dir(Path("root"), "lstm", 0.1001),
                             forecast_output_dir(Path("root"), "lstm", 0.1002))
@@ -83,6 +83,11 @@ class ForecastMatrixV2Tests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="forecast_config_v2_", dir=scratch)
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        for patcher in (patch("orchestrator.load_canonical_dataset", return_value=object()),
+                        patch("orchestrator.eligible_training_zone_ids", return_value=["A"]),
+                        patch("orchestrator.prepare_offline_models", return_value={"lstm": {"A": {"model_id": "fixture"}}})):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_matrix_sums_per_model_alpha_counts_and_reuses_same_paths(self):
         common = dict(data_dir=self.root / "data", output_dir=self.root / "output",

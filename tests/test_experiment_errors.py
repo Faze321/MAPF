@@ -36,6 +36,14 @@ class ExperimentErrorTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="experiment_errors_", dir=temporary_root)
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        # Qualification is tested separately; these fixtures start at the matrix's
+        # experiment boundary with two eligible Zones and already prepared weights.
+        for patcher in (
+            patch("orchestrator.load_canonical_dataset", return_value=object()),
+            patch("orchestrator.eligible_training_zone_ids", return_value=["1029", "741"]),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def run_matrix(self, dataset="UrbanEV", **overrides):
         arguments = {
@@ -43,6 +51,8 @@ class ExperimentErrorTests(unittest.TestCase):
             "output_dir": self.root / "output" / dataset,
             "forecast_starts": ["2023-01-01"],
             "forecast_models": ["lstm"],
+            # These tests isolate experiment error accounting after offline preparation.
+            "zone_model_references": {},
             "zone_ids": ["1029", "741"],
             "agent_modes": ["multi_agent_economist_retry", "single_agent_price_retry"],
             "diurnal_blend_alphas": [0.0, 0.5],

@@ -12,7 +12,7 @@ import pandas as pd
 
 
 SCHEMA_VERSION = 1
-NATIVE_ARTIFACT_SCHEMA_VERSION = 3
+NATIVE_ARTIFACT_SCHEMA_VERSION = 5
 SUPPORTED_BACKENDS = {"timesfm", "chronos", "chronos_2", "lstm", "xgboost", "ar", "AR"}
 CORE_COLUMNS = {"timestamp", "time", "zone", "zone_id", "load", "actual_kwh", "energy_price", "e_price"}
 
@@ -231,6 +231,18 @@ class NativeForecasterArtifact:
     fitted_state: dict[str, Any]
 
     def __post_init__(self) -> None:
+        if self.backend in {"lstm", "xgboost"}:
+            from zone_training import validate_model_reference
+
+            reference = self.fitted_state.get("model_reference")
+            if not isinstance(reference, dict):
+                raise ValueError("Native artifact requires an immutable per-zone model reference")
+            if reference.get("backend") != self.backend or str(reference.get("zone_id")) != str(self.zone):
+                raise ValueError("Native artifact model reference does not match its zone/backend")
+            dimensions = reference.get("parameters", {})
+            if dimensions.get("input_hours") != len(self.history) or dimensions.get("output_hours") != self.horizon_hours:
+                raise ValueError("Native artifact history/horizon does not match its direct model dimensions")
+            validate_model_reference(reference)
         forecast_origin = pd.Timestamp(self.forecast_origin)
         if self.horizon_hours <= 0:
             raise ValueError("Reusable forecaster horizon must be positive.")
@@ -301,7 +313,7 @@ class NativeForecasterArtifact:
         known_future = known_future.copy()
         known_future["e_price"] = scenario_prices.to_numpy(dtype=np.float64)
         if "T" in known_future:
-            temperature = pd.to_numeric(known_future["T"], errors="coerce").fillna(0.0)
+            temperature = pd.to_numeric(known_future["T"], errors="coerce")
             known_future["temp_price_idx"] = (
                 temperature.to_numpy(dtype=np.float64)
                 * known_future["e_price"].to_numpy(dtype=np.float64)
@@ -344,6 +356,7 @@ class NativeForecasterArtifact:
             "schema_version": NATIVE_ARTIFACT_SCHEMA_VERSION,
             "artifact_type": "native_backend_reforecast",
             "backend": self.backend,
+            "model_id": (self.fitted_state.get("model_reference") or {}).get("model_id"),
             "zone": self.zone,
             "forecast_origin": self.forecast_origin,
             "inference_mode": "original_backend_reforecast",

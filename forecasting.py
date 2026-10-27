@@ -1,5 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
+from copy import deepcopy
+import hashlib
 from typing import Any, Callable
 
 import numpy as np
@@ -22,20 +24,6 @@ class ForecastResult:
     hourly: pd.DataFrame
     summary: dict[str, Any]
     reusable_forecaster: dict[str, Any] | None = None
-
-
-@dataclass(frozen=True)
-class LSTMForecastBundle:
-    model: Any
-    load_mean: float
-    load_std: float
-    exog_mean: np.ndarray
-    exog_std: np.ndarray
-    context_hours: int
-    device: str
-    input_size: int
-    hidden_size: int
-    num_layers: int
 
 
 def forecast_zone(
@@ -61,35 +49,19 @@ def forecast_zone(
     chronos_context_hours: int = 512,
     chronos_exog_cols: list[str] | None = None,
     chronos_device: str = "auto",
-    lstm_context_hours: int = 24,
-    lstm_exog_cols: list[str] | None = None,
-    lstm_hidden_size: int = 64,
-    lstm_num_layers: int = 1,
-    lstm_epochs: int = 50,
-    lstm_learning_rate: float = 0.001,
-    lstm_batch_size: int = 32,
-    lstm_device: str = "auto",
-    lstm_seed: int = 42,
-    xgboost_lags: list[int] | None = None,
-    xgboost_exog_cols: list[str] | None = None,
-    xgboost_n_estimators: int = 300,
-    xgboost_max_depth: int = 9,
-    xgboost_learning_rate: float = 0.1,
-    xgboost_colsample_bytree: float = 0.9,
-    xgboost_tree_method: str = "approx",
-    xgboost_n_jobs: int = 1,
-    xgboost_seed: int = 42,
+    model_reference: dict[str, Any] | None = None,
+    raw_prediction_cache: dict | None = None,
 ) -> ForecastResult:
     for name, value, minimum in (("history_days", history_days, 1), ("validation_days", validation_days, 0), ("horizon_days", horizon_days, 1)):
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
     zone_id = str(zone_id)
     normalized_model = normalize_forecast_model_name(backend)
-    if normalized_model == "xgboost":
-        from xgboost_forecaster import DEFAULT_XGBOOST_LAGS
-
-        xgboost_lags = list(DEFAULT_XGBOOST_LAGS if xgboost_lags is None else xgboost_lags)
-        xgboost_exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if xgboost_exog_cols is None else xgboost_exog_cols)
+    if model_reference is not None and (
+        str(model_reference.get("zone_id")) != zone_id
+        or model_reference.get("backend") != normalized_model
+    ):
+        raise ValueError("Model reference does not match the requested zone/backend")
     horizon_hours = horizon_days * 24
     if forecast_origin is None:
         forecast_origin = load["time"].max() - pd.Timedelta(hours=horizon_hours - 1)
@@ -125,24 +97,8 @@ def forecast_zone(
         chronos_context_hours=chronos_context_hours,
         chronos_exog_cols=chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS,
         chronos_device=chronos_device,
-        lstm_context_hours=lstm_context_hours,
-        lstm_exog_cols=lstm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS,
-        lstm_hidden_size=lstm_hidden_size,
-        lstm_num_layers=lstm_num_layers,
-        lstm_epochs=lstm_epochs,
-        lstm_learning_rate=lstm_learning_rate,
-        lstm_batch_size=lstm_batch_size,
-        lstm_device=lstm_device,
-        lstm_seed=lstm_seed,
-        xgboost_lags=xgboost_lags,
-        xgboost_exog_cols=xgboost_exog_cols,
-        xgboost_n_estimators=xgboost_n_estimators,
-        xgboost_max_depth=xgboost_max_depth,
-        xgboost_learning_rate=xgboost_learning_rate,
-        xgboost_colsample_bytree=xgboost_colsample_bytree,
-        xgboost_tree_method=xgboost_tree_method,
-        xgboost_n_jobs=xgboost_n_jobs,
-        xgboost_seed=xgboost_seed,
+        model_reference=model_reference,
+        raw_prediction_cache=raw_prediction_cache,
     )
     forecast_attrs = dict(hourly.attrs)
     hourly_feature_cols = [
@@ -207,24 +163,6 @@ def forecast_zone(
         else None,
         "chronos_device": chronos_device if normalized_model.startswith("chronos") else None,
         "energy_price_adjustment": forecast_attrs.get("energy_price_adjustment"),
-        "lstm_context_hours": int(lstm_context_hours) if normalized_model == "lstm" else None,
-        "lstm_exog_cols": (lstm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS) if normalized_model == "lstm" else None,
-        "lstm_hidden_size": int(lstm_hidden_size) if normalized_model == "lstm" else None,
-        "lstm_num_layers": int(lstm_num_layers) if normalized_model == "lstm" else None,
-        "lstm_epochs": int(lstm_epochs) if normalized_model == "lstm" else None,
-        "lstm_learning_rate": float(lstm_learning_rate) if normalized_model == "lstm" else None,
-        "lstm_batch_size": int(lstm_batch_size) if normalized_model == "lstm" else None,
-        "lstm_device": lstm_device if normalized_model == "lstm" else None,
-        "lstm_seed": int(lstm_seed) if normalized_model == "lstm" else None,
-        "xgboost_lags": xgboost_lags if normalized_model == "xgboost" else None,
-        "xgboost_exog_cols": xgboost_exog_cols if normalized_model == "xgboost" else None,
-        "xgboost_n_estimators": xgboost_n_estimators if normalized_model == "xgboost" else None,
-        "xgboost_max_depth": xgboost_max_depth if normalized_model == "xgboost" else None,
-        "xgboost_learning_rate": xgboost_learning_rate if normalized_model == "xgboost" else None,
-        "xgboost_colsample_bytree": xgboost_colsample_bytree if normalized_model == "xgboost" else None,
-        "xgboost_tree_method": xgboost_tree_method if normalized_model == "xgboost" else None,
-        "xgboost_n_jobs": xgboost_n_jobs if normalized_model == "xgboost" else None,
-        "xgboost_seed": xgboost_seed if normalized_model == "xgboost" else None,
         "calibration": forecast_attrs.get("calibration"),
         "forecast_total_kwh": round(forecast_total, 2),
         "forecast_peak_kwh": round(forecast_peak, 2),
@@ -253,6 +191,20 @@ def forecast_zone(
         if not key.startswith(("timesfm_", "chronos_", "lstm_", "xgboost_", "ar_"))
         or key.startswith(normalized_model.lower() + "_")
     }
+    if model_reference is not None:
+        overlap = training_overlap_mask(hourly["time"], model_reference)
+        hourly["model_id"] = model_reference["model_id"]
+        hourly["training_period_overlap"] = overlap
+        summary.update(
+            model_id=model_reference["model_id"],
+            model_training_start=model_reference["training_start"],
+            model_training_end_exclusive=model_reference["training_end_exclusive"],
+            model_parameters=deepcopy(model_reference["parameters"]),
+            training_overlap_hours=int(overlap.sum()),
+            evaluation_is_out_of_sample=bool(
+                forecast_origin >= pd.Timestamp(model_reference["training_end_exclusive"])
+            ),
+        )
     known_future = forecast_features.drop(columns=["actual_kwh", "load"], errors="ignore").copy()
     reusable_forecaster = {
         "zone": zone_id,
@@ -270,24 +222,6 @@ def forecast_zone(
             "chronos_context_hours": int(chronos_context_hours),
             "chronos_exog_cols": list(chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS),
             "chronos_device": chronos_device,
-            "lstm_context_hours": int(lstm_context_hours),
-            "lstm_exog_cols": list(lstm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS),
-            "lstm_hidden_size": int(lstm_hidden_size),
-            "lstm_num_layers": int(lstm_num_layers),
-            "lstm_epochs": int(lstm_epochs),
-            "lstm_learning_rate": float(lstm_learning_rate),
-            "lstm_batch_size": int(lstm_batch_size),
-            "lstm_device": lstm_device,
-            "lstm_seed": int(lstm_seed),
-            "xgboost_lags": xgboost_lags,
-            "xgboost_exog_cols": xgboost_exog_cols,
-            "xgboost_n_estimators": xgboost_n_estimators,
-            "xgboost_max_depth": xgboost_max_depth,
-            "xgboost_learning_rate": xgboost_learning_rate,
-            "xgboost_colsample_bytree": xgboost_colsample_bytree,
-            "xgboost_tree_method": xgboost_tree_method,
-            "xgboost_n_jobs": xgboost_n_jobs,
-            "xgboost_seed": xgboost_seed,
         },
         "fitted_state": forecast_attrs.get("reusable_forecaster_state"),
     }
@@ -321,29 +255,13 @@ def forecast_load(
     chronos_context_hours: int = 512,
     chronos_exog_cols: list[str] | None = None,
     chronos_device: str = 'auto',
-    lstm_context_hours: int = 24,
-    lstm_exog_cols: list[str] | None = None,
-    lstm_hidden_size: int = 64,
-    lstm_num_layers: int = 1,
-    lstm_epochs: int = 50,
-    lstm_learning_rate: float = 0.001,
-    lstm_batch_size: int = 32,
-    lstm_device: str = 'auto',
-    lstm_seed: int = 42,
-    xgboost_lags: list[int] | None = None,
-    xgboost_exog_cols: list[str] | None = None,
-    xgboost_n_estimators: int = 300,
-    xgboost_max_depth: int = 9,
-    xgboost_learning_rate: float = 0.1,
-    xgboost_colsample_bytree: float = 0.9,
-    xgboost_tree_method: str = 'approx',
-    xgboost_n_jobs: int = 1,
-    xgboost_seed: int = 42,
     fitted_state: dict[str, Any] | None = None,
+    model_reference: dict[str, Any] | None = None,
+    raw_prediction_cache: dict | None = None,
 ) -> pd.DataFrame:
-    """Fit once, calibrate daily forecasts, then forecast without future observations."""
+    """Load frozen weights, calibrate daily forecasts, then predict the full horizon."""
     parameters = {name: value for name, value in locals().copy().items()
-                  if name.startswith(("timesfm_", "chronos_", "lstm_", "xgboost_"))}
+                  if name.startswith(("timesfm_", "chronos_"))}
     backend = normalize_forecast_model_name(backend)
     if backend not in {"timesfm", "chronos", "lstm", "xgboost", "AR"}:
         raise ValueError(f"Unsupported backend: {backend}")
@@ -391,16 +309,37 @@ def forecast_load(
         diurnal = build_diurnal_profile(history)
         bias = np.zeros(24, dtype=np.float64)
 
+    saved_reference = (fitted_state or {}).get("model_reference")
+    if saved_reference is not None:
+        if model_reference is not None and model_reference != saved_reference:
+            raise ValueError("Reusable calibration cannot be paired with a different model reference")
+        model_reference = saved_reference
+    if backend in {"lstm", "xgboost"} and model_reference is not None:
+        dimensions = model_reference.get("parameters", {})
+        if dimensions.get("input_hours") != history_hours or dimensions.get("output_hours") != horizon_hours:
+            raise ValueError("Offline model input/output windows do not match history_days/horizon_days; prepare the matching model")
     predict_raw, model_state = prepare_forecast_backend(
         backend, history, parameters, max(24, int(horizon_hours)), fitted_state=fitted_state,
+        model_reference=model_reference,
     )
+    if model_reference is not None and raw_prediction_cache is not None:
+        predict_raw = cache_raw_predictions(predict_raw, model_reference, raw_prediction_cache)
     if fitted_state is None:
         validation_rows: list[dict[str, Any]] = []
         residual_days = []
         for day, offset in enumerate(range(0, len(validation), 24)):
             day_frame = validation.iloc[offset:offset + 24].copy()
             context = pd.concat([history, validation.iloc[:offset]], ignore_index=True).tail(history_hours)
-            raw_frame = predict_raw(context, day_frame.drop(columns=["actual_kwh", "load"], errors="ignore"))
+            day_covariates = day_frame.drop(columns=["actual_kwh", "load"], errors="ignore")
+            if backend in {"lstm", "xgboost"} and model_reference is not None:
+                # A direct model always receives and returns its entire trained
+                # horizon. Daily bias uses only its first 24 offsets. Future
+                # covariates may cross T, but no future actual load is included.
+                known = pd.concat([history, validation, future_source], ignore_index=True)
+                known = known.drop(columns=["actual_kwh", "load"], errors="ignore").drop_duplicates("time", keep="last")
+                day_times = pd.date_range(day_frame["time"].iloc[0], periods=horizon_hours, freq="h")
+                day_covariates = known.set_index("time").reindex(day_times).rename_axis("time").reset_index()
+            raw_frame = predict_raw(context, day_covariates).iloc[:24].copy()
             raw = checked_raw_prediction(raw_frame, day_frame["time"])
             blended = blend_with_diurnal(raw, diurnal_for_times(day_frame["time"], diurnal), alpha)
             actual = day_frame["actual_kwh"].to_numpy(dtype=np.float64)
@@ -461,13 +400,37 @@ def forecast_load(
     return result
 
 
+def training_overlap_mask(times, reference: dict[str, Any]) -> np.ndarray:
+    """Identify observations included in this model's full offline training history."""
+    timestamps = pd.DatetimeIndex(times)
+    overlap = np.zeros(len(timestamps), dtype=bool)
+    for start, end in reference["training_intervals"]:
+        overlap |= (timestamps >= pd.Timestamp(start)) & (timestamps < pd.Timestamp(end))
+    return overlap
+
+
+def cache_raw_predictions(predict, reference: dict[str, Any], cache: dict):
+    """Share expensive unblended predictions across alpha experiments only."""
+    def cached(context, future):
+        digest = hashlib.sha256(reference["model_id"].encode())
+        digest.update(reference["manifest_sha256"].encode())
+        for frame in (context, future):
+            digest.update(repr(tuple(frame.columns)).encode())
+            digest.update(pd.util.hash_pandas_object(frame, index=False).values.tobytes())
+        key = digest.hexdigest()
+        if key not in cache:
+            cache[key] = predict(context, future).copy(deep=True)
+        return cache[key].copy(deep=True)
+    return cached
+
+
 def checked_hourly_history(frame: pd.DataFrame, label: str, *, allow_empty: bool = False) -> pd.DataFrame:
     if frame.empty and allow_empty:
         return frame.copy()
     if "time" not in frame or "actual_kwh" not in frame or frame.empty:
         raise ValueError(f"{label} must contain hourly time and actual_kwh values")
     result = frame.copy()
-    result["time"] = pd.to_datetime(result["time"])
+    result["time"] = pd.to_datetime(result["time"]).dt.as_unit("ns")
     result = result.sort_values("time").reset_index(drop=True)
     times = pd.DatetimeIndex(result["time"])
     if times.hasnans or times.has_duplicates or not times.equals(pd.date_range(times[0], periods=len(times), freq="h")):
@@ -481,7 +444,7 @@ def checked_hourly_history(frame: pd.DataFrame, label: str, *, allow_empty: bool
 
 
 def checked_raw_prediction(frame: pd.DataFrame, times) -> np.ndarray:
-    if len(frame) != len(times) or not pd.DatetimeIndex(frame["time"]).equals(pd.DatetimeIndex(times)):
+    if len(frame) != len(times) or not pd.DatetimeIndex(frame["time"]).as_unit("ns").equals(pd.DatetimeIndex(times).as_unit("ns")):
         raise ValueError("Backend prediction timestamps do not match the requested horizon")
     raw = frame["raw_predicted_kwh"].to_numpy(dtype=np.float64)
     if not np.isfinite(raw).all():
@@ -492,6 +455,7 @@ def checked_raw_prediction(frame: pd.DataFrame, times) -> np.ndarray:
 def prepare_forecast_backend(
     backend: str, history: pd.DataFrame, parameters: dict[str, Any], max_horizon: int,
     *, fitted_state: dict[str, Any] | None = None,
+    model_reference: dict[str, Any] | None = None,
 ) -> tuple[Callable[[pd.DataFrame, pd.DataFrame], pd.DataFrame], dict[str, Any]]:
     """Prepare one frozen model and return an uncalibrated inference callable."""
     p = parameters
@@ -525,27 +489,15 @@ def prepare_forecast_backend(
             return pd.DataFrame({"time": future["time"].to_numpy(), "raw_predicted_kwh": raw,
                                  "q10_kwh": q10, "q90_kwh": q90})
         return predict, {}
-    if backend == "lstm":
-        if fitted_state is None:
-            bundle = train_lstm_model(
-                history, context_hours=p["lstm_context_hours"], exog_cols=exog_cols,
-                hidden_size=p["lstm_hidden_size"], num_layers=p["lstm_num_layers"], epochs=p["lstm_epochs"],
-                learning_rate=p["lstm_learning_rate"], batch_size=p["lstm_batch_size"],
-                device=p["lstm_device"], seed=p["lstm_seed"],
-            )
-            model_state = {"lstm_bundle": serialize_lstm_bundle(bundle)}
-        else:
-            bundle = deserialize_lstm_bundle(state["lstm_bundle"], requested_device=p["lstm_device"])
-            model_state = {"lstm_bundle": state["lstm_bundle"]}
-        def predict(context, future):
-            raw = run_lstm_prediction(bundle, context["actual_kwh"].to_numpy(dtype=float),
-                                      build_lstm_exog_matrix(context, exog_cols),
-                                      build_lstm_exog_matrix(future, exog_cols), len(future))
-            return pd.DataFrame({"time": future["time"].to_numpy(), "raw_predicted_kwh": raw})
-        return predict, model_state
-    if backend == "xgboost":
-        from xgboost_forecaster import prepare_xgboost_backend
-        return prepare_xgboost_backend(history, p, fitted_state=fitted_state)
+    if backend in {"lstm", "xgboost"}:
+        from zone_training import load_cached_predictor
+
+        reference = model_reference or state.get("model_reference")
+        if not isinstance(reference, dict) or reference.get("backend") != backend:
+            raise ValueError(f"{backend} requires a prepared per-zone model_reference; run the train stage first")
+        return load_cached_predictor(reference), {
+            "model_reference": deepcopy(reference), "model_id": reference["model_id"],
+        }
     if backend == "AR":
         response = state["energy_price_response"] if fitted_state is not None else estimate_energy_price_response(history)
         def predict(context, future):
@@ -759,293 +711,6 @@ def build_chronos_covariate_input(
     }
 
 
-def train_lstm_model(
-    history: pd.DataFrame,
-    *,
-    context_hours: int,
-    exog_cols: list[str],
-    hidden_size: int,
-    num_layers: int,
-    epochs: int,
-    learning_rate: float,
-    batch_size: int,
-    device: str,
-    seed: int,
-) -> LSTMForecastBundle:
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("torch is required for backend: lstm.") from exc
-
-    load = history["actual_kwh"].astype(float).to_numpy(dtype=np.float64)
-    exog = build_lstm_exog_matrix(history, exog_cols)
-    if len(load) < 2:
-        raise ValueError("LSTM requires at least two historical values")
-
-    resolved_device = resolve_torch_device(device)
-    torch.manual_seed(int(seed))
-    if resolved_device.startswith("cuda") and torch.cuda.is_available():
-        torch.cuda.manual_seed_all(int(seed))
-
-    load_mean = float(np.nanmean(load))
-    load_std = safe_std(load)
-    exog_mean = np.nanmean(exog, axis=0) if exog.size else np.empty(0, dtype=np.float64)
-    exog_std = np.nanstd(exog, axis=0) if exog.size else np.empty(0, dtype=np.float64)
-    exog_std = np.where(exog_std > 1e-9, exog_std, 1.0)
-    context = max(1, int(context_hours))
-
-    x_train, y_train = build_lstm_training_arrays(
-        load,
-        exog,
-        context,
-        load_mean,
-        load_std,
-        exog_mean,
-        exog_std,
-    )
-    input_size = int(x_train.shape[-1])
-    model = create_lstm_regressor(
-        input_size=input_size,
-        hidden_size=max(1, int(hidden_size)),
-        num_layers=max(1, int(num_layers)),
-    ).to(resolved_device)
-
-    features = torch.tensor(x_train, dtype=torch.float32, device=resolved_device)
-    targets = torch.tensor(y_train[:, np.newaxis], dtype=torch.float32, device=resolved_device)
-    dataset = torch.utils.data.TensorDataset(features, targets)
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=min(max(1, int(batch_size)), len(dataset)),
-        shuffle=True,
-    )
-    optimizer = torch.optim.Adam(model.parameters(), lr=float(learning_rate))
-    loss_fn = torch.nn.MSELoss()
-
-    model.train()
-    for _ in range(max(1, int(epochs))):
-        for batch_x, batch_y in loader:
-            optimizer.zero_grad(set_to_none=True)
-            loss = loss_fn(model(batch_x), batch_y)
-            loss.backward()
-            optimizer.step()
-
-    model.eval()
-    return LSTMForecastBundle(
-        model=model,
-        load_mean=load_mean,
-        load_std=load_std,
-        exog_mean=exog_mean,
-        exog_std=exog_std,
-        context_hours=context,
-        device=resolved_device,
-        input_size=input_size,
-        hidden_size=max(1, int(hidden_size)),
-        num_layers=max(1, int(num_layers)),
-    )
-
-
-def serialize_lstm_bundle(bundle: LSTMForecastBundle) -> dict[str, Any]:
-    return {
-        "load_mean": float(bundle.load_mean),
-        "load_std": float(bundle.load_std),
-        "exog_mean": np.asarray(bundle.exog_mean, dtype=np.float64).tolist(),
-        "exog_std": np.asarray(bundle.exog_std, dtype=np.float64).tolist(),
-        "context_hours": int(bundle.context_hours),
-        "input_size": int(bundle.input_size),
-        "hidden_size": int(bundle.hidden_size),
-        "num_layers": int(bundle.num_layers),
-        "state_dict": {
-            str(name): tensor.detach().cpu().tolist()
-            for name, tensor in bundle.model.state_dict().items()
-        },
-    }
-
-
-def deserialize_lstm_bundle(
-    payload: dict[str, Any],
-    *,
-    requested_device: str,
-) -> LSTMForecastBundle:
-    try:
-        import torch
-    except ModuleNotFoundError as exc:
-        raise RuntimeError("torch is required for backend: lstm.") from exc
-
-    input_size = int(payload["input_size"])
-    hidden_size = int(payload["hidden_size"])
-    num_layers = int(payload["num_layers"])
-    model = create_lstm_regressor(input_size, hidden_size, num_layers)
-    raw_state = payload.get("state_dict")
-    if not isinstance(raw_state, dict) or not raw_state:
-        raise ValueError("Reusable LSTM artifact has no trained state_dict.")
-    state_dict = {
-        str(name): torch.tensor(value, dtype=torch.float32)
-        for name, value in raw_state.items()
-    }
-    model.load_state_dict(state_dict, strict=True)
-    resolved_device = resolve_torch_device(requested_device)
-    model = model.to(resolved_device)
-    model.eval()
-    return LSTMForecastBundle(
-        model=model,
-        load_mean=float(payload["load_mean"]),
-        load_std=float(payload["load_std"]),
-        exog_mean=np.asarray(payload.get("exog_mean") or [], dtype=np.float64),
-        exog_std=np.asarray(payload.get("exog_std") or [], dtype=np.float64),
-        context_hours=int(payload["context_hours"]),
-        device=resolved_device,
-        input_size=input_size,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-    )
-
-
-def create_lstm_regressor(input_size: int, hidden_size: int, num_layers: int):
-    import torch
-
-    class LSTMRegressor(torch.nn.Module):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lstm = torch.nn.LSTM(
-                input_size=input_size,
-                hidden_size=hidden_size,
-                num_layers=num_layers,
-                batch_first=True,
-            )
-            self.head = torch.nn.Linear(hidden_size, 1)
-
-        def forward(self, x):
-            out, _ = self.lstm(x)
-            return self.head(out[:, -1, :])
-
-    return LSTMRegressor()
-
-
-def build_lstm_training_arrays(
-    load: np.ndarray,
-    exog: np.ndarray,
-    context_hours: int,
-    load_mean: float,
-    load_std: float,
-    exog_mean: np.ndarray,
-    exog_std: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray]:
-    x_rows = []
-    y_rows = []
-    for target_idx in range(1, len(load)):
-        x_rows.append(
-            build_lstm_sequence(
-                known_load=load,
-                exog_until_target=exog,
-                target_idx=target_idx,
-                context_hours=context_hours,
-                load_mean=load_mean,
-                load_std=load_std,
-                exog_mean=exog_mean,
-                exog_std=exog_std,
-            )
-        )
-        y_rows.append((float(load[target_idx]) - load_mean) / load_std)
-    return np.asarray(x_rows, dtype=np.float32), np.asarray(y_rows, dtype=np.float32)
-
-
-def run_lstm_prediction(
-    bundle: LSTMForecastBundle,
-    rolling_load: np.ndarray,
-    rolling_exog: np.ndarray,
-    future_exog: np.ndarray,
-    horizon: int,
-) -> np.ndarray:
-    import torch
-
-    future_exog = align_exog(future_exog, int(horizon))
-    predictions: list[float] = []
-    exog_until_target = np.vstack([rolling_exog, future_exog])
-
-    with torch.no_grad():
-        for step_idx in range(int(horizon)):
-            known_load = np.concatenate([rolling_load, np.asarray(predictions, dtype=np.float64)])
-            target_idx = len(rolling_load) + step_idx
-            seq = build_lstm_sequence(
-                known_load=known_load,
-                exog_until_target=exog_until_target,
-                target_idx=target_idx,
-                context_hours=bundle.context_hours,
-                load_mean=bundle.load_mean,
-                load_std=bundle.load_std,
-                exog_mean=bundle.exog_mean,
-                exog_std=bundle.exog_std,
-            )
-            tensor = torch.tensor(seq[np.newaxis, :, :], dtype=torch.float32, device=bundle.device)
-            pred_norm = float(bundle.model(tensor).detach().cpu().item())
-            pred = pred_norm * bundle.load_std + bundle.load_mean
-            predictions.append(float(max(pred, 0.0)))
-
-    return np.asarray(predictions, dtype=np.float64)
-
-
-def build_lstm_sequence(
-    *,
-    known_load: np.ndarray,
-    exog_until_target: np.ndarray,
-    target_idx: int,
-    context_hours: int,
-    load_mean: float,
-    load_std: float,
-    exog_mean: np.ndarray,
-    exog_std: np.ndarray,
-) -> np.ndarray:
-    start = max(0, int(target_idx) - int(context_hours) + 1)
-    rows = []
-    for idx in range(start, int(target_idx) + 1):
-        if len(known_load) == 0:
-            prev_load = load_mean
-        elif idx == 0:
-            prev_load = float(known_load[0])
-        else:
-            prev_load = float(known_load[min(idx - 1, len(known_load) - 1)])
-        load_feature = np.asarray([(prev_load - load_mean) / load_std], dtype=np.float64)
-        exog_feature = standardize_exog(exog_until_target[idx], exog_mean, exog_std)
-        rows.append(np.concatenate([load_feature, exog_feature]))
-
-    sequence = np.asarray(rows, dtype=np.float32)
-    if len(sequence) < context_hours:
-        pad = np.repeat(sequence[[0]], context_hours - len(sequence), axis=0)
-        sequence = np.vstack([pad, sequence])
-    return sequence
-
-
-def build_lstm_exog_matrix(frame: pd.DataFrame, exog_cols: list[str]) -> np.ndarray:
-    base = build_exog_matrix(frame, exog_cols)
-    if "time" not in frame:
-        time_features = np.zeros((len(frame), 4), dtype=np.float64)
-    else:
-        times = pd.DatetimeIndex(pd.to_datetime(frame["time"]))
-        hour = times.hour.to_numpy(dtype=np.float64)
-        dayofweek = times.dayofweek.to_numpy(dtype=np.float64)
-        time_features = np.column_stack(
-            [
-                np.sin(2.0 * np.pi * hour / 24.0),
-                np.cos(2.0 * np.pi * hour / 24.0),
-                np.sin(2.0 * np.pi * dayofweek / 7.0),
-                np.cos(2.0 * np.pi * dayofweek / 7.0),
-            ]
-        )
-    return np.hstack([base, time_features]) if base.size else time_features
-
-
-def standardize_exog(exog_row: np.ndarray, exog_mean: np.ndarray, exog_std: np.ndarray) -> np.ndarray:
-    if len(exog_mean) == 0:
-        return np.empty(0, dtype=np.float64)
-    row = np.asarray(exog_row, dtype=np.float64)
-    return (row - exog_mean) / exog_std
-
-
-def safe_std(values: np.ndarray) -> float:
-    std = float(np.nanstd(values))
-    return std if std > 1e-9 else 1.0
-
-
 def estimate_interval_half_width(residual: np.ndarray) -> float:
     values = np.abs(np.asarray(residual, dtype=np.float64))
     values = values[np.isfinite(values)]
@@ -1129,9 +794,9 @@ def build_zone_model_frame(
     frame["hour"] = frame["time"].dt.hour
     frame["is_weekend"] = frame["time"].dt.dayofweek.isin([5, 6]).astype(float)
     if "T" in frame and "e_price" in frame:
-        frame["temp_price_idx"] = frame["T"].astype(float) * frame["e_price"].astype(float)
+        frame["temp_price_idx"] = pd.to_numeric(frame["T"], errors="coerce") * pd.to_numeric(frame["e_price"], errors="coerce")
     else:
-        frame["temp_price_idx"] = 0.0
+        frame["temp_price_idx"] = np.nan
     return frame
 
 

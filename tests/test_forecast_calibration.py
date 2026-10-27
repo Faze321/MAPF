@@ -3,6 +3,9 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 import json
+from pathlib import Path
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +13,8 @@ import numpy as np
 import pandas as pd
 
 import forecasting
+from config import TrainingConfig
+from zone_training import ensure_dataset_models
 
 
 class DailyCalibrationTests(unittest.TestCase):
@@ -84,15 +89,21 @@ class DailyCalibrationTests(unittest.TestCase):
             with self.subTest(backend=backend), patch.object(
                 forecasting, "prepare_forecast_backend", return_value=(predict, {})
             ) as prepare:
+                reference = ({"backend": backend, "model_id": "fixture", "parameters": {
+                    "input_hours": 720, "output_hours": 48}}
+                    if backend in {"lstm", "xgboost"} else None)
                 result = forecasting.forecast_load(self.history, self.validation, self.future,
-                                                   self.origin, 48, backend=backend)
+                                                   self.origin, 48, backend=backend, model_reference=reference)
             prepare.assert_called_once()
             self.assertEqual(prepare.call_args.args[0], backend)
             pd.testing.assert_frame_equal(prepare.call_args.args[1], self.history)
-            self.assertEqual([len(future) for _, future in calls], [24] * 5 + [48])
+            self.assertEqual([len(future) for _, future in calls],
+                             [48] * 6 if reference else [24] * 5 + [48])
             self.assertTrue(all(context.time.max() < future.time.min() for context, future in calls))
             np.testing.assert_allclose(result.bias_kwh, np.tile(3 + np.arange(24) / 10, 2))
             calibration = result.attrs["calibration"]
+            self.assertEqual(len(calibration["validation_predictions"]), 120)
+            self.assertEqual(calibration["samples_per_hour"], [5] * 24)
             # Centered residuals are [-2,-1,0,1,2] on every hourly offset.
             self.assertEqual(calibration["interval_half_width"], 2.0)
             np.testing.assert_allclose(result.q10_kwh, result.predicted_kwh - 2)
@@ -213,22 +224,30 @@ class DailyCalibrationTests(unittest.TestCase):
 
 class NativeModelSmokeTests(unittest.TestCase):
     def test_small_cpu_lstm_fits_once_replays_and_has_no_future_load_leakage(self):
-        origin = pd.Timestamp("2024-02-01")
-        times = pd.date_range(origin - pd.Timedelta(days=4), periods=5 * 24, freq="h")
-        frame = pd.DataFrame({"time": times, "actual_kwh": 10 + 2 * np.sin(np.arange(len(times)) / 4), "e_price": .4})
-        history, validation, future = frame.iloc[:72], frame.iloc[72:96], frame.iloc[96:]
-        kwargs = dict(backend="lstm", lstm_context_hours=4, lstm_hidden_size=4,
-                      lstm_num_layers=1, lstm_epochs=1, lstm_batch_size=16,
-                      lstm_device="cpu", lstm_exog_cols=["e_price"], lstm_seed=42)
-        with patch.object(forecasting, "train_lstm_model", wraps=forecasting.train_lstm_model) as fit:
-            original = forecasting.forecast_load(history, validation, future, origin, 24, **kwargs)
-        self.assertEqual(fit.call_count, 1)
-        self.assertTrue(np.isfinite(original.predicted_kwh).all())
-        state = json.loads(json.dumps(original.attrs["reusable_forecaster_state"], allow_nan=False))
-        with patch.object(forecasting, "train_lstm_model", side_effect=AssertionError("no refit")):
-            replay = forecasting.forecast_load(history, validation, future.assign(actual_kwh=1e9), origin, 24,
-                                               fitted_state=state, **kwargs)
-        pd.testing.assert_frame_equal(original, replay)
+        import offline_models
+        times = pd.date_range("2024-01-01", periods=50 * 24, freq="h")
+        position = np.arange(len(times))
+        frame = pd.DataFrame({"time": times, "actual_kwh": 10 + 2 * np.sin(position / 4),
+                              "e_price": .3 + .2 * (position % 24 >= 12)})
+        origin = frame.time.iloc[-24]
+        history, validation, future = frame.iloc[-864:-144], frame.iloc[-144:-24], frame.iloc[-24:]
+        parameters = dict(lstm_hidden_size=4, lstm_epochs=1, lstm_batch_size=128,
+                          lstm_device="cpu", lstm_exog_cols=["e_price"], lstm_head_dropout=0.0)
+        with tempfile.TemporaryDirectory() as temporary:
+            dataset = SimpleNamespace(cache_dir=Path(temporary) / "cache", dataset_fingerprint="fixture", feature_manifest={},
+                                      timeseries=frame.rename(columns={"time": "timestamp", "actual_kwh": "load_kwh", "e_price": "energy_price"}).assign(zone_id="A"))
+            with patch("offline_models.train_zone_model", wraps=offline_models.train_zone_model) as fit:
+                reference = ensure_dataset_models(dataset, ["lstm"], TrainingConfig(defaults=parameters, min_samples=2),
+                                                  zone_ids=["A"], history_days=30, horizon_days=1)["lstm"]["A"]
+            self.assertEqual(fit.call_count, 1)
+            kwargs = dict(backend="lstm", model_reference=reference)
+            with patch("offline_models.train_zone_model", side_effect=AssertionError("no refit")):
+                original = forecasting.forecast_load(history, validation, future, origin, 24, **kwargs)
+                state = json.loads(json.dumps(original.attrs["reusable_forecaster_state"], allow_nan=False))
+                replay = forecasting.forecast_load(history, validation, future.assign(actual_kwh=1e9), origin, 24,
+                                                   fitted_state=state, **kwargs)
+            self.assertTrue(np.isfinite(original.predicted_kwh).all())
+            pd.testing.assert_frame_equal(original, replay)
 
 
 if __name__ == "__main__":

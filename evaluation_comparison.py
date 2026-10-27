@@ -14,7 +14,7 @@ from numbers import Integral, Real
 from typing import Any
 
 from usage import cache_usage_fields, summarize_cache_usage
-from evaluation_artifacts import canonical_forecast_parameters, normalize_evaluation_fields
+from evaluation_artifacts import canonical_forecast_parameters, normalize_evaluation_fields, signature
 
 
 TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
@@ -164,6 +164,7 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
         key = (
             pair["left_batch"], pair["right_batch"], pair["dataset_identity"],
             pair["backend"], pair["agent_mode"], left.get("revenue_unit"), right.get("revenue_unit"),
+            left.get("model_set_id", "legacy_unknown"), right.get("model_set_id", "legacy_unknown"),
         )
         grouped[key].append(pair)
     summaries = []
@@ -190,6 +191,7 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
             "dataset": first_left.get("dataset"), "backend": key[3], "agent_mode": key[4],
             "revenue_unit": key[5] if units_agree else None,
             "left_revenue_unit": key[5], "right_revenue_unit": key[6],
+            "left_model_set_id": key[7], "right_model_set_id": key[8],
             "pair_count": len(records), "left": left, "right": right, "delta": delta,
             "delta_direction": "right_minus_left",
         })
@@ -208,6 +210,9 @@ def build_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
     for run in runs:
         if isinstance(run.get("forecast_parameters"), dict):
             run["forecast_parameters"] = canonical_forecast_parameters(run["forecast_parameters"])
+            model_ids = run["forecast_parameters"].get("model_ids")
+            if model_ids:
+                run["model_set_id"] = signature(model_ids)
     by_id: dict[str, dict[str, Any]] = {}
     for run in runs:
         run_id = run.get("run_id")

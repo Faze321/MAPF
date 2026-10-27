@@ -47,7 +47,8 @@ run:
   weather_file: "weather_central.csv"
   dry_run: false
   force_cache: false
-  pipeline_stage: "full" # options: "full", "forecaster", "agent"
+  force_train: false # only this flag requests rebuilding offline weights
+  pipeline_stage: "full" # options: "train", "full", "forecaster", "agent"
   forecaster_output_dir: null # required only to override the default agent-stage input folder
   agent_output_dir: null # optional override; normally written beside forecaster/
   precomputed_window_data: null # path to a previous window_load_price_cache.csv
@@ -55,7 +56,7 @@ run:
   forecast_starts: null # explicit dates override automatic selection
   forecast_start_count: 1 # 1: latest window; 2+: evenly spaced valid origins per dataset
   horizon_days: 1 # forecast length; multi-day forecasts reuse the 24-hour bias pattern
-  history_days: 30 # training history; model context is configured independently
+  history_days: 30 # LSTM/XGBoost input window = 720 hours; each output window uses horizon_days
   validation_days: 5 # average daily validation errors for each forecast hour
   forecast_models:
     - "timesfm"
@@ -104,33 +105,6 @@ run:
   chronos_repo: "amazon/chronos-2"
   chronos_context_hours: 168
 
-# LSTM
-  lstm_context_hours: 48
-  lstm_exog_cols:
-    - "T"
-    - "U"
-    - "nRAIN"
-    - "e_price"
-    - "s_price"
-    - "is_weekend"
-    - "temp_price_idx"
-  lstm_hidden_size: 64
-  lstm_num_layers: 2
-  lstm_epochs: 50
-  lstm_learning_rate: 0.001
-  lstm_batch_size: 32
-  lstm_seed: 42
-
-# XGBoost: recursive hourly predictions; no forecast-period actual load is used.
-  xgboost_lags: [1, 2, 3, 24] # history_days * 24 must exceed the largest lag
-  xgboost_exog_cols: [T, U, nRAIN, e_price, s_price, is_weekend, temp_price_idx]
-  xgboost_n_estimators: 300
-  xgboost_max_depth: 9
-  xgboost_learning_rate: 0.1
-  xgboost_colsample_bytree: 0.9
-  xgboost_tree_method: approx # approx, hist, or exact; runs on CPU
-  xgboost_n_jobs: 1 # threads per model; datasets may already run in parallel
-  xgboost_seed: 42
   zones: null # automatically select sites from the current dataset
   experiment_zone_count: 12
   experiment_zone_counts: {} # optional per-folder counts; unspecified folders use experiment_zone_count
@@ -141,3 +115,37 @@ run:
   experiment_zone_selection: representative # random samples cached eligible sites with varying load AND energy price
   experiment_zone_seed: 42 # fixed seed keeps the same sites across models and Agent modes
   temperature: 0.2
+
+# Train only selected sites; reuse weights across origins, alpha and Agent modes for the same H/P.
+training:
+  train_ratio: 0.8 # chronological complete-window split; purge overlapping target windows
+  validation_ratio: 0.2 # separate from the five-day bias calibration in run.validation_days
+  min_history_days: 45
+  min_samples: 512 # complete input + output windows before splitting
+  sample_stride_hours: 1
+  seed: 42
+  lstm_workers: 1 # concurrent zone models per dataset; any positive integer
+  xgboost_workers: 2 # concurrent zone models per dataset; any positive integer
+  defaults: # explicit fixed hyperparameters; no automatic size tiers
+    lstm_device: cuda
+    lstm_hidden_size: 32
+    lstm_num_layers: 1
+    lstm_batch_size: 64
+    lstm_learning_rate: 0.001
+    lstm_epochs: 100 # upper limit; early stopping restores the best validation weights
+    lstm_early_stopping_patience: 10
+    xgboost_device: cuda
+    xgboost_n_estimators: 800 # upper limit for each output hour's independent tree model
+    xgboost_learning_rate: 0.03
+    xgboost_max_depth: 3
+    xgboost_early_stopping_rounds: 50
+    xgboost_n_jobs: 2 # host threads per XGBoost model
+  dataset_overrides: {} # dataset folder -> flat training parameter overrides
+  zone_overrides: {} # dataset folder -> quoted zone/site ID -> flat overrides
+  # dataset_overrides:
+  #   data/UrbanEV:
+  #     lstm_hidden_size: 64
+  # zone_overrides:
+  #   data/UrbanEV:
+  #     "001":
+  #       xgboost_max_depth: 3

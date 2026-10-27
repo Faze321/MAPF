@@ -78,6 +78,9 @@ def canonical_forecast_parameters(raw: dict[str, Any]) -> dict[str, Any]:
             parameters.pop(key)
     # Old artifacts cannot establish the new multi-day calibration protocol.
     parameters.setdefault("calibration_method", "legacy_unknown")
+    if "model_ids" in parameters:
+        parameters["model_ids"] = {str(zone): str(model_id) for zone, model_id in
+                                   sorted((parameters["model_ids"] or {}).items(), key=lambda item: str(item[0]))}
     return parameters
 
 
@@ -145,7 +148,7 @@ def load_forecast_context(directory: Path) -> dict:
     if "time" in frame:
         frame["time"] = frame["time"].map(timestamp)
     metrics_path = directory / "evaluation" / "forecast_metrics.csv"
-    metrics = normalize_evaluation_columns(pd.read_csv(metrics_path)) if metrics_path.exists() else pd.DataFrame()
+    metrics = normalize_evaluation_columns(pd.read_csv(metrics_path, dtype={"zone_id": str})) if metrics_path.exists() else pd.DataFrame()
     raw_parameters = dict(manifest.get("forecast_parameters") or {})
     metadata = dataset_metadata(manifest)
     for key in ("backend", "diurnal_blend_alpha", "calibration_method", "forecast_origin"):
@@ -155,9 +158,35 @@ def load_forecast_context(directory: Path) -> dict:
         if len(unique) and raw_parameters.get(key) is None:
             raw_parameters[key] = unique[0]
     parameters = canonical_forecast_parameters(raw_parameters)
+    model_ids = dict(parameters.get("model_ids") or {})
+    sources = [manifest.get("model_ids") or {},
+               {str(zone): value.get("model_id") for zone, value in (manifest.get("model_provenance") or {}).items()}]
+    for source in (metrics, frame):
+        if all(column in source for column in ("zone_id", "model_id")):
+            sources.extend({str(row.zone_id): row.model_id} for row in source[["zone_id", "model_id"]].dropna().drop_duplicates().itertuples())
+    for source in sources:
+        for zone, model_id in source.items():
+            if model_id is None:
+                continue
+            zone, model_id = str(zone), str(model_id)
+            if zone in model_ids and model_ids[zone] != model_id:
+                raise ValueError(f"Conflicting model_id for zone {zone} in {directory}")
+            model_ids[zone] = model_id
+    if model_ids:
+        parameters["model_ids"] = dict(sorted(model_ids.items()))
+    metadata["model_set_id"] = signature(model_ids) if model_ids else "legacy_unknown"
+    if "zone_id" in frame and "model_id" not in frame:
+        frame["model_id"] = frame["zone_id"].map(model_ids).fillna("legacy_unknown")
     for key in ("backend", "diurnal_blend_alpha"):
         metadata[key] = str(parameters.get(key, "unknown"))
     metadata["forecast_origin"] = timestamp(parameters.get("forecast_origin"))
+    if "zone_id" in frame:
+        provenance = manifest.get("model_provenance") or {}
+        if "model_training_end_exclusive" not in frame:
+            frame["model_training_end_exclusive"] = frame["zone_id"].map(
+                {str(zone): record.get("model_training_end_exclusive") for zone, record in provenance.items()})
+        if "forecast_origin" not in frame:
+            frame["forecast_origin"] = metadata["forecast_origin"]
     snippets_path = directory / "context_snippets.json"
     snippets = read_json(snippets_path) if snippets_path.exists() else []
     if not isinstance(snippets, list):
@@ -172,7 +201,8 @@ def load_forecast_context(directory: Path) -> dict:
         if metadata["dataset_provenance_known"] and parameters else str(directory.resolve())
     return {"directory": directory, "detail_dir": detail_dir, "frame": frame,
             "manifest": manifest, "parameters": parameters, "metadata": metadata,
-            "thresholds": thresholds, "expected_windows": expected_windows, "identity": identity}
+            "thresholds": thresholds, "expected_windows": expected_windows, "identity": identity,
+            "model_ids": model_ids, "model_provenance": manifest.get("model_provenance") or {}}
 
 
 def find_forecast_context(control_path: Path, cache: dict[Path, dict]) -> dict | None:
@@ -241,8 +271,20 @@ def pairing_metadata(control: dict, context: dict | None) -> dict:
             if (len(selected) and finite_values.to_numpy().all() and set(selected.zone_id) == set(zones)
                     and covered and not selected.duplicated(["zone_id", "time"]).any()):
                 hourly_signature = signature(selected.to_dict("records"))
-    parameters = (context or {}).get("parameters", {})
+    parameters = dict((context or {}).get("parameters", {}))
+    model_ids = {str(zone): str(model_id) for zone, model_id in (control.get("model_ids") or {}).items()}
+    for zone in control.get("zones", []):
+        if zone.get("model_id"):
+            zone_id, model_id = str(zone["zone_id"]), str(zone["model_id"])
+            complete &= not model_ids.get(zone_id) or model_ids[zone_id] == model_id
+            model_ids[zone_id] = model_id
+    recorded_ids = parameters.get("model_ids") or {}
+    complete &= all(not recorded_ids.get(zone) or recorded_ids[zone] == model_id for zone, model_id in model_ids.items())
+    if model_ids:
+        parameters["model_ids"] = {**recorded_ids, **model_ids}
     return {"zone_ids": zones, "forecast_parameters": parameters,
+            "model_ids": parameters.get("model_ids") or {},
+            "model_set_id": signature(parameters["model_ids"]) if parameters.get("model_ids") else "legacy_unknown",
             "baseline_signature": signature(rows) if complete else None,
             "hourly_signature": hourly_signature,
             "pairing_ready": bool(complete and hourly_signature and parameters)}

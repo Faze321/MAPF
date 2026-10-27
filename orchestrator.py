@@ -31,6 +31,7 @@ from agents import (
 from config import (
     AgentConfig,
     RunConfig,
+    TrainingConfig,
     BACKEND_PARAMETER_NAMES,
     BACKEND_BLEND_PARAMETER_NAMES,
     CALIBRATION_METHOD,
@@ -64,7 +65,8 @@ from load_policy import (
     classify_load_percentage,
     load_range_position_pct,
 )
-from reporting import dataset_folder_key, safe_filename, write_agent_outputs, write_forecaster_outputs
+from reporting import (MODEL_PROVENANCE_FIELDS, dataset_folder_key, safe_filename,
+                       write_agent_outputs, write_forecaster_outputs)
 from time_utils import normalize_datetime_series_24h, parse_datetime_24h
 from zone_selection import select_zone_categories
 from zone_eligibility import load_zone_eligibility
@@ -197,7 +199,7 @@ ERROR_CODE_BY_STAGE = {
 }
 MAX_CONTROL_ATTEMPTS = 3
 CONTROL_AGENT_USAGE_KEY = "_control_agent_usage"
-FORECASTER_MANIFEST_SCHEMA_VERSION = 4
+FORECASTER_MANIFEST_SCHEMA_VERSION = 6
 FORECAST_PARAMETER_NAMES = (
     'forecast_origin',
     'horizon_days',
@@ -242,6 +244,91 @@ class ForecasterBundle:
     scenario_artifacts: dict[str, NativeForecasterArtifact]
 
 
+def prepare_offline_models(dataset, backends, training_config=None, cli_overrides=None,
+                           *, zone_ids, history_days=30, horizon_days=1, force_train=False, data_dir=None):
+    """Prepare only the selected sites once, before experiment expansion."""
+    selected = list(dict.fromkeys(backend for backend in backends if backend in {"lstm", "xgboost"}))
+    if not selected:
+        return {}
+    from zone_training import ensure_dataset_models
+    return ensure_dataset_models(
+        dataset, backends=selected, training_config=training_config or TrainingConfig(),
+        zone_ids=normalize_zone_ids(zone_ids), history_days=history_days, horizon_days=horizon_days,
+        cli_overrides=cli_overrides, force_train=force_train, data_dir=data_dir,
+    )
+
+
+def eligible_training_zone_ids(dataset, training_config=None, *, zone_ids=None,
+                               history_days=30, horizon_days=1) -> list[str]:
+    """Check sample availability without fitting models or consulting cached weights."""
+    from zone_training import assess_dataset_training
+    requested = normalize_zone_ids(zone_ids)
+    assessment = assess_dataset_training(
+        dataset, training_config or TrainingConfig(), zone_ids=requested or None,
+        history_days=history_days, horizon_days=horizon_days,
+    )
+    eligible = [str(zone) for zone in assessment["eligible_zone_ids"]]
+    if requested:
+        unavailable = [zone for zone in requested if zone not in set(eligible)]
+        if unavailable:
+            reasons = {zone: assessment.get("zones", {}).get(zone, {"reason": "unknown_zone"})
+                       for zone in unavailable}
+            raise ValueError(f"Selected zones are not eligible for offline training: {reasons}")
+        return requested
+    if not eligible:
+        raise ValueError("No zones have enough complete sliding windows for offline training")
+    return eligible
+
+
+def run_training_stage(*, data_dir: Path, backends: Iterable[str] = ("lstm", "xgboost"),
+                       dataset_spec: DatasetSpec | None = None, cache_dir: Path | None = None,
+                       training_config: TrainingConfig | None = None,
+                       training_cli_overrides: dict[str, Any] | None = None,
+                       zone_ids: str | Iterable[str] | None = None,
+                       experiment_zone_count: int = 12,
+                       experiment_zone_selection: str = "representative",
+                       experiment_zone_seed: int = 42,
+                       history_days: int = 30, horizon_days: int = 1,
+                       force_train: bool = False, force_cache: bool = False) -> dict[str, Path]:
+    selected = list(dict.fromkeys(backend for backend in backends if backend in {"lstm", "xgboost"}))
+    if not selected:
+        raise ValueError("The train stage requires lstm or xgboost in forecast_models")
+    spec = dataset_spec or DatasetSpec(path=data_dir, cache_dir=cache_dir)
+    dataset = load_canonical_dataset(spec, force_cache=force_cache)
+    selected_zone_ids = normalize_zone_ids(zone_ids)
+    eligible = eligible_training_zone_ids(
+        dataset, training_config, zone_ids=selected_zone_ids,
+        history_days=history_days, horizon_days=horizon_days,
+    )
+    if not selected_zone_ids:
+        selection = normalize_zone_selection(experiment_zone_selection)
+        if selection == "random":
+            if len(eligible) < experiment_zone_count:
+                raise ValueError(f"Only {len(eligible)} eligible zones remain for {experiment_zone_count} requested random zones")
+            profiles = pd.DataFrame({"zone_id": eligible})
+        else:
+            selection_start = pd.Timestamp(dataset.timeseries["timestamp"].max()) + pd.Timedelta(hours=1)
+            selection_split = split_cache_key(dataset.dataset_fingerprint, selection_start, window_hours=3,
+                                              policy_id="historical_3h_min_max_range_35_80_90")
+            profiles = build_zone_profiles_from_canonical(
+                dataset, Path(dataset.cache_dir) / "datasets" / dataset.dataset_fingerprint / "splits" / selection_split,
+                forecast_origin=selection_start, force_cache=force_cache,
+            )
+            profiles = profiles[profiles["zone_id"].astype(str).isin(eligible)]
+        selected_zone_ids = select_experiment_zone_ids(
+            profiles, count=experiment_zone_count, selection=selection, seed=experiment_zone_seed,
+        )
+    prepare_offline_models(dataset, selected, training_config, training_cli_overrides,
+                           zone_ids=selected_zone_ids, history_days=history_days, horizon_days=horizon_days,
+                           force_train=force_train, data_dir=data_dir)
+    outputs = {}
+    for backend in selected:
+        directory = Path(dataset.cache_dir) / "weight" / backend
+        outputs[f"{backend}_weight_dir"] = directory
+        outputs[f"{backend}_training_index"] = directory / "index.json"
+    return outputs
+
+
 def run_pipeline(
     *,
     data_dir: Path,
@@ -268,33 +355,27 @@ def run_pipeline(
     chronos_repo: str = "amazon/chronos-2",
     chronos_context_hours: int = 512,
     chronos_device: str = "auto",
-    lstm_context_hours: int = 24,
-    lstm_exog_cols: list[str] | None = None,
-    lstm_hidden_size: int = 64,
-    lstm_num_layers: int = 1,
-    lstm_epochs: int = 50,
-    lstm_learning_rate: float = 0.001,
-    lstm_batch_size: int = 32,
-    lstm_device: str = "auto",
-    lstm_seed: int = 42,
-    xgboost_lags: list[int] | None = None,
-    xgboost_exog_cols: list[str] | None = None,
-    xgboost_n_estimators: int = 300,
-    xgboost_max_depth: int = 9,
-    xgboost_learning_rate: float = 0.1,
-    xgboost_colsample_bytree: float = 0.9,
-    xgboost_tree_method: str = "approx",
-    xgboost_n_jobs: int = 1,
-    xgboost_seed: int = 42,
     temperature: float = 0.2,
     precomputed_window_data: Path | str | None = None,
     pipeline_stage: str = "full",
     forecaster_output_dir: Path | str | None = None,
     agent_output_dir: Path | str | None = None,
     dataset_spec: DatasetSpec | None = None,
+    training_config: TrainingConfig | None = None,
+    training_cli_overrides: dict[str, Any] | None = None,
+    force_train: bool = False,
+    zone_model_references: dict[str, dict[str, dict[str, Any]]] | None = None,
+    raw_prediction_cache: dict | None = None,
 ) -> dict[str, Path]:
     backend = normalize_forecast_model_name(backend)
     pipeline_stage = normalize_pipeline_stage(pipeline_stage)
+    if pipeline_stage == "train":
+        return run_training_stage(data_dir=data_dir, dataset_spec=dataset_spec,
+                                  backends=[backend], training_config=training_config,
+                                  training_cli_overrides=training_cli_overrides,
+                                  zone_ids=zone_ids, experiment_zone_count=experiment_zone_count,
+                                  history_days=history_days, horizon_days=horizon_days,
+                                  force_train=force_train, force_cache=force_cache, cache_dir=cache_dir)
     agent_mode = normalize_agent_mode(agent_mode)
     chain_mode = (
         "single_agent"
@@ -335,24 +416,6 @@ def run_pipeline(
         chronos_repo=chronos_repo,
         chronos_context_hours=chronos_context_hours,
         chronos_device=chronos_device,
-        lstm_context_hours=lstm_context_hours,
-        lstm_exog_cols=lstm_exog_cols,
-        lstm_hidden_size=lstm_hidden_size,
-        lstm_num_layers=lstm_num_layers,
-        lstm_epochs=lstm_epochs,
-        lstm_learning_rate=lstm_learning_rate,
-        lstm_batch_size=lstm_batch_size,
-        lstm_device=lstm_device,
-        lstm_seed=lstm_seed,
-        xgboost_lags=xgboost_lags,
-        xgboost_exog_cols=xgboost_exog_cols,
-        xgboost_n_estimators=xgboost_n_estimators,
-        xgboost_max_depth=xgboost_max_depth,
-        xgboost_learning_rate=xgboost_learning_rate,
-        xgboost_colsample_bytree=xgboost_colsample_bytree,
-        xgboost_tree_method=xgboost_tree_method,
-        xgboost_n_jobs=xgboost_n_jobs,
-        xgboost_seed=xgboost_seed,
     )
 
     if pipeline_stage == "agent":
@@ -381,6 +444,7 @@ def run_pipeline(
         scenario_artifacts = bundle.scenario_artifacts
 
     canonical_dataset = load_canonical_dataset(dataset_spec, force_cache=force_cache)
+    raw_prediction_cache = {} if raw_prediction_cache is None else raw_prediction_cache
     if bundle is not None:
         recorded_fingerprint = (bundle.manifest.get("data_source") or {}).get(
             "dataset_fingerprint"
@@ -432,17 +496,40 @@ def run_pipeline(
     )
     if pipeline_stage != "agent":
         requested_zone_ids = normalize_zone_ids(zone_ids)
-        if not requested_zone_ids and (len(profiles) < 5 or "station_type" in profiles):
-            requested_zone_ids = profiles["zone_id"].astype(str).tolist()
+        selection_profiles = profiles
+        if backend in {"lstm", "xgboost"} and (not requested_zone_ids or zone_model_references is None):
+            eligible = eligible_training_zone_ids(
+                canonical_dataset, training_config, zone_ids=requested_zone_ids,
+                history_days=history_days, horizon_days=horizon_days,
+            )
+            selection_profiles = profiles[profiles["zone_id"].astype(str).isin(eligible)]
+            if selection_profiles.empty:
+                raise ValueError(f"No eligible offline {backend} training zones have forecast history")
+        if not requested_zone_ids and (len(selection_profiles) < 5 or "station_type" in selection_profiles):
+            requested_zone_ids = selection_profiles["zone_id"].astype(str).tolist()
         try:
             selected_zones = (
                 select_requested_zones(profiles, requested_zone_ids)
                 if requested_zone_ids
-                else select_zone_categories(profiles)
+                else select_zone_categories(selection_profiles)
             )
         except Exception as exc:
             raise PipelineStageError(stage="zone_selection", original=exc) from exc
     selected_zone_ids = selected_zones["zone_id"].astype(str).tolist()
+    if pipeline_stage != "agent" and zone_model_references is None:
+        zone_model_references = prepare_offline_models(
+            canonical_dataset, [backend], training_config, training_cli_overrides,
+            zone_ids=selected_zone_ids, history_days=history_days, horizon_days=horizon_days,
+            force_train=force_train, data_dir=data_dir,
+        )
+    current_model_references = ((bundle.manifest.get("model_provenance") or {}) if bundle is not None
+                                else (zone_model_references or {}).get(backend, {}))
+    selected_model_references = {zone: current_model_references[zone] for zone in selected_zone_ids
+                                if zone in current_model_references}
+    selected_model_provenance = dict(selected_model_references) if bundle is not None else {}
+    if selected_model_references:
+        forecast_parameters["model_ids"] = {zone: reference["model_id"]
+                                            for zone, reference in selected_model_references.items()}
     try:
         pipeline_data = load_pipeline_data(
             data_dir,
@@ -466,11 +553,17 @@ def run_pipeline(
                 pipeline_data=pipeline_data,
                 selected_zones=selected_zones,
                 zone_load_thresholds=zone_load_thresholds,
+                zone_model_references=(zone_model_references or {}).get(backend, {}),
+                raw_prediction_cache=raw_prediction_cache,
                 **forecast_runtime_parameters(forecast_parameters),
             )
             scenario_artifacts = {
                 str(zone_id): NativeForecasterArtifact.from_forecast_result(result)
                 for zone_id, result in forecast_results.items()
+            }
+            selected_model_provenance = {
+                str(zone): {key: result.summary.get(key) for key in (*MODEL_PROVENANCE_FIELDS, "model_parameters")}
+                for zone, result in forecast_results.items() if result.summary.get("model_id")
             }
         except PipelineStageError:
             raise
@@ -491,6 +584,7 @@ def run_pipeline(
                     cache_keys=pipeline_data.cache_keys or {},
                     feature_manifest=pipeline_data.feature_manifest or {},
                     dataset_adapter=dataset_spec.adapter,
+                    zone_model_references=(zone_model_references or {}).get(backend, {}),
                 ),
             )
         except Exception as exc:
@@ -621,6 +715,8 @@ def run_pipeline(
                 forecaster_dir=forecaster_dir,
                 selected_zone_ids=selected_zone_ids,
                 forecast_origin=forecast_parameters.get("forecast_origin"),
+                model_ids=forecast_parameters.get("model_ids"),
+                model_provenance=selected_model_provenance,
                 dataset_fingerprint=canonical_dataset.dataset_fingerprint,
                 cache_keys=pipeline_data.cache_keys or {},
                 feature_manifest=pipeline_data.feature_manifest or {},
@@ -633,6 +729,10 @@ def run_pipeline(
 
 def make_forecast_parameters(**values: Any) -> dict[str, Any]:
     """Persist only the resolved run and the active backend's hyperparameters."""
+    moved = [name for name in values if name.startswith(("lstm_", "xgboost_"))]
+    if moved:
+        raise ValueError("Offline training parameters belong to training configuration and per-zone model references: "
+                         + ", ".join(moved))
     defaults = RunConfig()
     common = ("forecast_origin", "backend", "history_days", "validation_days", "horizon_days", "diurnal_blend_alpha")
     missing = [name for name in common if name not in values]
@@ -652,6 +752,13 @@ def make_forecast_parameters(**values: Any) -> dict[str, Any]:
     parameters.update({name: values.get(name, getattr(defaults, name))
                        for name in BACKEND_PARAMETER_NAMES if name.startswith(backend.lower() + "_")})
     parameters["calibration_method"] = CALIBRATION_METHOD
+    if values.get("model_ids"):
+        model_ids = values["model_ids"]
+        if not isinstance(model_ids, dict) or any(not isinstance(zone, str) or not zone
+                                                  or not isinstance(model_id, str) or not model_id
+                                                  for zone, model_id in model_ids.items()):
+            raise ValueError("model_ids must map nonempty zone IDs to nonempty model IDs")
+        parameters["model_ids"] = dict(model_ids)
     return parameters
 
 
@@ -689,7 +796,11 @@ def build_forecaster_manifest(
     cache_keys: dict[str, str] | None = None,
     feature_manifest: dict[str, Any] | None = None,
     dataset_adapter: str = "urbanev",
+    zone_model_references: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    references = {zone: dict(zone_model_references[zone]) for zone in selected_zone_ids
+                  if zone_model_references and zone in zone_model_references}
+    model_ids = {zone: reference["model_id"] for zone, reference in references.items()}
     return {
         "schema_version": FORECASTER_MANIFEST_SCHEMA_VERSION,
         "stage": "forecaster",
@@ -703,7 +814,9 @@ def build_forecaster_manifest(
         },
         "feature_manifest": feature_manifest or {},
         "zone_ids": list(selected_zone_ids),
-        "forecast_parameters": dict(forecast_parameters),
+        "forecast_parameters": {**forecast_parameters, **({"model_ids": model_ids} if model_ids else {})},
+        "model_ids": model_ids,
+        "model_provenance": references,
     }
 
 
@@ -717,9 +830,11 @@ def build_agent_manifest(
     dataset_fingerprint: str | None = None,
     cache_keys: dict[str, str] | None = None,
     feature_manifest: dict[str, Any] | None = None,
+    model_ids: dict[str, str] | None = None,
+    model_provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "stage": "agent",
         "completed_at": pd.Timestamp.now().isoformat(),
         "agent_mode": agent_mode,
@@ -732,6 +847,8 @@ def build_agent_manifest(
         "feature_manifest": feature_manifest or {},
         "forecaster_output_dir": str(forecaster_dir.resolve()),
         "zone_ids": list(selected_zone_ids),
+        "model_ids": model_ids or {},
+        "model_provenance": model_provenance or {},
     }
 
 
@@ -816,6 +933,12 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
         raise ValueError(
             "Forecaster artifact Zone set does not match the no-leakage handoff."
         )
+    model_ids = manifest.get("model_ids") or {}
+    if forecast_parameters["backend"] in {"lstm", "xgboost"}:
+        if not isinstance(model_ids, dict) or set(model_ids) != set(selected_ids):
+            raise ValueError("Forecaster manifest must identify an offline model for every selected zone")
+        if forecast_parameters.get("model_ids") != model_ids:
+            raise ValueError("Forecaster model IDs differ between forecast parameters and manifest")
     for zone_id, artifact in scenario_artifacts.items():
         metadata = artifact.metadata()
         if metadata.get("backend") != forecast_parameters["backend"]:
@@ -824,6 +947,8 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
             raise ValueError(f"Forecaster artifact origin differs from the manifest for zone {zone_id}")
         if float(artifact.forecast_parameters.get("diurnal_blend_alpha", float("nan"))) != forecast_parameters["diurnal_blend_alpha"]:
             raise ValueError(f"Forecaster artifact blend alpha differs from the manifest for zone {zone_id}")
+        if forecast_parameters["backend"] in {"lstm", "xgboost"} and metadata.get("model_id") != model_ids[zone_id]:
+            raise ValueError(f"Forecaster artifact model ID differs from the manifest for zone {zone_id}")
 
     outputs = {
         "forecaster_output_dir": output_dir,
@@ -897,10 +1022,22 @@ def run_experiment_matrix(
     **pipeline_kwargs: Any,
 ) -> dict[str, Path]:
     max_dataset_errors = positive_integer(max_dataset_errors, "run.max_dataset_errors")
-    starts = normalize_forecast_starts(forecast_starts)
     models = normalize_forecast_models(forecast_models)
-    seeds = normalize_experiment_seeds(experiment_seeds)
     matrix_stage = normalize_pipeline_stage(pipeline_kwargs.get("pipeline_stage", "full"))
+    if matrix_stage == "train":
+        return run_training_stage(
+            data_dir=data_dir, backends=models, dataset_spec=pipeline_kwargs.get("dataset_spec"),
+            cache_dir=pipeline_kwargs.get("cache_dir"), training_config=pipeline_kwargs.get("training_config"),
+            training_cli_overrides=pipeline_kwargs.get("training_cli_overrides"),
+            zone_ids=zone_ids, experiment_zone_count=experiment_zone_count,
+            experiment_zone_selection=experiment_zone_selection, experiment_zone_seed=experiment_zone_seed,
+            history_days=pipeline_kwargs.get("history_days", RunConfig.history_days),
+            horizon_days=pipeline_kwargs.get("horizon_days", RunConfig.horizon_days),
+            force_train=bool(pipeline_kwargs.get("force_train", False)),
+            force_cache=bool(pipeline_kwargs.get("force_cache", False)),
+        )
+    starts = normalize_forecast_starts(forecast_starts)
+    seeds = normalize_experiment_seeds(experiment_seeds)
     requested_modes = normalize_agent_modes(
         agent_modes,
         pipeline_kwargs.get("agent_mode", "multi_agent_economist_retry"),
@@ -916,12 +1053,16 @@ def run_experiment_matrix(
         for backend in models
     }
     selected_zone_ids = normalize_zone_ids(zone_ids)
-    shared_cache_dir = Path(pipeline_kwargs.pop("cache_dir", data_dir / "cache"))
+    supplied_spec = pipeline_kwargs.get("dataset_spec")
+    shared_cache_dir = Path(pipeline_kwargs.pop("cache_dir", None)
+                            or (supplied_spec.resolved_cache_dir if supplied_spec else data_dir / "cache"))
     shared_cache_dir.mkdir(parents=True, exist_ok=True)
     base_force_cache = bool(pipeline_kwargs.pop("force_cache", False))
     selection_artifacts: dict[str, Path] = {}
-    if not selected_zone_ids:
-        matrix_dataset_spec = pipeline_kwargs.get("dataset_spec") or DatasetSpec(
+    offline_backends = [backend for backend in models if backend in {"lstm", "xgboost"}]
+    canonical_dataset = None
+    if not selected_zone_ids or (offline_backends and matrix_stage != "agent"):
+        matrix_dataset_spec = supplied_spec or DatasetSpec(
             path=data_dir,
             cache_dir=shared_cache_dir,
             weather_file=str(pipeline_kwargs.get("weather_file") or "weather_airport.csv"),
@@ -930,6 +1071,14 @@ def run_experiment_matrix(
             matrix_dataset_spec,
             force_cache=base_force_cache,
         )
+    training_eligible_zones = None
+    if offline_backends and matrix_stage != "agent":
+        training_eligible_zones = set(eligible_training_zone_ids(
+            canonical_dataset, pipeline_kwargs.get("training_config"), zone_ids=selected_zone_ids,
+            history_days=pipeline_kwargs.get("history_days", RunConfig.history_days),
+            horizon_days=pipeline_kwargs.get("horizon_days", RunConfig.horizon_days),
+        ))
+    if not selected_zone_ids:
         if normalize_zone_selection(experiment_zone_selection) == "random":
             eligibility = load_zone_eligibility(
                 canonical_dataset,
@@ -943,12 +1092,14 @@ def run_experiment_matrix(
                 "zone_eligibility_csv": Path(eligibility["csv_path"]),
             }
             eligible_ids = eligibility["eligible_zone_ids"]
+            if training_eligible_zones is not None:
+                eligible_ids = [zone for zone in eligible_ids if str(zone) in training_eligible_zones]
             requested_count = max(1, int(experiment_zone_count))
             if len(eligible_ids) < requested_count:
                 raise ValueError(
                     f"Only {len(eligible_ids)} eligible zones remain for {requested_count} requested random zones. "
                     "Both load and electricity price must vary in history before the first validation period, "
-                    "and all training windows must be complete. "
+                    "all historical windows must be complete and enough offline training samples must be available. "
                     "Choose another dataset/date or reduce its configured zone count "
                     "(run.experiment_zone_counts or run.experiment_zone_count). "
                     f"See eligibility reasons: {eligibility['cache_path']}"
@@ -972,13 +1123,29 @@ def run_experiment_matrix(
                 forecast_origin=selection_start,
                 force_cache=base_force_cache,
             )
+        if training_eligible_zones is not None:
+            profiles = profiles[profiles["zone_id"].astype(str).isin(training_eligible_zones)]
+            if profiles.empty:
+                raise ValueError("No candidate zones have enough complete sliding windows for offline training")
         selected_zone_ids = select_experiment_zone_ids(
             profiles,
             count=experiment_zone_count,
             selection=experiment_zone_selection,
             seed=experiment_zone_seed,
         )
-        del canonical_dataset
+    if matrix_stage != "agent":
+        if pipeline_kwargs.get("zone_model_references") is None:
+            pipeline_kwargs["zone_model_references"] = prepare_offline_models(
+                canonical_dataset, models, pipeline_kwargs.get("training_config"),
+                pipeline_kwargs.get("training_cli_overrides"), zone_ids=selected_zone_ids,
+                history_days=pipeline_kwargs.get("history_days", RunConfig.history_days),
+                horizon_days=pipeline_kwargs.get("horizon_days", RunConfig.horizon_days),
+                force_train=bool(pipeline_kwargs.get("force_train", False)), data_dir=data_dir,
+            )
+        pipeline_kwargs.setdefault("raw_prediction_cache", {})
+        # A force request applies to preparation, never to each experiment cell.
+        pipeline_kwargs["force_train"] = False
+    del canonical_dataset
     resolved_experiment_name = normalize_experiment_name(experiment_name, default="experiment")
     # main resolves <output_folder>/<experiment_name>/<dataset> once for every stage.
     experiment_dir = output_dir
@@ -1033,9 +1200,6 @@ def run_experiment_matrix(
                         run_output_dir = forecast_output_dir(run_base_dir, backend, blend_alpha)
                         run_kwargs = dict(pipeline_kwargs)
                         run_kwargs["agent_mode"] = agent_mode
-                        if seed is not None:
-                            run_kwargs["lstm_seed"] = seed
-                            run_kwargs["xgboost_seed"] = seed
                         run_kwargs["diurnal_blend_alpha"] = blend_alpha
                         if matrix_stage == "agent":
                             shared_run_base_dir = time_output_dir
@@ -1895,24 +2059,6 @@ def apply_price_conditioned_baseline_forecasts(
     chronos_repo: str,
     chronos_context_hours: int,
     chronos_device: str,
-    lstm_context_hours: int,
-    lstm_exog_cols: list[str] | None,
-    lstm_hidden_size: int,
-    lstm_num_layers: int,
-    lstm_epochs: int,
-    lstm_learning_rate: float,
-    lstm_batch_size: int,
-    lstm_device: str,
-    lstm_seed: int,
-    xgboost_lags: list[int] | None = None,
-    xgboost_exog_cols: list[str] | None = None,
-    xgboost_n_estimators: int = 300,
-    xgboost_max_depth: int = 9,
-    xgboost_learning_rate: float = 0.1,
-    xgboost_colsample_bytree: float = 0.9,
-    xgboost_tree_method: str = "approx",
-    xgboost_n_jobs: int = 1,
-    xgboost_seed: int = 42,
 ) -> list[dict[str, Any]]:
     normalized_model = normalize_forecast_model_name(backend)
     if normalized_model not in {"timesfm", "lstm", "chronos", "xgboost", "AR"}:
@@ -2817,24 +2963,8 @@ def build_contexts(
     chronos_repo: str,
     chronos_context_hours: int,
     chronos_device: str,
-    lstm_context_hours: int,
-    lstm_exog_cols: list[str] | None,
-    lstm_hidden_size: int,
-    lstm_num_layers: int,
-    lstm_epochs: int,
-    lstm_learning_rate: float,
-    lstm_batch_size: int,
-    lstm_device: str,
-    lstm_seed: int,
-    xgboost_lags: list[int] | None = None,
-    xgboost_exog_cols: list[str] | None = None,
-    xgboost_n_estimators: int = 300,
-    xgboost_max_depth: int = 9,
-    xgboost_learning_rate: float = 0.1,
-    xgboost_colsample_bytree: float = 0.9,
-    xgboost_tree_method: str = "approx",
-    xgboost_n_jobs: int = 1,
-    xgboost_seed: int = 42,
+    zone_model_references: dict[str, dict[str, Any]] | None = None,
+    raw_prediction_cache: dict | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, ForecastResult]]:
     start = pd.Timestamp(forecast_origin) if forecast_origin else None
     contexts = []
@@ -2850,6 +2980,15 @@ def build_contexts(
             profile=profile,
         )
         try:
+            model_reference = (zone_model_references or {}).get(zone_id)
+            if backend in {"lstm", "xgboost"} and model_reference is None:
+                raise ValueError(f"No usable offline {backend} weights for zone {zone_id}; see the backend training index")
+            zone_weather = pipeline_data.weather
+            canonical_dataset = getattr(pipeline_data, "canonical_dataset", None)
+            if backend in {"lstm", "xgboost"} and canonical_dataset is not None:
+                from zone_training import canonical_zone_frame
+                # Match training covariates, preserving this site's missing weather values.
+                zone_weather = canonical_zone_frame(canonical_dataset, zone_id)[["time", "T", "U", "nRAIN"]]
             raw_result = forecast_zone(
                 zone_id=zone_id,
                 category=row["category"],
@@ -2857,7 +2996,7 @@ def build_contexts(
                 service_price=pipeline_data.service_price,
                 energy_price=pipeline_data.energy_price,
                 occupancy=pipeline_data.occupancy,
-                weather=pipeline_data.weather,
+                weather=zone_weather,
                 profile=profile,
                 forecast_origin=start,
                 horizon_days=horizon_days,
@@ -2865,30 +3004,14 @@ def build_contexts(
                 validation_days=validation_days,
                 backend=backend,
                 diurnal_blend_alpha=diurnal_blend_alpha,
+                model_reference=model_reference,
+                raw_prediction_cache=raw_prediction_cache,
                 timesfm_repo=timesfm_repo,
                 timesfm_context_hours=timesfm_context_hours,
                 timesfm_exog_cols=timesfm_exog_cols,
                 chronos_repo=chronos_repo,
                 chronos_context_hours=chronos_context_hours,
                 chronos_device=chronos_device,
-                lstm_context_hours=lstm_context_hours,
-                lstm_exog_cols=lstm_exog_cols,
-                lstm_hidden_size=lstm_hidden_size,
-                lstm_num_layers=lstm_num_layers,
-                lstm_epochs=lstm_epochs,
-                lstm_learning_rate=lstm_learning_rate,
-                lstm_batch_size=lstm_batch_size,
-                lstm_device=lstm_device,
-                lstm_seed=lstm_seed,
-                xgboost_lags=xgboost_lags,
-                xgboost_exog_cols=xgboost_exog_cols,
-                xgboost_n_estimators=xgboost_n_estimators,
-                xgboost_max_depth=xgboost_max_depth,
-                xgboost_learning_rate=xgboost_learning_rate,
-                xgboost_colsample_bytree=xgboost_colsample_bytree,
-                xgboost_tree_method=xgboost_tree_method,
-                xgboost_n_jobs=xgboost_n_jobs,
-                xgboost_seed=xgboost_seed,
             )
         except Exception as exc:
             raise PipelineStageError(

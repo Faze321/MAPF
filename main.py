@@ -20,9 +20,11 @@ from config import (
 )
 from dataset_adapter import (DatasetSpec, default_forecast_start, evenly_spaced_forecast_starts,
                              load_canonical_dataset, resolve_dataset_spec)
+from training_config import (TRAINING_PARAMETER_NAMES, INTEGER_PARAMETERS, LIST_PARAMETERS,
+                             STRING_PARAMETERS)
 from reporting import output_lock, scoped_output
 from orchestrator import (format_failure_message, run_dataset_batch, run_experiment_matrix,
-                          run_pipeline, normalize_experiment_name)
+                          run_pipeline, run_training_stage, normalize_experiment_name)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,7 +34,21 @@ def build_parser() -> argparse.ArgumentParser:
         description="Run Multi-Agent Prescriptive Forecasting on EV charging datasets.",
     )
     parser.add_argument("--config", default="config.yaml", help="YAML config file for run and model settings.")
-    parser.add_argument("--lstm-epochs", type=int, help="Override LSTM training epochs.")
+    for name in TRAINING_PARAMETER_NAMES:
+        options = {"default": None, "help": "Override this offline training parameter for every selected dataset/site."}
+        if name in LIST_PARAMETERS:
+            options.update(nargs="*", type=int if name.endswith("_lags") else str)
+        elif name in INTEGER_PARAMETERS:
+            options["type"] = int
+        elif name not in STRING_PARAMETERS:
+            options["type"] = float
+        parser.add_argument("--" + name.replace("_", "-"), **options)
+    for name in ("train_ratio", "validation_ratio"):
+        parser.add_argument("--training-" + name.replace("_", "-"), type=float, default=None)
+    for name in ("min_history_days", "min_samples", "sample_stride_hours", "seed", "lstm_workers", "xgboost_workers"):
+        parser.add_argument("--training-" + name.replace("_", "-"), type=int, default=None)
+    parser.add_argument("--force-train", action=argparse.BooleanOptionalAction, default=None,
+                        help="Retrain offline weights; --force-cache only rebuilds data caches.")
     parser.add_argument("--data-dir", default=None, help="Dataset folder; overrides run.data_dir for one run.")
     parser.add_argument(
         "--dataset-adapter",
@@ -90,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--stage",
         dest="pipeline_stage",
         default=None,
-        help="Execution stage: full, forecaster, or agent.",
+        help="Execution stage: train, full, forecaster, or agent.",
     )
     parser.add_argument(
         "--forecaster-output-dir",
@@ -121,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="ISO timestamp(s) for an experiment matrix. Accepts space-separated or comma-separated values.",
     )
     parser.add_argument("--horizon-days", type=int, default=None, help="Forecast horizon.")
-    parser.add_argument("--history-days", type=int, default=None, help="History window used for the zone snippets.")
+    parser.add_argument("--history-days", type=int, default=None, help="History input length in days; LSTM/XGBoost use the complete window.")
     parser.add_argument("--validation-days", type=int, default=None, help="Validation window used for bias calibration.")
     parser.add_argument(
         "--zones",
@@ -147,7 +163,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--experiment-seeds",
         nargs="+",
         default=None,
-        help="Seed(s) for repeated experiment runs, affecting LSTM and XGBoost training.",
+        help="Labels/seeds for repeated Agent experiments; offline model training uses training.seed.",
     )
     parser.add_argument(
         "--agent-mode",
@@ -186,10 +202,15 @@ def main(argv: list[str] | None = None):
     app_config = AppConfig.from_file(config_path, required=False, load_agent=False)
     run_config = app_config.run
     data_config = app_config.data
-    if args.lstm_epochs is not None:
-        if args.lstm_epochs < 1:
-            raise ValueError("--lstm-epochs must be positive")
-        run_config = replace(run_config, lstm_epochs=args.lstm_epochs)
+    training_config = app_config.training
+    training_policies = {name: getattr(args, "training_" + name) for name in
+                         ("train_ratio", "validation_ratio", "min_history_days", "min_samples", "sample_stride_hours",
+                          "seed", "lstm_workers", "xgboost_workers")
+                         if getattr(args, "training_" + name) is not None}
+    if training_policies:
+        training_config = replace(training_config, **training_policies)
+    training_cli_overrides = {name: getattr(args, name) for name in TRAINING_PARAMETER_NAMES
+                              if getattr(args, name) is not None}
     pipeline_stage = normalize_pipeline_stage(
         args.pipeline_stage if args.pipeline_stage is not None else run_config.pipeline_stage
     )
@@ -221,6 +242,40 @@ def main(argv: list[str] | None = None):
             reuse_outputs=pipeline_stage == "agent",
         )
         print("Generated outputs:")
+        for name, path in outputs.items():
+            print(f"- {name}: {path}")
+        return outputs
+    resolved_data_dir = Path(data_dirs)
+    dataset_spec = resolve_dataset_spec(DatasetSpec(
+        path=resolved_data_dir,
+        adapter=args.dataset_adapter or data_config.adapter,
+        weather_file=args.weather_file or run_config.weather_file,
+        cache_dir=Path(args.cache_dir or data_config.cache_dir)
+        if (args.cache_dir or data_config.cache_dir)
+        else None,
+        timeseries_file=args.timeseries_file or data_config.timeseries_file,
+        column_mapping=data_config.column_mapping,
+        static_file=data_config.static_file,
+        static_mapping=data_config.static_mapping,
+        unit_conversions=data_config.unit_conversions,
+    ))
+    if pipeline_stage == "train":
+        selected_backends = normalize_forecast_model_list(args.forecast_models) or run_config.forecast_models or ["lstm", "xgboost"]
+        outputs = run_training_stage(
+            data_dir=resolved_data_dir, dataset_spec=dataset_spec,
+            backends=[backend for backend in selected_backends if backend in {"lstm", "xgboost"}],
+            training_config=training_config, training_cli_overrides=training_cli_overrides,
+            zone_ids=args.zones if args.zones is not None else run_config.zone_ids,
+            experiment_zone_count=(args.experiment_zone_count if args.experiment_zone_count is not None
+                                   else run_config.zone_count_for(resolved_data_dir)),
+            experiment_zone_selection=run_config.experiment_zone_selection,
+            experiment_zone_seed=run_config.experiment_zone_seed,
+            history_days=args.history_days if args.history_days is not None else run_config.history_days,
+            horizon_days=args.horizon_days if args.horizon_days is not None else run_config.horizon_days,
+            force_train=args.force_train if args.force_train is not None else run_config.force_train,
+            force_cache=args.force_cache if args.force_cache is not None else run_config.force_cache,
+        )
+        print("Generated training outputs:")
         for name, path in outputs.items():
             print(f"- {name}: {path}")
         return outputs
@@ -282,20 +337,6 @@ def main(argv: list[str] | None = None):
     else:
         agent_mode = run_config.agent_mode
 
-    resolved_data_dir = Path(data_dirs)
-    dataset_spec = resolve_dataset_spec(DatasetSpec(
-        path=resolved_data_dir,
-        adapter=args.dataset_adapter or data_config.adapter,
-        weather_file=args.weather_file or run_config.weather_file,
-        cache_dir=Path(args.cache_dir or data_config.cache_dir)
-        if (args.cache_dir or data_config.cache_dir)
-        else None,
-        timeseries_file=args.timeseries_file or data_config.timeseries_file,
-        column_mapping=data_config.column_mapping,
-        static_file=data_config.static_file,
-        static_mapping=data_config.static_mapping,
-        unit_conversions=data_config.unit_conversions,
-    ))
     common_kwargs = {
         "data_dir": resolved_data_dir,
         "dataset_spec": dataset_spec,
@@ -308,6 +349,9 @@ def main(argv: list[str] | None = None):
         "dry_run": args.dry_run if args.dry_run is not None else run_config.dry_run,
         "force_cache": args.force_cache if args.force_cache is not None else run_config.force_cache,
         "pipeline_stage": pipeline_stage,
+        "training_config": training_config,
+        "training_cli_overrides": training_cli_overrides,
+        "force_train": args.force_train if args.force_train is not None else run_config.force_train,
         "forecaster_output_dir": forecaster_output_dir,
         "agent_output_dir": agent_output_dir,
         "precomputed_window_data": (

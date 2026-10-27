@@ -66,11 +66,11 @@ class ForecastContracts(unittest.TestCase):
             "actual_kwh": np.arange(1.0, 49.0), "e_price": 0.4,
         })
         self.future = pd.DataFrame({
-            "time": pd.date_range(self.origin, periods=7, freq="h"),
+            "time": pd.date_range(self.origin, periods=24, freq="h"),
             "actual_kwh": 10000.0, "e_price": 0.4,
         })
 
-    def backend(self, name, stack):
+    def backend(self, name, stack, input_hours=48):
         def point(load, exog, horizon):
             return load[-1] + np.arange(1, horizon + 1) + exog[:horizon, 0]
 
@@ -89,28 +89,26 @@ class ForecastContracts(unittest.TestCase):
                 return values, values - 1, values + 1
             stack.enter_context(patch.object(forecasting, "run_chronos_prediction", side_effect=predict))
             return forecasting.forecast_load, {**common, "chronos_exog_cols": ["e_price"], "chronos_context_hours": 24}, None
-        trained = stack.enter_context(patch.object(forecasting, "train_lstm_model", return_value=object()))
-        stack.enter_context(patch.object(forecasting, "serialize_lstm_bundle", return_value={"trained": True}))
-        stack.enter_context(patch.object(forecasting, "deserialize_lstm_bundle", return_value=object()))
-        def predict(model, load, past_exog, exog, horizon):
-            return point(load, exog, horizon)
-        stack.enter_context(patch.object(forecasting, "run_lstm_prediction", side_effect=predict))
+        trained = stack.enter_context(patch("offline_models.train_zone_model", side_effect=AssertionError("inference must not train")))
+        def predict(context, future):
+            values = point(context.actual_kwh.to_numpy(), future[["e_price"]].to_numpy(), len(future))
+            return pd.DataFrame({"time": future.time.to_numpy(), "raw_predicted_kwh": values})
+        stack.enter_context(patch("zone_training.load_cached_predictor", return_value=predict))
         return forecasting.forecast_load, {
-            **common, "lstm_context_hours": 24, "lstm_exog_cols": ["e_price"],
-            "lstm_device": "cpu", "lstm_hidden_size": 8, "lstm_num_layers": 1,
-            "lstm_epochs": 1, "lstm_learning_rate": 0.001, "lstm_batch_size": 8, "lstm_seed": 42,
+            **common, "model_reference": {"backend": "lstm", "model_id": "fixture-lstm",
+                                           "parameters": {"input_hours": input_hours, "output_hours": 24}},
         }, trained
 
     def test_forecasts_never_roll_in_future_actuals(self):
-        expected = [49.4, 50.4, 51.4, 52.4, 53.4, 54.4, 55.4]
+        expected = 48.4 + np.arange(1, 25)
         for backend in ("timesfm", "chronos", "lstm"):
             with self.subTest(backend=backend), ExitStack() as stack:
                 predict, kwargs, _ = self.backend(backend, stack)
                 before = self.future.copy(deep=True)
-                result = predict(self.history, self.history.iloc[:0], self.future, self.origin, 7, **kwargs)
+                result = predict(self.history, self.history.iloc[:0], self.future, self.origin, 24, **kwargs)
                 np.testing.assert_allclose(result.predicted_kwh, expected)
                 changed = self.future.assign(actual_kwh=-123.0)
-                other = predict(self.history, self.history.iloc[:0], changed, self.origin, 7, **kwargs)
+                other = predict(self.history, self.history.iloc[:0], changed, self.origin, 24, **kwargs)
                 pd.testing.assert_frame_equal(result, other)
                 pd.testing.assert_frame_equal(self.future, before)
 
@@ -118,14 +116,14 @@ class ForecastContracts(unittest.TestCase):
         history, validation = self.history.iloc[:-24], self.history.iloc[-24:]
         for backend in ("timesfm", "chronos", "lstm"):
             with self.subTest(backend=backend), ExitStack() as stack:
-                predict, kwargs, trained = self.backend(backend, stack)
+                predict, kwargs, trained = self.backend(backend, stack, input_hours=24)
                 kwargs["diurnal_blend_alpha"] = 0.3
-                result = predict(history, validation, self.future, self.origin, 7, **kwargs)
+                result = predict(history, validation, self.future, self.origin, 24, **kwargs)
                 state = result.attrs["reusable_forecaster_state"]
                 self.assertTrue(state["calibration"]["enabled"])
                 if trained:
                     trained.reset_mock()
-                replay = predict(history, validation, self.future, self.origin, 7, fitted_state=state, **kwargs)
+                replay = predict(history, validation, self.future, self.origin, 24, fitted_state=state, **kwargs)
                 pd.testing.assert_frame_equal(result, replay)
                 if trained:
                     trained.assert_not_called()

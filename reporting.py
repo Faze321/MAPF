@@ -23,6 +23,10 @@ PRICE_ERROR_THRESHOLD_RATIO = 0.08
 PRICE_ERROR_THRESHOLD_PCT = PRICE_ERROR_THRESHOLD_RATIO * 100
 ECONOMIST_AGENT_OUTPUT_KEY = "_economist_agent_output"
 CONTROL_AGENT_USAGE_KEY = "_control_agent_usage"
+MODEL_PROVENANCE_FIELDS = (
+    "model_id", "model_training_start", "model_training_end_exclusive",
+    "training_overlap_hours", "evaluation_is_out_of_sample",
+)
 EXPLAINABILITY_RUBRIC_TEXT = """# Explainability Evaluation Rubric
 
 Score each criterion from 1 to 5.
@@ -40,6 +44,7 @@ Recommended protocol: use at least two independent raters, then add an operator 
 TRACE_COLUMNS = [
     "category",
     "zone_id",
+    *MODEL_PROVENANCE_FIELDS,
     "predicted_load_kwh",
     "predicted_change_pct",
     "grid_stress_level",
@@ -234,8 +239,16 @@ def write_forecaster_outputs(
     }
     outputs.update(metrics)
     if manifest is not None:
+        provenance = {
+            str(zone): {key: result.summary.get(key) for key in (*MODEL_PROVENANCE_FIELDS, "model_parameters")}
+            for zone, result in forecast_results.items() if result.summary.get("model_id")
+        }
+        model_ids = {zone: values["model_id"] for zone, values in provenance.items()}
         manifest_payload = {
             **manifest,
+            "model_ids": model_ids,
+            "model_provenance": provenance,
+            "forecast_parameters": {**(manifest.get("forecast_parameters") or {}), "model_ids": model_ids},
             "artifacts": {
                 "selected_zones": selected_path.name,
                 "context_snippets": contexts_path.name,
@@ -411,6 +424,10 @@ def write_control_outputs(
 
     for report in reports:
         zone_id = report.get("zone_id")
+        saved_provenance = (metadata.get("model_provenance") or {}).get(str(zone_id), {})
+        provenance = {key: report.get(key, saved_provenance.get(key)) for key in MODEL_PROVENANCE_FIELDS}
+        if provenance["model_id"] is None:
+            provenance["model_id"] = (metadata.get("model_ids") or {}).get(str(zone_id))
         final_windows = [
             {key: window.get(key) for key in safe_window_keys if key in window}
             for window in report.get("price_change_windows_3h") or []
@@ -426,6 +443,7 @@ def write_control_outputs(
         zones.append(
             {
                 "zone_id": zone_id,
+                **provenance,
                 "category": report.get("category"),
                 "status": report.get("control_status", "fail"),
                 "attempts_used": report.get("attempts_used", len(attempts)),
@@ -471,6 +489,7 @@ def write_control_outputs(
                     "backend": backend,
                     "agent_mode": agent_mode,
                     "zone_id": zone_id,
+                    **provenance,
                     "category": report.get("category"),
                     "zone_status": report.get("control_status", "fail"),
                     "attempts_used": report.get("attempts_used", len(attempts)),
@@ -526,6 +545,7 @@ def write_control_outputs(
                         "backend": backend,
                         "agent_mode": agent_mode,
                         "zone_id": zone_id,
+                        **provenance,
                         "category": report.get("category"),
                         "attempt": attempt_number,
                         "proposal_phase": attempt.get("proposal_phase"),
@@ -569,6 +589,9 @@ def write_control_outputs(
         "dataset_fingerprint": metadata.get("dataset_fingerprint"),
         "cache_keys": metadata.get("cache_keys") or {},
         "feature_manifest": metadata.get("feature_manifest") or {},
+        "model_ids": {str(zone["zone_id"]): zone["model_id"] for zone in zones if zone.get("model_id")},
+        "model_provenance": {str(zone["zone_id"]): {key: zone.get(key) for key in MODEL_PROVENANCE_FIELDS}
+                             for zone in zones if zone.get("model_id")},
         "attempt_limit": 3,
         "attempts_used": max((int(zone["attempts_used"] or 0) for zone in zones), default=0),
         "success_policy": "all zones and all 3-hour windows are Medium",
@@ -943,6 +966,9 @@ def write_forecast_outputs(
         hourly = result.hourly.copy()
         hourly.insert(0, "zone_id", zone_id)
         hourly.insert(1, "category", result.summary.get("category"))
+        for key in MODEL_PROVENANCE_FIELDS:
+            if key in result.summary:
+                hourly[key] = result.summary[key]
         hourly_path = details_dir / f"zone_{safe_zone}_forecast_vs_actual.csv"
         plot_path = details_dir / f"zone_{safe_zone}_forecast_plot.png"
         old_svg_path = details_dir / f"zone_{safe_zone}_forecast_plot.svg"
@@ -957,6 +983,7 @@ def write_forecast_outputs(
         metric_rows.append(
             {
                 "zone_id": zone_id,
+                **{key: result.summary.get(key) for key in MODEL_PROVENANCE_FIELDS},
                 "category": result.summary.get("category"),
                 "backend": result.summary.get("backend"),
                 "diurnal_blend_alpha": result.summary.get("diurnal_blend_alpha"),

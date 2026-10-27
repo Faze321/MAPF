@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from config import DataConfig, RunConfig
+from config import DataConfig, RunConfig, TrainingConfig
 from dataset_adapter import (DatasetSpec, load_canonical_dataset, validate_forecaster_dataset_source,
                              MPEVDataDatasetAdapter, tou_schedule, resolve_dataset_spec, merge_cache_manifest,
                              replace_cache_file, evenly_spaced_forecast_starts, process_file_lock)
@@ -168,7 +168,7 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(DataConfig.from_mapping({}).adapter, "auto")
         self.assertIsNone(run.forecast_starts)
         self.assertIsNone(run.zone_ids)
-        self.assertEqual(run.lstm_device, "auto")
+        self.assertEqual(TrainingConfig().resolve(self.root, "A", "lstm")["lstm_device"], "cuda")
         for value in [[], "", 4, [None], [folder, folder]]:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 RunConfig.from_mapping({"data_dir": value})
@@ -284,7 +284,7 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(kwargs["forecast_starts"], ["2023-04-02T00:00:00"])
         self.assertEqual(kwargs["forecast_models"], ["AR", "lstm"])
         self.assertIsNone(kwargs["zone_ids"])
-        self.assertEqual(kwargs["lstm_device"], "auto")
+        self.assertEqual(kwargs["training_config"].resolve(self.root, "A", "lstm")["lstm_device"], "cuda")
         self.assertEqual(kwargs["output_dir"], self.root / "out" / "experiment" / "CHARGED_LOA")
         with patch("main.run_experiment_matrix", return_value={}) as run:
             main(["--config", str(config), "--experiment-name", "named_experiment"])
@@ -454,6 +454,12 @@ class DatasetTests(unittest.TestCase):
         self.assertEqual(manifest.read_text(encoding="utf-8"), "existing run")
 
     def test_named_matrix_reuses_forecaster_and_full_mode_outputs_in_place(self):
+        preparation = patch("orchestrator.prepare_offline_models", return_value={"lstm": {"001": {"model_id": "fixture"}}})
+        preparation.start()
+        self.addCleanup(preparation.stop)
+        assessment = patch("orchestrator.eligible_training_zone_ids", return_value=["001"])
+        assessment.start()
+        self.addCleanup(assessment.stop)
         spec = self.charged(days=31)
         config = self.root / "named.yaml"
         config.write_text(yaml.safe_dump({"agent": {}, "run": {

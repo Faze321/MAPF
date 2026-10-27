@@ -5,7 +5,7 @@ MAPF separates forecasting from price control and keeps forecast-period ground t
 ## Architecture
 
 1. **Dataset adapter and cache** converts UrbanEV, CHARGED, MP-EVData, or a mapped long-format dataset to a canonical schema. Reusable dataset features are stored under `<dataset_path>/cache/`.
-2. **Global forecaster** fits once at a fixed origin, calibrates validation bias, and persists a reusable artifact. Price proposals reuse this artifact; no control attempt retrains the model.
+2. **Offline models** train a separate LSTM and XGBoost for each available Zone from that Zone's full valid history. Forecasting reads these cached weights, calibrates each origin, and persists reusable inference state. Price proposals reuse the same model and bias.
 3. **Control engine** runs either Grid → Behaviour → Economist or a single Agent, proposes one energy price per continuous 3-hour window, reforecasts, and accepts a run only when every Zone/window is `Medium`.
 4. **Evaluation** is kept separate from the no-leakage handoff and authoritative control result.
 
@@ -76,7 +76,7 @@ The cache is fingerprinted by adapter/schema version, source paths, sizes, mtime
       historical_3h_load_policy.csv
 ```
 
-`--force-cache` rebuilds caches. Writes use a temporary file followed by atomic replacement. Model state, validation bias, forecasts, Agent output, closed-loop traces, and evaluation are never stored in the dataset cache.
+`--force-cache` rebuilds dataset caches. Writes use a temporary file followed by atomic replacement. Offline LSTM/XGBoost weights live under `<dataset_path>/cache/weight/<backend>/`; forecast-specific calibration, forecasts, Agent output and evaluation remain in experiment outputs.
 
 ## Running
 
@@ -257,21 +257,129 @@ because the earlier attempts may have unreported usage. Existing prompt, complet
 and total token counts retain their meanings. The dataset cache is independent of
 this server-side prefix cache.
 
+## Offline training for each Zone
+
+Each selected Zone has its own LSTM and XGBoost. The pipeline checks training
+eligibility before selecting Zones, then prepares weights only for that selection.
+Training uses each Zone's available historical series independently of forecast
+origins, alpha values, Agent modes, and experiment seeds. Explicit training runs use:
+
+```powershell
+python main.py --stage train --forecast-models lstm xgboost
+```
+
+Forecaster and Full stages prepare missing or stale models before generating
+forecasts. Agent-only requires the saved forecast artifact and its referenced
+weights. `--force-train` creates a new immutable version; existing references
+continue to identify their original model. Model IDs depend on the Zone's
+training content, resolved training parameters, and input/output window lengths. Updating another Zone or
+changing the forecast matrix does not invalidate an unchanged model.
+The preparation stage rebuilds missing or corrupt caches into a fresh version and
+records the recovery reason. Agent-only replay remains bound to the saved version
+and fails if that version is missing or damaged.
+
+`run.history_days` determines the input window H and `run.horizon_days` the
+direct output window P, both in hours. Defaults are 720 input hours and 24 output
+hours. With stride 1, N consecutive hourly observations yield N-H-P+1 complete
+samples. Every input and output hour must exist; windows never cross gaps or pad
+missing loads. A Zone needs at least 45 days of valid history and 512 complete
+samples, so default windows require at least 1,255 consecutive hours. Duplicate
+timestamps, insufficient samples, and constant load or price are rejected.
+
+Complete samples are ordered chronologically and split using `train_ratio: 0.8`
+and `validation_ratio: 0.2`. Training samples whose output labels reach the first
+validation target are purged. Both ratios must be positive and sum to 1;
+for example, `--training-train-ratio 0.7 --training-validation-ratio 0.3`.
+Reports retain requested ratios, actual counts,
+and purged counts. Preprocessing uses only the training prefix. Each model fits
+once, stops early if validation no longer improves, and saves its best weights
+or trees. It is not refitted on validation data. This internal split is separate
+from the forecast's five-day bias calibration.
+
+Defaults are fixed: LSTM hidden size 32, one layer, batch size 64, learning rate
+0.001, and at most 100 epochs; XGBoost depth 3, learning rate 0.03, and at most
+800 trees per output hour. LSTM produces P values in one forward pass; XGBoost
+saves P independent regressors. Batch size controls LSTM batches. XGBoost uses
+`xgboost_n_estimators` and `xgboost_learning_rate`, without an epoch or batch setting.
+
+Training settings belong in a separate top-level section; old `run.lstm_*` and
+`run.xgboost_*` training fields are rejected. Plural per-model alpha lists remain
+under `run`. Override precedence is CLI, Zone, dataset, global defaults, then
+built-in defaults. Explicit training seeds are independent of experiment seeds.
+
+```yaml
+training:
+  train_ratio: 0.8
+  validation_ratio: 0.2
+  min_history_days: 45
+  min_samples: 512
+  sample_stride_hours: 1
+  seed: 42
+  lstm_workers: 1
+  xgboost_workers: 2
+  defaults:
+    lstm_device: cuda
+    lstm_hidden_size: 32
+    lstm_num_layers: 1
+    lstm_batch_size: 64
+    lstm_learning_rate: 0.001
+    lstm_epochs: 100
+    lstm_early_stopping_patience: 10
+    xgboost_device: cuda
+    xgboost_n_jobs: 2
+    xgboost_n_estimators: 800
+    xgboost_max_depth: 3
+    xgboost_learning_rate: 0.03
+    xgboost_early_stopping_rounds: 50
+  dataset_overrides:
+    data/CHARGED/JHB:
+      lstm_hidden_size: 32
+  zone_overrides:
+    data/MP-EVData:
+      A10:
+        lstm_batch_size: 32
+```
+
+LSTM and XGBoost default to CUDA for offline training and inference. Use
+`cuda:0` to select a specific GPU, or `--lstm-device cpu --xgboost-device cpu`
+to explicitly use CPU. Device settings are part of the training fingerprint, so
+changing the device creates or selects the corresponding cached model version.
+
+`lstm_workers` and `xgboost_workers` control concurrent Zone model training per
+dataset and backend. They accept any positive integer, with defaults of 1 and 2.
+There is no global training lock across datasets: up to `max_parallel_datasets`
+datasets can each use their configured workers. XGBoost uses two host threads
+per model by default. CLI overrides remain `--training-lstm-workers` and
+`--training-xgboost-workers`.
+
+Offline fitting and early-stopping validation can include dates later than a historical forecast origin.
+The forecast is still generated without reading future observations as inputs,
+but it is not a strict out-of-sample backtest when its labels influenced fitting or early stopping.
+Results retain the exact model ID, training range, and per-hour training overlap;
+offline evaluation keeps distinct model versions separate and reports overlap.
+Zero overlap only means the evaluated hours were absent from fitted data; it does
+not establish a temporal holdout if the model used later observations.
+`evaluation_is_out_of_sample` requires the forecast origin to be at or after the
+recorded end of training. Agent, window, usage and paired summaries also separate
+model versions; the overall Agent inventory explicitly spans all versions.
+
 ## Forecast windows and daily bias calibration
 
-All five backends use the same default split: 30 days of training history,
+All five backends use the same default forecast split: 30 days of history,
 5 days of validation, and 1 day of forecasting. The lengths remain configurable.
-For forecast origin `T`, the default training window is `[T-35d, T-5d)`,
-validation is `[T-5d, T)`, and the forecast is `[T, T+1d)`. Each model's
-`context_hours` is independent of the available training/history window.
+For forecast origin `T`, the default history window is `[T-35d, T-5d)`,
+validation is `[T-5d, T)`, and the forecast is `[T, T+1d)`. LSTM/XGBoost input
+length equals `history_days`; TimesFM/Chronos retain their own context settings.
 
-Each Zone/model run fits once, using only the training window. Validation makes
-five separate 24-hour predictions. At each validation origin, context consists
+LSTM/XGBoost load the Zone's offline model without fitting at the forecast origin.
+AR estimates its price response from the history window. Validation evaluates five
+separate 24-hour predictions. LSTM/XGBoost predict the full configured output
+window each time and use its first 24 hours for calibration. At each validation origin, context consists
 of the most recent `history_days` of already observed load; observations from
-the current or later validation day cannot enter its forecast. Trained weights,
-scalers, the AR price response, and the training diurnal profile remain frozen.
+the current or later validation day cannot enter its forecast input. Saved weights,
+scalers, the AR price response, and the history diurnal profile remain frozen.
 
-For each validation day, model predictions are blended once with the training
+For each validation day, model predictions are blended once with the history
 diurnal profile. Their signed errors (`blended prediction - actual`) are averaged
 across validation days at each of the 24 horizon offsets. The final prediction
 is `max(0, blended prediction - bias[offset % 24])`. Thus the default produces
@@ -281,8 +389,8 @@ predictions, hourly residuals, and the averaged bias vector.
 
 Incomplete or invalid validation load is an error. `validation_days: 0` disables
 calibration. A longer configured forecast repeats the 24-hour bias vector; it
-never consumes forecast-period actual load. LSTM and XGBoost may recursively
-predict within the requested horizon. The old `roll_actuals` and per-model
+never consumes forecast-period actual load. LSTM and XGBoost directly predict
+the entire configured horizon. The old `roll_actuals` and per-model
 `step_horizon` settings have been removed.
 
 Configuration selects dates and models through plural keys, even for one run:
@@ -339,35 +447,36 @@ backends for a model comparison. This CLI override selects only XGBoost:
 python main.py --config config.yaml --forecast-models xgboost --pipeline-stage forecaster
 ```
 
-`xgboost` (alias `xgb`) trains one `XGBRegressor` per Zone. Defaults follow the
-supplied notebook: 300 trees, depth 9, learning rate 0.1, column sampling 0.9,
-and `tree_method: approx`. It runs on CPU with one thread by default. All
-`xgboost_*` settings are listed in `config.example.yaml`; experiment seeds and
-global and independent diurnal-blend sweeps also apply to this backend.
+`xgboost` (alias `xgb`) trains one `XGBRegressor` for each output hour per selected
+Zone in the offline phase, with early stopping on internal validation.
+Defaults use learning rate 0.03, column sampling 0.9, `tree_method: hist`, and `device: cuda`.
+Training overrides are listed in `config.example.yaml`; global and independent
+diurnal-blend sweeps reuse the same saved model.
 
-Inputs are load lags (default 1, 2, 3 and 24 hours), hourly/weekly calendar cycles,
-and the configured known covariates. Training requires more history hours than
-the largest lag. Targets are in kWh; no scaler is fitted. Missing weather and
-other covariates remain NaN for XGBoost's missing-value handling. Target columns
+Inputs contain all H historical loads, recent load summaries, hourly/weekly calendar
+cycles, and the P hours of configured known covariates. Load normalization is
+fitted only on the training prefix, and outputs are converted back to kWh.
+Missing weather and other covariates remain NaN with missingness indicators. Target columns
 cannot be selected as covariates. Future prices/weather must be available at
 the forecast origin, as with the other covariate forecasters.
 
-The model follows the shared daily bias-calibration protocol above. Its internal
-recursion appends its own raw predictions; blending and correction happen once
+The model follows the shared daily bias-calibration protocol above. All P output
+hours are predicted directly; blending and correction happen once
 on the forecast output. The q10/q90 columns follow the empirical residual-width
 convention and are not learned quantiles. With no validation, bias is zero and
 interval bounds are unavailable.
 
-The artifact stores the trained model in XGBoost's
+The weight cache stores the P regressors in a bundle using XGBoost's
 [JSON model format](https://xgboost.readthedocs.io/en/stable/tutorials/saving_model.html),
-lag state and calibration. Full and Agent-only runs reuse it for each proposed
+alongside preprocessing parameters. The forecast artifact stores calibration and
+an immutable model reference. Full and Agent-only runs reuse them for each proposed
 price schedule without retraining. Load changes depend on the relationships
 learned from history; tree predictions can remain unchanged for small price changes.
 
 ## Fixed-origin and no leakage
 
-- Profiles, scalers, stress thresholds, preprocessing, and validation calibration use only timestamps before `forecast_origin`.
-- Multi-step forecasts roll their own predictions, never forecast-period actual load.
+- Forecast contexts, stress thresholds and bias calibration use only observations before `forecast_origin`. Offline LSTM/XGBoost weights and scalers follow their independently recorded training period; overlap is reported for historical evaluations.
+- LSTM/XGBoost produce direct multi-step outputs without forecast-period actual load.
 - Agent context is constructed from an allowlist. It excludes future actual load/stress/percentile, future error metrics, evaluation nodes, and all derived correctness labels.
 - Grid Agent assesses the forecaster values but cannot overwrite them.
 - Only structured reasoning summaries are persisted; hidden chain-of-thought is neither requested nor stored.

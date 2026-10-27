@@ -12,12 +12,12 @@ import pandas as pd
 from evaluate import evaluate_agent, evaluate_directory, evaluate_experiments, write_evaluation
 
 
-def saved_run(root, mode="single", price=3, cache=True, forecast_delta=0):
+def saved_run(root, mode="single", price=3, cache=True, forecast_delta=0, origin="2026-01-01"):
     run = root / "arbitrary" / mode / "AR"
     forecast = run / "forecaster"
     details = forecast / "evaluation" / "forecast_details"
     details.mkdir(parents=True)
-    times = pd.date_range("2026-01-01", periods=6, freq="h")
+    times = pd.date_range(origin, periods=6, freq="h")
     pd.DataFrame({"zone_id": ["001"] * 6, "time": times,
                   "actual_kwh": [10, 10, 10, 20, 20, 20],
                   "predicted_kwh": [10 + forecast_delta] * 3 + [20] * 3}).to_csv(
@@ -27,7 +27,7 @@ def saved_run(root, mode="single", price=3, cache=True, forecast_delta=0):
     features = {"adapter": "mp_evdata", "price_unit": "CNY/kWh"}
     manifest = {"data_source": {"adapter": "mp_evdata", "dataset_fingerprint": "fixture"},
                 "feature_manifest": features, "zone_ids": ["001"],
-                "forecast_parameters": {"forecast_start": "2026-01-01 00:00:00", "forecast_model": "AR", "horizon_days": .25}}
+                "forecast_parameters": {"forecast_start": str(times[0]), "forecast_model": "AR", "horizon_days": .25}}
     (forecast / "forecaster_manifest.json").write_text(json.dumps(manifest))
     windows = [{"window_start": str(times[i * 3]), "window_end": str(times[i * 3 + 2]),
                 "mean_energy_price": 2, "sum_predicted_kwh": 30 * (i + 1),
@@ -53,7 +53,7 @@ def saved_run(root, mode="single", price=3, cache=True, forecast_delta=0):
     if cache:
         total["cached_tokens"] = 15
     control = {"schema_version": 3, "forecast_model": "AR", "agent_mode": mode,
-               "forecast_origin": "2026-01-01T00:00:00", "dataset_fingerprint": "fixture",
+               "forecast_origin": times[0].isoformat(), "dataset_fingerprint": "fixture",
                "feature_manifest": features, "attempt_limit": 2, "attempts_used": 2, "status": "success",
                "agent_cumulative_usage": total, "agent_round_usage": rounds, "agent_step_token_usage": calls,
                "zones": [{"zone_id": "001", "status": "success", "attempts_used": 2,
@@ -83,6 +83,42 @@ class EvaluationIntegrationTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
+
+    def test_agent_window_usage_and_paired_tables_keep_trained_versions_separate(self):
+        batches = {"left": self.root / "left", "right": self.root / "right"}
+        for batch_root in batches.values():
+            for origin, model_id in (("2026-01-01", "weights-v1"), ("2026-02-01", "weights-v2")):
+                path = saved_run(batch_root / model_id, origin=origin)
+                control = json.loads(path.read_text())
+                control["model_ids"] = {"001": model_id}
+                control["zones"][0]["model_id"] = model_id
+                path.write_text(json.dumps(control))
+                manifest_path = path.parent.parent / "forecaster" / "forecaster_manifest.json"
+                manifest = json.loads(manifest_path.read_text())
+                manifest["model_ids"] = {"001": model_id}
+                manifest_path.write_text(json.dumps(manifest))
+        report = evaluate_experiments(batches)
+        self.assertEqual(report["agent"]["overall"]["model_set_count"], 2)
+        self.assertEqual(report["agent"]["overall"]["aggregation_scope"], "inventory_across_model_sets")
+        rows = report["agent"]["by_model_and_mode"]
+        self.assertEqual(len(rows), 4)
+        self.assertTrue(all(row["run_count"] == 1 for row in rows))
+        for table in ("round_overall", "round_by_dataset", "round_by_mode", "revenue_by_dataset_model_mode"):
+            final = [row for row in report["tables"][table] if row["phase"] == "final"]
+            self.assertEqual(len(final), 4, table)
+            self.assertEqual(len({row["model_set_id"] for row in final}), 2, table)
+            self.assertTrue(all(row["window_count"] == 2 for row in final), table)
+        for table in ("usage_by_batch", "usage_by_mode", "usage_by_dataset", "usage_by_dataset_model_mode", "ppt_medium", "ppt_tokens"):
+            rows = report["tables"][table]
+            self.assertEqual(len(rows), 4, table)
+            self.assertEqual(len({row["model_set_id"] for row in rows}), 2, table)
+        paired = report["comparison"]["paired_summary"]
+        self.assertEqual(len(paired), 2)
+        self.assertTrue(all(row["pair_count"] == 1 for row in paired))
+        self.assertEqual(len({row["left_model_set_id"] for row in paired}), 2)
+        target = write_evaluation(report, self.root / "analysis")
+        markdown = target.with_name("evaluation_report_zh.md").read_text(encoding="utf-8")
+        self.assertTrue(all(row["left_model_set_id"] in markdown for row in paired))
 
     def test_tables_report_and_json_agree_and_sources_remain_unchanged(self):
         path = saved_run(self.root)

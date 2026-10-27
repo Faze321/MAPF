@@ -11,35 +11,11 @@ import re
 import os
 import yaml
 
-XGBOOST_PARAMETER_DEFAULTS = {
-    "xgboost_lags": None,
-    "xgboost_exog_cols": None,
-    "xgboost_n_estimators": 300,
-    "xgboost_max_depth": 9,
-    "xgboost_learning_rate": 0.1,
-    "xgboost_colsample_bytree": 0.9,
-    "xgboost_tree_method": "approx",
-    "xgboost_n_jobs": 1,
-    "xgboost_seed": 42,
-}
+from training_config import TrainingConfig, TRAINING_PARAMETER_NAMES
 
 BACKEND_PARAMETER_NAMES = (
-    *XGBOOST_PARAMETER_DEFAULTS,
-    "timesfm_repo",
-    "timesfm_context_hours",
-    "timesfm_exog_cols",
-    "chronos_repo",
-    "chronos_context_hours",
-    "chronos_device",
-    "lstm_context_hours",
-    "lstm_exog_cols",
-    "lstm_hidden_size",
-    "lstm_num_layers",
-    "lstm_epochs",
-    "lstm_learning_rate",
-    "lstm_batch_size",
-    "lstm_device",
-    "lstm_seed",
+    "timesfm_repo", "timesfm_context_hours", "timesfm_exog_cols",
+    "chronos_repo", "chronos_context_hours", "chronos_device",
 )
 
 FORECAST_BACKENDS = ("timesfm", "chronos", "lstm", "xgboost", "AR")
@@ -71,7 +47,7 @@ def resolve_backend_blend_alphas(backend: str, global_values: Any, overrides: di
     return local if local is not None else global_alphas if global_alphas is not None else [0.0]
 
 
-PIPELINE_STAGES = {"full", "forecaster", "agent"}
+PIPELINE_STAGES = {"train", "full", "forecaster", "agent"}
 AGENT_BACKENDS = {"auto", "openrouter", "openai_compatible", "vllm", "sglang"}
 LOCAL_AGENT_BACKENDS = {"vllm", "sglang"}
 LOCAL_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
@@ -166,6 +142,7 @@ class RunConfig:
     weather_file: str = "weather_airport.csv"
     dry_run: bool = False
     force_cache: bool = False
+    force_train: bool = False
     pipeline_stage: str = "full"
     forecaster_output_dir: str | None = None
     agent_output_dir: str | None = None
@@ -197,24 +174,6 @@ class RunConfig:
     chronos_repo: str = "amazon/chronos-2"
     chronos_context_hours: int = 512
     chronos_device: str = "auto"
-    lstm_context_hours: int = 24
-    lstm_exog_cols: list[str] | None = None
-    lstm_hidden_size: int = 64
-    lstm_num_layers: int = 1
-    lstm_epochs: int = 50
-    lstm_learning_rate: float = 0.001
-    lstm_batch_size: int = 32
-    lstm_device: str = "auto"
-    lstm_seed: int = 42
-    xgboost_lags: list[int] | None = None
-    xgboost_exog_cols: list[str] | None = None
-    xgboost_n_estimators: int = 300
-    xgboost_max_depth: int = 9
-    xgboost_learning_rate: float = 0.1
-    xgboost_colsample_bytree: float = 0.9
-    xgboost_tree_method: str = "approx"
-    xgboost_n_jobs: int = 1
-    xgboost_seed: int = 42
     temperature: float = 0.2
 
     @property
@@ -230,6 +189,10 @@ class RunConfig:
     def from_mapping(cls, raw: dict[str, Any] | None) -> "RunConfig":
         settings = raw or {}
         reject_retired_forecast_settings(settings)
+        moved = [key for key in settings if key.startswith(("lstm_", "xgboost_"))
+                 and key not in ("lstm_diurnal_blend_alphas", "xgboost_diurnal_blend_alphas")]
+        if moved:
+            raise ValueError("Training settings moved out of run; use training.defaults: " + ", ".join(moved))
         zone_ids = settings.get("zone_ids", settings.get("zones"))
         forecast_starts = normalize_string_list(settings.get("forecast_starts"))
         forecast_models = normalize_forecast_model_list(settings.get("forecast_models"))
@@ -247,21 +210,8 @@ class RunConfig:
                 "experiment_zone_seed",
                 "timesfm_context_hours",
                 "chronos_context_hours",
-                "lstm_context_hours",
-                "lstm_hidden_size",
-                "lstm_num_layers",
-                "lstm_epochs",
-                "lstm_batch_size",
-                "lstm_seed",
-                "xgboost_n_estimators",
-                "xgboost_max_depth",
-                "xgboost_n_jobs",
-                "xgboost_seed",
             )),
             (optional_float, (
-                "lstm_learning_rate",
-                "xgboost_learning_rate",
-                "xgboost_colsample_bytree",
                 "temperature",
             )),
         ):
@@ -285,6 +235,7 @@ class RunConfig:
             weather_file=optional_str(settings.get("weather_file")) or "weather_airport.csv",
             dry_run=optional_bool(settings.get("dry_run"), False),
             force_cache=optional_bool(settings.get("force_cache"), False),
+            force_train=optional_bool(settings.get("force_train"), False),
             pipeline_stage=normalize_pipeline_stage(settings.get("pipeline_stage")),
             forecaster_output_dir=optional_str(settings.get("forecaster_output_dir")),
             agent_output_dir=optional_str(settings.get("agent_output_dir")),
@@ -305,11 +256,6 @@ class RunConfig:
             timesfm_exog_cols=normalize_zone_id_list(settings.get("timesfm_exog_cols")),
             chronos_repo=optional_str(settings.get("chronos_repo")) or "amazon/chronos-2",
             chronos_device="auto",
-            lstm_exog_cols=normalize_zone_id_list(settings.get("lstm_exog_cols")),
-            lstm_device="auto",
-            xgboost_lags=normalize_int_list(settings.get("xgboost_lags")),
-            xgboost_exog_cols=normalize_zone_id_list(settings.get("xgboost_exog_cols")),
-            xgboost_tree_method=optional_str(settings.get("xgboost_tree_method")) or "approx",
         )
 
 
@@ -557,7 +503,7 @@ def normalize_pipeline_stage(value: Any) -> str:
     stage = aliases.get(stage, stage)
     if stage not in PIPELINE_STAGES:
         raise ValueError(
-            f"Unsupported pipeline stage: {value}. Expected one of: agent, forecaster, full."
+            f"Unsupported pipeline stage: {value}. Expected one of: train, agent, forecaster, full."
         )
     return stage
 
@@ -566,6 +512,7 @@ class AppConfig:
     agent: AgentConfig
     run: RunConfig
     data: DataConfig = field(default_factory=DataConfig)
+    training: TrainingConfig = field(default_factory=TrainingConfig)
 
     @classmethod
     def from_file(
@@ -584,7 +531,7 @@ class AppConfig:
 
         raw = read_config_mapping(path, expand_env=False)
         agent_settings = raw.get("agent")
-        if not isinstance(agent_settings, dict):
+        if load_agent and not isinstance(agent_settings, dict):
             raise ValueError('Config key "agent" must contain a mapping')
         run_settings = raw.get("run", {})
         if run_settings is None:
@@ -606,6 +553,7 @@ class AppConfig:
             ),
             run=RunConfig.from_mapping(run_settings),
             data=DataConfig.from_mapping(data_settings),
+            training=TrainingConfig.from_mapping(_expand_env_vars(raw.get("training"))),
         )
 
 def _expand_env_vars(obj: Any) -> Any:

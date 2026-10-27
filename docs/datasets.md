@@ -58,14 +58,20 @@ run:
 
 `forecast_starts` 留空且 `forecast_start_count: 1`（默认）时，
 使用当前数据最后 `horizon_days` 天作为预测窗口。默认预测起点为 `T` 时，
-训练取 `[T-35天, T-5天)` 的 720 小时，验证取 `[T-5天, T)` 的 120 小时，
+预测历史取 `[T-35天, T-5天)` 的 720 小时，Bias 验证取 `[T-5天, T)` 的 120 小时，
 正式预测 `[T, T+1天)` 的 24 小时。三个天数可以独立配置。
 每天验证只读取当天起点之前的真实历史，五日同一预测偏移小时的残差均值形成
-24 个 bias；训练和验证结束后，调价重预测复用已保存模型及 bias。
+24 个 bias；调价重预测复用已保存模型及 bias。LSTM/XGBoost 权重来自独立离线训练，
+`history_days` 同时决定离线训练样本和预测的输入长度，`horizon_days` 决定直接输出长度。
+默认每个样本输入 720 小时、输出 24 小时；预测历史还用于固定日内均值曲线。
 `zones: null` 从当前数据自动选站。
 显式填写日期或站点时会按你的配置执行，因此跨数据集切换时需使用该数据集的日期和编号。
-模型、轮数、Agent 模式和其他训练参数仍使用原有 `run` 字段。
-无需设置设备；后端自动选择可用设备。
+预测模型、Agent 模式等实验参数使用 `run`；LSTM/XGBoost 的训练参数使用独立
+`training` 配置，旧的 `run.lstm_*`、`run.xgboost_*` 训练键会明确报错。
+各模型复数 alpha 配置仍属于 `run`。LSTM 与 XGBoost 默认使用 CUDA 进行离线训练和推理。
+`training.defaults.lstm_device` 和 `training.defaults.xgboost_device` 均设为 `cuda`，
+可用 `cuda:0` 指定 GPU，或显式设为 `cpu`；CLI 对应 `--lstm-device`、`--xgboost-device`。
+XGBoost 继续使用 `tree_method: hist`。设备设置参与训练指纹，修改设备会选择或创建对应的模型版本。
 日期和模型统一使用 `forecast_starts: [日期]`、`forecast_models: [模型]`，
 CLI 对应 `--forecast-starts`、`--forecast-models`，单次实验也使用单元素列表。
 旧的单数日期、模型和 alpha 配置会明确报错。Python 单次调用与输出字段使用
@@ -102,15 +108,15 @@ run:
 覆盖项同时适用于随机选区和代表性选区。
 
 程序先确定预测起点，再从缓存的合格区域列表中抽样一次；同一数据集的全部起点、
-模型、Agent 模式和训练种子共用这组区域。更改 `experiment_zone_seed` 可重新抽样，
+模型、Agent 模式和实验种子共用这组区域。更改 `experiment_zone_seed` 可重新抽样，
 区域不重复。随机选区时，符合条件的区域不足该数据集的有效配置数量时会明确报错并给出资格缓存位置，
 不会补入恒定区域，也不会静默减少实验区域数。
 
 随机抽样同时要求负荷和 `energy_price` 非恒定。判定范围为该区域从数据开始至
 **最早预测起点减去 `validation_days`** 的全部历史，右端不包含，不使用验证或预测期数据。
 负荷或电价任意一项恒定都会被排除；常数比较使用 `rtol=1e-9`、`atol=1e-12`，
-容忍浮点计算误差。每个预测起点的 `history_days` 天训练窗口还必须有完整、有效的小时数据。
-这是对早期历史中区域是否恒定的判断，不要求每个训练窗口都发生变化；
+容忍浮点计算误差。每个预测起点的 `history_days` 天上下文窗口还必须有完整、有效的小时数据。
+这是对早期历史中区域是否恒定的判断，不要求每个上下文窗口都发生变化；
 例如最近一周电价固定，但更早历史有变化的区域仍可进入候选。
 真实零负荷保留，不新增零值比例或稀疏度阈值。
 
@@ -140,7 +146,48 @@ run:
 不再需要 `train_datasets.py`。原有模型、阶段等 CLI 参数仍可覆盖配置；
 `--data-dir` 可临时指定单个文件夹。
 
-## 并行训练
+## 各区域独立离线训练
+
+先筛选训练资格并完成实验选区，只为选中区域训练独立的 LSTM 和 XGBoost：
+
+```powershell
+python main.py --stage train --forecast-models lstm xgboost
+```
+
+`train`、`forecaster`、`full` 使用相同的显式站点或自动抽样规则；未选中区域不会训练。
+每个区域只使用自己的有效历史，训练不依赖预测起点、alpha、Agent 模式或实验种子。
+默认至少需要 45 天有效小时记录和 512 个完整输入/输出样本。
+设输入 H 小时、输出 P 小时，N 个连续小时按步长 1 产生 N-H-P+1 个样本；
+默认 H=720、P=24 时至少需要 1,255 个连续小时才能满足样本数门槛。
+负荷或电价恒定、重复时间戳和样本不足会明确报错。无效小时形成缺口，
+样本的输入与标签都不能跨缺口；不插值补负荷。
+
+完整样本按时间顺序以 `training.train_ratio: 0.8`、`validation_ratio: 0.2` 划分。
+两个比例都必须大于零且总和为 1；CLI 可一起设置为
+`--training-train-ratio 0.7 --training-validation-ratio 0.3`。
+删除输出标签触及验证起点的训练样本，记录实际训练/验证数量和删除数量。
+预处理只拟合训练前缀。模型仅训练一次，LSTM 按验证误差早停并恢复最佳权重；
+XGBoost 为 P 个输出小时分别训练和保存最佳树数。不会重新拟合验证数据。
+该内部验证与预测前的 5 天 Bias 校准相互独立。
+
+固定默认值为 LSTM 隐藏大小 32、1 层、batch 64、学习率 0.001、最多 100 epochs；
+XGBoost 最大深度 3、每小时模型最多 800 棵树、学习率 0.03。没有自动参数档位。
+LSTM 直接输出 P 个小时；XGBoost 保存 P 个独立回归器组成的模型包。
+XGBoost 使用 `xgboost_n_estimators` 和学习率，不提供 epoch 或 batch 参数。
+可通过 `training.defaults`、`training.dataset_overrides`、`training.zone_overrides`
+逐层覆盖；CLI 训练参数优先级最高。配置完整示例见 [README](../README.md) 和
+`config.example.yaml`。`training.seed` 决定训练随机性，`run.experiment_seeds` 不会触发重新训练。
+
+`forecaster` 和 `full` 阶段会先为选中区域补齐所需后端的离线模型，再运行预测矩阵。
+已缓存模型直接复用；显式 `--force-train` 创建新版本，保留已被预测产物引用的旧版本。
+`agent` 阶段只读取已有预测产物及其固定权重引用，不执行训练。
+
+训练及早停验证覆盖的历史范围可能包含历史预测期间。输出记录每个区域的
+`model_id`、训练起止时间及逐小时 `training_period_overlap`。这类结果不能解释为
+按预测日截断训练的严格样本外回测；零重叠也不能排除使用了
+预测日之后的训练信息。评估按实际模型版本分组，避免混合不同版本。
+
+## 并行运行
 
 将同一个 `run.data_dir` 改为列表，仍然运行 `python main.py`：
 
@@ -161,17 +208,36 @@ run:
 ```
 
 每个文件夹用独立 Python 子进程，最多同时运行 `max_parallel_datasets` 个任务。
-各进程共享配置中的训练参数；一个数据集内部依次执行模型/种子/模式矩阵。
-`pipeline_stage: forecaster` 只训练预测模型；`full` 执行完整闭环；
+各进程使用对应数据集及区域的训练覆盖配置；一个数据集内部依次执行模型/种子/模式矩阵。
+`pipeline_stage: train` 只准备离线权重；`forecaster` 生成预测及校准产物；`full` 执行完整闭环；
 `dry_run: true` 使用确定性离线 Agent，不调用 API。
 单任务出错时其他任务继续执行，最终进程返回失败并在清单中记录各自退出码。
 
 多模型共用机器资源，`max_parallel_datasets` 可调整并发数量。
-设备选择仍由各模型自动完成。
+`training.lstm_workers` 和 `training.xgboost_workers` 分别控制每个数据集内各后端的
+区域模型训练并发数，默认 1 和 2，可设为任意正整数。不存在跨数据集的全局训练锁；
+同时运行的数据集数与各自的 worker 数相乘，决定该后端可能同时训练的模型数。
+各 XGBoost 默认使用 2 个主机线程，可用 `training.defaults.xgboost_n_jobs` 覆盖。
+CLI 仍使用 `--training-lstm-workers` 和 `--training-xgboost-workers`。
 
 ## 缓存与结果隔离
 
-每个数据目录的 `cache/` 保存指纹缓存、特征和时间划分。
+每个数据目录的 `cache/` 保存指纹缓存、特征、时间划分和离线权重。
+
+```text
+<data_dir>/cache/weight/<backend>/index.json
+<data_dir>/cache/weight/<backend>/<safe-zone-key>/current.json
+<data_dir>/cache/weight/<backend>/<safe-zone-key>/<model_id>/
+    manifest.json
+    model.pt 或 model.json
+    preprocess.json
+    training_history.csv
+```
+
+模型指纹来自当前区域的实际训练内容、特征和参数，其他区域数据改变不使本区域模型失效。
+加载时校验清单及每个文件的哈希，损坏或缺失时明确报错，不在预测期间静默训练。
+`train` 或实验开始前的准备阶段会为缺失、损坏的缓存创建新版本并记录原因；已有预测的
+Agent-only 重放仍严格绑定原版本，原版本损坏时直接失败。
 随机选区的资格缓存由 `zone_eligibility.load_zone_eligibility` 读取或生成，默认路径为：
 
 ```text
@@ -224,8 +290,8 @@ run:
 重用模型时，将 `pipeline_stage` 从 `forecaster` 改为 `agent`，保持
 `output_folder`、`experiment_name` 和其他实验设置一致即可；单数据集和多数据集
 均按相同规则查找，无需再将 `output_folder` 指向某个时间批次目录。
-`forecaster` 阶段的模型位于预测起点下的共享模型目录；多模式 `full` 阶段的模型
-位于各自模式目录。Agent 阶段优先读取对应模式目录中的 `forecaster_manifest.json`，
+预测起点下的 `forecaster` 目录保存预测、Bias 和离线权重引用；多模式 `full` 阶段的这些产物
+位于各自模式目录，权重仍共用数据集缓存。Agent 阶段优先读取对应模式目录中的 `forecaster_manifest.json`，
 没有时再读取共享模型目录，支持这两种来源。
 使用单个 `data_dir` 时，可以通过 `forecaster_output_dir` 精确指定当前协议模型的
 `forecaster` 目录或 `forecaster_manifest.json` 文件。旧协议的预测器产物需要重新生成，

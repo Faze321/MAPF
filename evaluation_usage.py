@@ -329,6 +329,8 @@ def _group_summary(rows: list[dict[str, Any]], *, aggregated: bool,
 def build_usage_tables(calls: list[dict[str, Any]], rounds: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
     """Build portable tables; global totals use rounds, call roles use details."""
     tables: dict[str, list[dict[str, Any]]] = {"call_details": calls, "usage_per_run_round": []}
+    model_dimensions = ("model_set_id",) if any(row.get("model_set_id") not in (None, "legacy_unknown")
+                                               for row in [*calls, *rounds]) else ()
     by_run_round = _group(calls, ("run_id", "attempt"))
     for row in rounds:
         tables["usage_per_run_round"].append({
@@ -344,6 +346,7 @@ def build_usage_tables(calls: list[dict[str, Any]], rounds: list[dict[str, Any]]
         "tokens_by_mode_round": (*_CONTEXT, "attempt"),
     }
     for name, keys in aggregate_groups.items():
+        keys += model_dimensions
         call_groups = _group(calls, keys)
         tables[name] = [{**dict(zip(keys, key)), **_group_summary(group, aggregated=True, calls=call_groups.get(key, []))}
                         for key, group in sorted(_group(rounds, keys).items(), key=lambda item: str(item[0]))]
@@ -355,6 +358,7 @@ def build_usage_tables(calls: list[dict[str, Any]], rounds: list[dict[str, Any]]
         "usage_by_repair": (*_CONTEXT, "is_repair"),
     }
     for name, keys in detail_groups.items():
+        keys += model_dimensions
         tables[name] = [{**dict(zip(keys, key)), **_group_summary(group, aggregated=False)}
                         for key, group in sorted(_group(calls, keys).items(), key=lambda item: str(item[0]))]
     return tables

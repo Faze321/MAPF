@@ -2,6 +2,9 @@ agent:
   # Profiles inherit this limit; a profile-level value (including null) overrides it.
   # Clients using the same base_url must use the same positive limit.
   max_concurrent_requests_total: null # null disables the shared limit; per-client limits still apply
+  # Native Claude: set a profile's backend to anthropic, base_url to
+  # https://api.anthropic.com, model to a native Claude ID, and api_key to
+  # ${ANTHROPIC_API_KEY}. See README for thinking and cache examples.
   multi_agent:
     api_key: "${MULTI_AGENT_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
@@ -10,6 +13,8 @@ agent:
     # For a local server, explicitly choose vllm or sglang; api_key may then be null.
     chat_template_kwargs: {} # explicit enable_thinking overrides the switch derived from reasoning_effort
     reasoning_effort: "none" # OpenRouter/vllm/sglang; none=off, low/medium/high=on; local null=server default
+    anthropic_thinking: null # native only: explicit {type: adaptive/disabled} or {type: enabled, budget_tokens: 2048}
+    anthropic_cache_control: null # native only: {type: ephemeral} enables automatic prompt caching
     max_tokens: null # optional positive output-token limit; size for all pricing windows
     timeout_seconds: 90
     max_concurrent_requests: 4
@@ -19,9 +24,11 @@ agent:
     api_key: "${SINGLE_AGENT_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
     model: "meta-llama/llama-3.3-70b-instruct"
-    backend: "auto" # auto, openrouter, openai_compatible, vllm, sglang
+    backend: "auto" # auto, openrouter, openai_compatible, vllm, sglang, anthropic
     chat_template_kwargs: {} # leave empty to follow reasoning_effort on vllm/sglang
     reasoning_effort: "none" # OpenRouter/vllm/sglang; local null leaves the server default
+    anthropic_thinking: null # explicit native thinking settings override the derived mode
+    anthropic_cache_control: null # optional {type: ephemeral, ttl: 5m} (or 1h)
     max_tokens: null
     timeout_seconds: 90
     max_concurrent_requests: 4

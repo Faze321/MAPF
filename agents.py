@@ -113,46 +113,68 @@ class AgentChatClient:
             raise ValueError(
                 f"agent.{self.config.profile}.api_key is required when dry-run is disabled"
             )
-        from openai import AsyncOpenAI
+        self._uses_anthropic = self.config.resolved_backend == "anthropic"
+        limiter_url = self.config.base_url
+        if self._uses_anthropic:
+            from anthropic_backend import anthropic_base_url, create_anthropic_client
 
-        headers = {}
-        # if self.config.http_referer:
-        #     headers["HTTP-Referer"] = self.config.http_referer
-        # if self.config.title:
-        #     headers["X-Title"] = self.config.title
-        #     headers["X-OpenRouter-Title"] = self.config.title
-        self._client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=self.config.base_url,
-            default_headers=headers or None,
-            timeout=self.config.timeout_seconds,
-        )
+            self._client = create_anthropic_client(self.config)
+            limiter_url = anthropic_base_url(self.config.base_url)
+        else:
+            from openai import AsyncOpenAI
+
+            self._client = AsyncOpenAI(
+                api_key=api_key,
+                base_url=self.config.base_url,
+                default_headers=None,
+                timeout=self.config.timeout_seconds,
+            )
         self._request_semaphore = asyncio.Semaphore(self.config.max_concurrent_requests)
         self._shared_request_limiter = (
-            SharedRequestLimiter(self.config.base_url, self.config.max_concurrent_requests_total)
+            SharedRequestLimiter(limiter_url, self.config.max_concurrent_requests_total)
             if self.config.max_concurrent_requests_total is not None
             else None
         )
 
-    async def complete_json(self, prompt: str, *, temperature: float) -> dict[str, Any]:
-        request: dict[str, Any] = {
-            "model": self.config.model,
-            "messages": [
-                {"role": "system", "content": SYSTEM_MESSAGE},
-                {"role": "user", "content": prompt},
-            ],
-            "response_format": {"type": "json_object"},
-            "temperature": temperature,
-        }
-        if self.config.max_tokens is not None:
-            request["max_tokens"] = self.config.max_tokens
-        extra_body = request_extra_body(self.config)
-        if extra_body is not None:
-            request["extra_body"] = extra_body
+    async def complete_json(
+        self, prompt: str, *, temperature: float,
+        response_format: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if self._uses_anthropic:
+            from anthropic_backend import anthropic_request
+
+            request = anthropic_request(
+                self.config, prompt, system=SYSTEM_MESSAGE,
+                response_format=response_format if response_format is not None else {"type": "json_object"},
+                output_schema=output_schema,
+            )
+        else:
+            request = {
+                "model": self.config.model,
+                "messages": [
+                    {"role": "system", "content": SYSTEM_MESSAGE},
+                    {"role": "user", "content": prompt},
+                ],
+                "response_format": copy.deepcopy(response_format) if response_format is not None else {"type": "json_object"},
+                "temperature": temperature,
+            }
+            if self.config.max_tokens is not None:
+                request["max_tokens"] = self.config.max_tokens
+            extra_body = request_extra_body(self.config)
+            if extra_body is not None:
+                request["extra_body"] = extra_body
         response, provider_attempt_count = await self._create_completion_with_retry(request)
-        content = completion_message_content(response, requested_model=self.config.model)
+        if self._uses_anthropic:
+            from anthropic_backend import anthropic_message_content
+            from anthropic_usage import anthropic_response_token_usage
+
+            content = anthropic_message_content(response, requested_model=self.config.model)
+            token_usage = anthropic_response_token_usage(response)
+        else:
+            content = completion_message_content(response, requested_model=self.config.model)
+            token_usage = response_token_usage(response)
         payload = extract_json_object(content)
-        token_usage = response_token_usage(response)
         token_usage["provider_attempt_count"] = provider_attempt_count
         if provider_attempt_count > 1:
             # Failed provider responses may have consumed unreported cache/input tokens.
@@ -200,15 +222,28 @@ class AgentChatClient:
                         limiter = getattr(self, "_shared_request_limiter", None)
                         if limiter is not None:
                             await slots.enter_async_context(limiter.slot())
-                        response = await self._client.chat.completions.create(**request)
+                        if self._uses_anthropic:
+                            response = await self._client.messages.create(**request)
+                        else:
+                            response = await self._client.chat.completions.create(**request)
                         return response, attempt_index + 1
-            except json.JSONDecodeError as exc:
+            except Exception as exc:
+                is_decode_error = isinstance(exc, json.JSONDecodeError)
+                retryable = is_decode_error
+                if self._uses_anthropic and not retryable:
+                    from anthropic_backend import is_retryable_anthropic_error
+
+                    retryable = is_retryable_anthropic_error(exc)
+                if not retryable:
+                    raise
                 if attempt_index >= retry_count:
-                    raise ProviderResponseDecodeError(
-                        model=self.config.model,
-                        attempts=attempt_index + 1,
-                        original=exc,
-                    ) from exc
+                    if is_decode_error:
+                        raise ProviderResponseDecodeError(
+                            model=self.config.model,
+                            attempts=attempt_index + 1,
+                            original=exc,
+                        ) from exc
+                    raise
                 delay = self.config.provider_json_retry_backoff_seconds * (2**attempt_index)
                 if delay > 0:
                     await asyncio.sleep(delay)
@@ -889,7 +924,14 @@ async def complete_agent_json(
     agent: str,
 ) -> AgentCallResult:
     try:
-        response = await client.complete_json(prompt, temperature=temperature)
+        if isinstance(client, AgentChatClient) and client.config.resolved_backend == "anthropic":
+            from agent_output_schemas import agent_output_schema
+
+            response = await client.complete_json(
+                prompt, temperature=temperature, output_schema=agent_output_schema(stage),
+            )
+        else:
+            response = await client.complete_json(prompt, temperature=temperature)
     except AgentStageError:
         raise
     except Exception as exc:

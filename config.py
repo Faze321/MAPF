@@ -48,9 +48,11 @@ def resolve_backend_blend_alphas(backend: str, global_values: Any, overrides: di
 
 
 PIPELINE_STAGES = {"train", "full", "forecaster", "agent"}
-AGENT_BACKENDS = {"auto", "openrouter", "openai_compatible", "vllm", "sglang"}
+AGENT_BACKENDS = {"auto", "openrouter", "openai_compatible", "vllm", "sglang", "anthropic"}
 LOCAL_AGENT_BACKENDS = {"vllm", "sglang"}
 LOCAL_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+ANTHROPIC_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
+DEFAULT_ANTHROPIC_MAX_TOKENS = 8192
 
 
 def positive_integer(value: Any, key: str) -> int:
@@ -277,20 +279,24 @@ class AgentConfig:
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     max_tokens: int | None = None
     max_concurrent_requests_total: int | None = None
+    anthropic_thinking: dict[str, Any] | None = None
+    anthropic_cache_control: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.backend, str) or self.backend not in AGENT_BACKENDS:
             raise ValueError(f"agent.backend must be one of: {', '.join(sorted(AGENT_BACKENDS))}")
-        if self.backend in LOCAL_AGENT_BACKENDS:
+        if self.backend in LOCAL_AGENT_BACKENDS or self.backend == "anthropic":
+            provider = "anthropic" if self.backend == "anthropic" else "vllm/sglang"
+            efforts = ANTHROPIC_REASONING_EFFORTS if self.backend == "anthropic" else LOCAL_REASONING_EFFORTS
             effort = self.reasoning_effort
             if effort is not None and not isinstance(effort, str):
-                raise ValueError("agent.reasoning_effort must be a string or null for vllm/sglang")
+                raise ValueError(f"agent.reasoning_effort must be a string or null for {provider}")
             if effort is not None:
                 effort = effort.strip().lower() or None
-            if effort is not None and effort not in LOCAL_REASONING_EFFORTS:
+            if effort is not None and effort not in efforts:
                 raise ValueError(
-                    "agent.reasoning_effort for vllm/sglang must be null or one of: "
-                    + ", ".join(sorted(LOCAL_REASONING_EFFORTS))
+                    f"agent.reasoning_effort for {provider} must be null or one of: "
+                    + ", ".join(sorted(efforts))
                 )
             object.__setattr__(self, "reasoning_effort", effort)
         kwargs = self.chat_template_kwargs
@@ -318,11 +324,39 @@ class AgentConfig:
             ) from exc
         if "enable_thinking" in kwargs and not isinstance(kwargs["enable_thinking"], bool):
             raise ValueError("agent.chat_template_kwargs.enable_thinking must be a boolean")
+        if self.backend == "anthropic" and kwargs:
+            raise ValueError("agent.chat_template_kwargs is unsupported for anthropic; use agent.anthropic_thinking")
         object.__setattr__(self, "chat_template_kwargs", deepcopy(kwargs))
         for name in ("max_tokens", "max_concurrent_requests_total"):
             value = getattr(self, name)
             if value is not None:
                 positive_integer(value, f"agent.{name}")
+        thinking = self.anthropic_thinking
+        if thinking is not None:
+            if not isinstance(thinking, dict):
+                raise ValueError("agent.anthropic_thinking must be a mapping or null")
+            mode = thinking.get("type")
+            if not isinstance(mode, str) or mode not in {"disabled", "adaptive", "enabled"}:
+                raise ValueError("agent.anthropic_thinking.type must be disabled, adaptive or enabled")
+            keys = {"type", "budget_tokens"} if mode == "enabled" else {"type"}
+            if set(thinking) != keys:
+                raise ValueError(f"agent.anthropic_thinking with type {mode} requires exactly: {', '.join(sorted(keys))}")
+            if mode == "enabled":
+                budget = positive_integer(thinking["budget_tokens"], "agent.anthropic_thinking.budget_tokens")
+                if budget < 1024:
+                    raise ValueError("agent.anthropic_thinking.budget_tokens must be at least 1024")
+                if self.backend == "anthropic" and budget >= (self.max_tokens or DEFAULT_ANTHROPIC_MAX_TOKENS):
+                    raise ValueError("agent.anthropic_thinking.budget_tokens must be smaller than max_tokens (8192 when unset)")
+            object.__setattr__(self, "anthropic_thinking", deepcopy(thinking))
+        cache_control = self.anthropic_cache_control
+        if cache_control is not None:
+            if (not isinstance(cache_control, dict)
+                    or cache_control.get("type") != "ephemeral"
+                    or not set(cache_control).issubset({"type", "ttl"})):
+                raise ValueError("agent.anthropic_cache_control must contain type: ephemeral and optionally ttl")
+            if "ttl" in cache_control and cache_control["ttl"] not in ("5m", "1h"):
+                raise ValueError("agent.anthropic_cache_control.ttl must be 5m or 1h")
+            object.__setattr__(self, "anthropic_cache_control", deepcopy(cache_control))
         positive_integer(self.max_concurrent_requests, "agent.max_concurrent_requests")
         if (
             isinstance(self.provider_json_retries, bool)
@@ -406,6 +440,8 @@ class AgentConfig:
             "chat_template_kwargs",
             "max_tokens",
             "max_concurrent_requests_total",
+            "anthropic_thinking",
+            "anthropic_cache_control",
         )
         resolved = {name: settings[name] for name in setting_names if name in settings}
         resolved.update(profile_settings)
@@ -422,7 +458,6 @@ class AgentConfig:
             or (profile_model if optional_str(profile_model) else None)
             or (legacy_single_model if optional_str(legacy_single_model) else None)
             or (flat_model if optional_str(flat_model) else None)
-            or "meta-llama/llama-3.1-8b-instruct"
         )
         resolved = _expand_env_vars(resolved)
 
@@ -442,15 +477,18 @@ class AgentConfig:
 
         backend = resolved.get("backend", "auto")
         reasoning_effort = resolved.get("reasoning_effort", "none")
-        if not isinstance(backend, str) or backend not in LOCAL_AGENT_BACKENDS:
+        if not isinstance(backend, str) or backend not in LOCAL_AGENT_BACKENDS | {"anthropic"}:
             # Preserve the legacy cloud default. Local null explicitly delegates
             # reasoning settings to the server/model instead of disabling them.
             reasoning_effort = optional_str(reasoning_effort) or "none"
+        native_anthropic = backend == "anthropic"
 
         return cls(
             api_key=optional_str(resolved.get("api_key")),
-            base_url=optional_str(resolved.get("base_url")) or "https://openrouter.ai/api/v1",
-            model=optional_str(resolved.get("model")) or "meta-llama/llama-3.1-8b-instruct",
+            base_url=optional_str(resolved.get("base_url")) or (
+                "https://api.anthropic.com" if native_anthropic else "https://openrouter.ai/api/v1"),
+            model=optional_str(resolved.get("model")) or (
+                "claude-sonnet-4-6" if native_anthropic else "meta-llama/llama-3.1-8b-instruct"),
             profile=profile,
             single_agent_model=optional_str(settings.get("single_agent_model")),
             reasoning_effort=reasoning_effort,
@@ -466,6 +504,8 @@ class AgentConfig:
             chat_template_kwargs=resolved.get("chat_template_kwargs"),
             max_tokens=resolved.get("max_tokens"),
             max_concurrent_requests_total=resolved.get("max_concurrent_requests_total"),
+            anthropic_thinking=resolved.get("anthropic_thinking"),
+            anthropic_cache_control=resolved.get("anthropic_cache_control"),
         )
 
     @classmethod

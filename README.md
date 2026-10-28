@@ -257,6 +257,107 @@ because the earlier attempts may have unreported usage. Existing prompt, complet
 and total token counts retain their meanings. The dataset cache is independent of
 this server-side prefix cache.
 
+## Native Anthropic / Claude endpoint
+
+Set `backend: anthropic` to use the Anthropic SDK and Messages API independently
+of the OpenAI-compatible client. This works in either Agent profile, including
+mixed providers for single/multi-Agent experiments. For example:
+
+```yaml
+agent:
+  single_agent:
+    backend: anthropic
+    api_key: "${ANTHROPIC_API_KEY}"
+    base_url: "https://api.anthropic.com"
+    model: "claude-sonnet-4-6"
+    reasoning_effort: medium
+    max_tokens: 8192
+    chat_template_kwargs: {}
+    anthropic_thinking: null
+    anthropic_cache_control: {type: ephemeral}
+```
+
+Use native Claude model IDs and credentials for the selected endpoint. Explicit
+`anthropic` selection is required: `auto` keeps its existing routing. Native
+defaults when omitted are `https://api.anthropic.com`, `claude-sonnet-4-6`, and
+an application-selected output cap of 8192 when `max_tokens` is null. The cap is
+required by the Messages API and covers thinking plus the final answer. A trailing
+`/v1` is removed from the configured base URL because the SDK appends
+`/v1/messages`; custom gateway path prefixes are retained. Existing active
+profiles are not switched automatically.
+
+For this backend, `reasoning_effort: none` requests `thinking.type: disabled`;
+`low`, `medium`, `high`, `xhigh`, or `max` requests adaptive thinking and forwards
+the level in `output_config.effort`. `null`/blank leaves both unspecified.
+Supported modes/levels depend on the chosen Claude model; older models may not
+support adaptive thinking, and some newer models cannot disable thinking. An
+explicit `anthropic_thinking` overrides the derived mode. To use a model's manual
+budget mode, set `reasoning_effort: null` and
+`anthropic_thinking: {type: enabled, budget_tokens: 2048}`. The budget must be at
+least 1024 and less than `max_tokens`. See
+[Anthropic effort](https://platform.claude.com/docs/en/build-with-claude/effort).
+
+The adapter uses the installed Anthropic SDK 2.x API: it sends the system prompt
+as `system` and converts `response_format: {type: json_object}` into native
+`output_config.format: {type: json_schema, schema: ...}`. Agent calls automatically
+select the fixed schema for Grid, Behaviour, pricing, single Agent, or discussion;
+schema repairs and price retries use the pricing contract. All objects declare
+their fields and set `additionalProperties: false`. No extra config setting is
+needed. Schemas do not embed Zone IDs, timestamps, window counts, or discussion
+round numbers, so the same stage can reuse its schema across experiments.
+
+Native `format` and `effort` share `output_config`; thinking and cache settings
+remain effective. The adapter retains the existing JSON parser, schema-repair
+flow, and business validation of window identities, counts, and prices. It reads
+only final text blocks, never thinking blocks. `temperature`, OpenAI
+`response_format`, and local `chat_template_kwargs` are not sent as native request
+parameters. Nonempty `chat_template_kwargs` is rejected; use the native thinking
+option instead. A truncated (`max_tokens`) response raises an explicit error. See
+the [SDK migration](https://platform.claude.com/docs/en/api/migration-2026-10-21)
+and [structured-output requirements](https://platform.claude.com/docs/en/build-with-claude/structured-outputs).
+
+Custom code calling `AgentChatClient.complete_json` directly must supply a concrete
+schema for native JSON-object mode, because `json_object` alone does not describe
+the expected fields:
+
+```python
+result = await client.complete_json(
+    prompt,
+    temperature=0.2,
+    response_format={"type": "json_object"},
+    output_schema={
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": False,
+    },
+)
+```
+
+An explicit OpenAI-style `response_format` with `type: json_schema` and
+`json_schema.schema` is also converted. The SDK's `transform_schema` adapts
+unsupported constraints (such as numeric bounds) into descriptions; callers
+should validate those constraints themselves. Missing schemas in direct native
+JSON-object calls fail before sending a request. The ordinary Agent pipeline
+supplies schemas automatically, while other backends keep their existing JSON
+mode.
+
+`anthropic_cache_control: null` sends no cache option; `{type: ephemeral}` enables
+native automatic caching (optional `ttl: 5m` or `1h`). Cache hits depend on the
+service's prefix/block matching and retention rules. Recorded input tokens equal
+`input_tokens + cache_creation_input_tokens + cache_read_input_tokens`; only
+`cache_read_input_tokens` counts as `cached_tokens`. Cache writes are input, not
+hits. Missing fields remain unknown instead of becoming zero; complete counts
+flow into the existing token, cache and evaluation summaries. See
+[Anthropic cache accounting](https://platform.claude.com/docs/en/build-with-claude/prompt-caching#tracking-cache-performance).
+
+Native SDK-internal retries are disabled so every attempt uses the existing
+concurrency limit. `provider_json_retries` also controls native connection,
+timeout, 408/409/429 and server-error retries, using the configured backoff.
+Successful calls after a retry retain known response usage but mark complete
+token/cache totals as unavailable because failed attempts may have consumed
+unreported tokens. No native SDK or model request is loaded by offline evaluation.
+
 ## Offline training for each Zone
 
 Each selected Zone has its own LSTM and XGBoost. The pipeline checks training

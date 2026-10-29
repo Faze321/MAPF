@@ -55,6 +55,20 @@ ANTHROPIC_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
 DEFAULT_ANTHROPIC_MAX_TOKENS = 8192
 
 
+def resolve_agent_backend(backend: str, base_url: str) -> str:
+    """Resolve automatic routing from the URL hostname, preserving explicit choices."""
+    if not isinstance(backend, str) or backend not in AGENT_BACKENDS:
+        raise ValueError(f"agent.backend must be one of: {', '.join(sorted(AGENT_BACKENDS))}")
+    if backend != "auto":
+        return backend
+    hostname = (urlsplit(base_url).hostname or "").lower().rstrip(".")
+    if hostname == "api.openai.com":
+        return "openai"
+    if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
+        return "openrouter"
+    return "openai_compatible"
+
+
 def positive_integer(value: Any, key: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ValueError(f'{key} must be a positive integer')
@@ -380,14 +394,7 @@ class AgentConfig:
 
     @property
     def resolved_backend(self) -> str:
-        if self.backend != "auto":
-            return self.backend
-        hostname = (urlsplit(self.base_url).hostname or "").lower().rstrip(".")
-        if hostname == "api.openai.com":
-            return "openai"
-        if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
-            return "openrouter"
-        return "openai_compatible"
+        return resolve_agent_backend(self.backend, self.base_url)
 
     @property
     def client_api_key(self) -> str | None:
@@ -478,11 +485,6 @@ class AgentConfig:
             return converted
 
         backend = resolved.get("backend", "auto")
-        reasoning_effort = resolved.get("reasoning_effort", "none")
-        if not isinstance(backend, str) or backend not in LOCAL_AGENT_BACKENDS | {"anthropic"}:
-            # Preserve the legacy cloud default. Local null explicitly delegates
-            # reasoning settings to the server/model instead of disabling them.
-            reasoning_effort = optional_str(reasoning_effort) or "none"
         native_anthropic = backend == "anthropic"
         if backend == "openai" and not optional_str(resolved.get("model")):
             raise ValueError("agent.model is required for backend openai; specify the endpoint's model ID")
@@ -491,10 +493,17 @@ class AgentConfig:
             "https://api.openai.com/v1" if backend == "openai" else
             "https://openrouter.ai/api/v1"
         )
+        base_url = optional_str(resolved.get("base_url")) or default_base_url
+        resolved_backend = resolve_agent_backend(backend, base_url)
+        reasoning_effort = resolved.get("reasoning_effort", None if resolved_backend == "openai" else "none")
+        if resolved_backend not in LOCAL_AGENT_BACKENDS | {"anthropic", "openai"}:
+            # Preserve other cloud providers' legacy default; OpenAI and native/
+            # local backends retain null so their model or server chooses effort.
+            reasoning_effort = optional_str(reasoning_effort) or "none"
 
         return cls(
             api_key=optional_str(resolved.get("api_key")),
-            base_url=optional_str(resolved.get("base_url")) or default_base_url,
+            base_url=base_url,
             model=optional_str(resolved.get("model")) or (
                 "claude-sonnet-4-6" if native_anthropic else "meta-llama/llama-3.1-8b-instruct"),
             profile=profile,

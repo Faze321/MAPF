@@ -16,7 +16,7 @@ from usage import (
 from config import AgentConfig
 from agent_backend import (
     output_token_limit_params, anthropic_base_url, create_anthropic_client,
-    anthropic_request, anthropic_message_content, is_retryable_anthropic_error,
+    anthropic_request, anthropic_message_content, is_retryable_anthropic_error, openai_request,
 )
 from request_limits import SharedRequestLimiter
 from load_policy import (
@@ -149,6 +149,11 @@ class AgentChatClient:
                 response_format=response_format if response_format is not None else {"type": "json_object"},
                 output_schema=output_schema,
             )
+        elif self.config.resolved_backend == "openai":
+            request = openai_request(
+                self.config, prompt, system=SYSTEM_MESSAGE,
+                response_format=response_format,
+            )
         else:
             request = {
                 "model": self.config.model,
@@ -262,6 +267,8 @@ def reasoning_extra_body(config: AgentConfig) -> dict[str, Any] | None:
 
 def request_extra_body(config: AgentConfig) -> dict[str, Any] | None:
     """Send only extensions supported/selected for this endpoint's protocol."""
+    if config.resolved_backend == "openai":
+        return None
     body = reasoning_extra_body(config) or {}
     template_kwargs = copy.deepcopy(config.chat_template_kwargs or {})
     if config.resolved_backend in {"vllm", "sglang"}:

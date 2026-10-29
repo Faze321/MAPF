@@ -9,6 +9,28 @@ from urllib.parse import urlsplit, urlunsplit
 from config import AgentConfig, DEFAULT_ANTHROPIC_MAX_TOKENS
 
 
+def openai_request(
+    config: AgentConfig, prompt: str, *, system: str,
+    response_format: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Omit sampling/vendor extensions; leave model support checks to the API."""
+    request: dict[str, Any] = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": deepcopy(response_format) if response_format is not None else {"type": "json_object"},
+        **output_token_limit_params(config),
+    }
+    effort = config.reasoning_effort
+    if isinstance(effort, str):
+        effort = effort.strip()
+    if effort is not None and effort != "":
+        request["reasoning_effort"] = effort
+    return request
+
+
 def output_token_limit_params(config: AgentConfig) -> dict[str, int]:
     """Keep one config budget and send exactly the selected backend's field.
 

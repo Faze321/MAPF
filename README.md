@@ -243,11 +243,8 @@ including an explicit profile-level `null` clearing an inherited budget.
 For OpenAI reasoning models, the output limit includes reasoning and visible
 answer tokens; see the [Chat Completions parameter reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
 Anthropic's limit also includes thinking plus the final answer. Different models
-and discussion modes can need different budgets. This budget mapping does not
-implement model-specific reasoning or sampling rules: OpenAI models such as
-GPT-6.1 Sol still require adapting the existing temperature and reasoning-effort
-request handling before use. These options do not change forecast models or
-select a device.
+and discussion modes can need different budgets. These options do not change
+forecast models or select a device.
 
 `max_concurrent_requests` remains the per-client limit. Optional
 `max_concurrent_requests_total` additionally bounds requests to the same normalized
@@ -284,6 +281,34 @@ remain null. Calls with malformed-provider-response retries are marked incomplet
 because the earlier attempts may have unreported usage. Existing prompt, completion,
 and total token counts retain their meanings. The dataset cache is independent of
 this server-side prefix cache.
+
+## OpenAI endpoint parameter compatibility
+
+Use `backend: openai` (or `auto` with `https://api.openai.com/v1`) to apply the
+OpenAI request adapter in `agent_backend.py`. For example:
+
+```yaml
+agent:
+  single_agent:
+    backend: openai
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    model: "gpt-6.1-sol"
+    reasoning_effort: medium
+    max_tokens: 16384
+    chat_template_kwargs: {}
+```
+
+The OpenAI adapter omits `temperature` and all local-serving/Anthropic extensions,
+including `chat_template_kwargs`, `thinking`, and `cache_control`. It keeps the
+existing `system` message and JSON response format, and maps the configured
+`max_tokens` budget to `max_completion_tokens`.
+
+Nonempty `reasoning_effort` is forwarded at the top level. An omitted, blank, or
+`null` YAML value omits that parameter; profile-level `null` clears an inherited
+value. The adapter does not infer capabilities from model names or validate
+effort values against a local list. The API handles model-specific validation.
+Other backends keep their own request conventions and token/cache accounting.
 
 ## Native Anthropic / Claude endpoint
 

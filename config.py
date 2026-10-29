@@ -48,7 +48,7 @@ def resolve_backend_blend_alphas(backend: str, global_values: Any, overrides: di
 
 
 PIPELINE_STAGES = {"train", "full", "forecaster", "agent"}
-AGENT_BACKENDS = {"auto", "openrouter", "openai_compatible", "vllm", "sglang", "anthropic"}
+AGENT_BACKENDS = {"auto", "openai", "openrouter", "openai_compatible", "vllm", "sglang", "anthropic"}
 LOCAL_AGENT_BACKENDS = {"vllm", "sglang"}
 LOCAL_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 ANTHROPIC_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
@@ -383,6 +383,8 @@ class AgentConfig:
         if self.backend != "auto":
             return self.backend
         hostname = (urlsplit(self.base_url).hostname or "").lower().rstrip(".")
+        if hostname == "api.openai.com":
+            return "openai"
         if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
             return "openrouter"
         return "openai_compatible"
@@ -482,11 +484,17 @@ class AgentConfig:
             # reasoning settings to the server/model instead of disabling them.
             reasoning_effort = optional_str(reasoning_effort) or "none"
         native_anthropic = backend == "anthropic"
+        if backend == "openai" and not optional_str(resolved.get("model")):
+            raise ValueError("agent.model is required for backend openai; specify the endpoint's model ID")
+        default_base_url = (
+            "https://api.anthropic.com" if native_anthropic else
+            "https://api.openai.com/v1" if backend == "openai" else
+            "https://openrouter.ai/api/v1"
+        )
 
         return cls(
             api_key=optional_str(resolved.get("api_key")),
-            base_url=optional_str(resolved.get("base_url")) or (
-                "https://api.anthropic.com" if native_anthropic else "https://openrouter.ai/api/v1"),
+            base_url=optional_str(resolved.get("base_url")) or default_base_url,
             model=optional_str(resolved.get("model")) or (
                 "claude-sonnet-4-6" if native_anthropic else "meta-llama/llama-3.1-8b-instruct"),
             profile=profile,

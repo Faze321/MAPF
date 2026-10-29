@@ -17,6 +17,10 @@ def _nonnegative_integer(value: Any) -> int | None:
     return int(value)
 
 
+def _response_field(value: Any, name: str) -> Any:
+    return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+
 def cache_usage_fields(value: dict[str, Any]) -> dict[str, Any]:
     """Normalize reported cache usage without treating unavailable counts as zero.
 
@@ -54,6 +58,37 @@ def cache_usage_fields(value: dict[str, Any]) -> dict[str, Any]:
         "cache_usage_complete": complete,
         "cache_hit_ratio": cached / prompt if complete and prompt else None,
     }
+
+
+def anthropic_response_token_usage(response: Any) -> dict[str, Any]:
+    """Read native Messages usage without guessing missing cache counts as zero.
+
+    Anthropic's input_tokens counts uncached input only. A complete input count
+    requires uncached input, cache-write input, and cache-read input, each added
+    exactly once; only cache reads count as hits. Partial records retain their
+    native components as diagnostics but cannot establish full prompt/total
+    tokens or a cache ratio. known_cached_tokens follows the shared normalizer's
+    validated-subtotal semantics; when the denominator is unavailable its native
+    evidence remains in cache_read_input_tokens instead.
+    """
+    usage = _response_field(response, "usage")
+    inputs = {
+        name: _nonnegative_integer(_response_field(usage, name))
+        for name in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    }
+    prompt = sum(inputs.values()) if all(value is not None for value in inputs.values()) else None
+    completion = _nonnegative_integer(_response_field(usage, "output_tokens"))
+    result = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion if prompt is not None and completion is not None else None,
+        **inputs,
+    }
+    result.update(cache_usage_fields({
+        **result,
+        "cached_tokens": inputs["cache_read_input_tokens"],
+    }))
+    return result
 
 
 def summarize_cache_usage(

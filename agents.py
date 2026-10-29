@@ -10,10 +10,14 @@ from typing import Any, Protocol
 
 from usage import (
     optional_int_usage, call_token_usage_complete, sum_token_usage, summarize_agent_call_usage,
-    cache_usage_fields,
+    cache_usage_fields, anthropic_response_token_usage,
 )
 
 from config import AgentConfig
+from agent_backend import (
+    output_token_limit_params, anthropic_base_url, create_anthropic_client,
+    anthropic_request, anthropic_message_content, is_retryable_anthropic_error,
+)
 from request_limits import SharedRequestLimiter
 from load_policy import (
     EXTREMELY_HIGH_STRESS,
@@ -116,8 +120,6 @@ class AgentChatClient:
         self._uses_anthropic = self.config.resolved_backend == "anthropic"
         limiter_url = self.config.base_url
         if self._uses_anthropic:
-            from anthropic_backend import anthropic_base_url, create_anthropic_client
-
             self._client = create_anthropic_client(self.config)
             limiter_url = anthropic_base_url(self.config.base_url)
         else:
@@ -142,8 +144,6 @@ class AgentChatClient:
         output_schema: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         if self._uses_anthropic:
-            from anthropic_backend import anthropic_request
-
             request = anthropic_request(
                 self.config, prompt, system=SYSTEM_MESSAGE,
                 response_format=response_format if response_format is not None else {"type": "json_object"},
@@ -159,16 +159,12 @@ class AgentChatClient:
                 "response_format": copy.deepcopy(response_format) if response_format is not None else {"type": "json_object"},
                 "temperature": temperature,
             }
-            if self.config.max_tokens is not None:
-                request["max_tokens"] = self.config.max_tokens
+            request.update(output_token_limit_params(self.config))
             extra_body = request_extra_body(self.config)
             if extra_body is not None:
                 request["extra_body"] = extra_body
         response, provider_attempt_count = await self._create_completion_with_retry(request)
         if self._uses_anthropic:
-            from anthropic_backend import anthropic_message_content
-            from anthropic_usage import anthropic_response_token_usage
-
             content = anthropic_message_content(response, requested_model=self.config.model)
             token_usage = anthropic_response_token_usage(response)
         else:
@@ -231,8 +227,6 @@ class AgentChatClient:
                 is_decode_error = isinstance(exc, json.JSONDecodeError)
                 retryable = is_decode_error
                 if self._uses_anthropic and not retryable:
-                    from anthropic_backend import is_retryable_anthropic_error
-
                     retryable = is_retryable_anthropic_error(exc)
                 if not retryable:
                     raise

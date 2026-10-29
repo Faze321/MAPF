@@ -1,4 +1,4 @@
-"""Native Anthropic Messages adapter; no OpenAI request or response assumptions."""
+"""Provider request adapters, output budgets, and native response handling."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -7,6 +7,23 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from config import AgentConfig, DEFAULT_ANTHROPIC_MAX_TOKENS
+
+
+def output_token_limit_params(config: AgentConfig) -> dict[str, int]:
+    """Keep one config budget and send exactly the selected backend's field.
+
+    Model names do not identify a gateway's wire protocol. Generic compatible
+    endpoints retain max_tokens; select openai for gateways requiring the newer
+    max_completion_tokens parameter. Anthropic requires an explicit budget.
+    """
+    backend = config.resolved_backend
+    limit = config.max_tokens
+    if limit is None:
+        if backend != "anthropic":
+            return {}
+        limit = DEFAULT_ANTHROPIC_MAX_TOKENS
+    parameter = "max_completion_tokens" if backend == "openai" else "max_tokens"
+    return {parameter: limit}
 
 
 def anthropic_base_url(base_url: str) -> str:
@@ -76,7 +93,7 @@ def anthropic_request(
 ) -> dict[str, Any]:
     request: dict[str, Any] = {
         "model": config.model,
-        "max_tokens": config.max_tokens or DEFAULT_ANTHROPIC_MAX_TOKENS,
+        **output_token_limit_params(config),
         "system": system,
         "messages": [{"role": "user", "content": prompt}],
     }

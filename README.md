@@ -179,8 +179,10 @@ agent:
     max_concurrent_requests: 4
 ```
 
-The same options apply to `single_agent`. `backend: auto` identifies OpenRouter by
-its URL hostname; other URLs use `openai_compatible`. It does not guess a local
+The same options apply to `single_agent`. `backend: auto` identifies OpenAI at
+the exact hostname `api.openai.com` and OpenRouter at `openrouter.ai` or its
+subdomains; other URLs use `openai_compatible`. An explicit backend takes
+precedence over URL detection. It does not guess a local
 engine from a port number or model name. Both `vllm` and `sglang` now use the
 existing `reasoning_effort` setting. Their HTTP request receives top-level
 `reasoning_effort`, together with `chat_template_kwargs.enable_thinking` derived
@@ -216,10 +218,36 @@ content is parsed as the existing JSON result. See the
 Only explicit `vllm`/`sglang` profiles may omit an API key, in which case the SDK
 receives an `EMPTY` placeholder. Real server authentication still requires its key.
 
-`max_tokens: null` preserves the server's output budget; a positive integer sets
-the request's total output-token limit (thinking plus final answer, not a separate
-thinking budget). Different models and discussion modes can need
-different budgets. These options do not change forecast models or select a device.
+Keep using `max_tokens` in configuration for every backend. A positive integer
+is translated into exactly one output-budget parameter:
+
+| Resolved backend | Request field | When `max_tokens: null` |
+| --- | --- | --- |
+| `openai` | `max_completion_tokens` | Omit the output limit |
+| `openrouter` | `max_tokens` | Omit the output limit |
+| `vllm`, `sglang` | `max_tokens` | Omit the output limit |
+| `openai_compatible` | `max_tokens` | Omit the output limit |
+| `anthropic` | `max_tokens` | Send the existing application default of 8192 |
+
+Select `backend: openai` for the official API or a gateway that expects
+`max_completion_tokens`. If its URL is omitted, the default is
+`https://api.openai.com/v1`; explicitly supply the endpoint's model ID and API key.
+For example, `backend: openai` with `max_tokens: 8192` sends
+`max_completion_tokens: 8192`. A generic compatible endpoint keeps the legacy
+`max_tokens` field even if its served model has a GPT name; model names do not
+override the selected protocol. Existing `openai_compatible` profiles pointed at
+the official API should select `openai` (or `auto`) to use the new parameter.
+Shared settings and single/multi-Agent overrides use the same translation,
+including an explicit profile-level `null` clearing an inherited budget.
+
+For OpenAI reasoning models, the output limit includes reasoning and visible
+answer tokens; see the [Chat Completions parameter reference](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
+Anthropic's limit also includes thinking plus the final answer. Different models
+and discussion modes can need different budgets. This budget mapping does not
+implement model-specific reasoning or sampling rules: OpenAI models such as
+GPT-6.1 Sol still require adapting the existing temperature and reasoning-effort
+request handling before use. These options do not change forecast models or
+select a device.
 
 `max_concurrent_requests` remains the per-client limit. Optional
 `max_concurrent_requests_total` additionally bounds requests to the same normalized
@@ -258,6 +286,9 @@ and total token counts retain their meanings. The dataset cache is independent o
 this server-side prefix cache.
 
 ## Native Anthropic / Claude endpoint
+
+Provider protocol helpers, including the native Anthropic adapter, live in
+`agent_backend.py`. Token and cache accounting share `usage.py`.
 
 Set `backend: anthropic` to use the Anthropic SDK and Messages API independently
 of the OpenAI-compatible client. This works in either Agent profile, including

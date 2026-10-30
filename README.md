@@ -174,16 +174,18 @@ agent:
     model: Qwen/Qwen3-14B # must match the server's model name or served alias
     api_key: null # use the configured key if the server requires authentication
     reasoning_effort: "none" # none=disable thinking; low/medium/high=enable and forward effort
-    chat_template_kwargs: {} # normally keep empty to follow reasoning_effort
+    extra_body:
+      chat_template_kwargs: {} # normally keep empty to follow reasoning_effort
     max_tokens: null # optional positive output-token limit; allow room for every window
     max_concurrent_requests: 4
 ```
 
-The same options apply to `single_agent`. `backend: auto` identifies OpenAI at
-the exact hostname `api.openai.com` and OpenRouter at `openrouter.ai` or its
-subdomains; other URLs use `openai_compatible`. An explicit backend takes
-precedence over URL detection. It does not guess a local
-engine from a port number or model name. Both `vllm` and `sglang` now use the
+The same options apply to `single_agent`. `backend` must be explicitly set to
+`openai`, `openrouter`, `openai_compatible`, `vllm`, `sglang`, or `anthropic`,
+either in the selected profile or inherited from `agent.backend`.
+Missing/blank values and `auto` are rejected; URLs, ports, and model names never
+select the protocol. Training-only and dry-run paths do not load Agent settings.
+Both `vllm` and `sglang` use the
 existing `reasoning_effort` setting. Their HTTP request receives top-level
 `reasoning_effort`, together with `chat_template_kwargs.enable_thinking` derived
 from the setting. The SDK merges these fields from `extra_body` into the JSON
@@ -198,13 +200,40 @@ endpoints keep their previous behavior.
 | `null` or an empty string | Omit automatic effort and thinking fields; use server/model defaults |
 
 Each profile can override an inherited effort, including `null` to clear it for
-a local backend. Local values are normalized to lowercase and validated before
-any request. Explicit `chat_template_kwargs.enable_thinking` takes precedence
+a local backend. Top-level local effort values are normalized to lowercase and
+validated before any request. Explicit
+`extra_body.chat_template_kwargs.enable_thinking` takes precedence
 over the derived switch; other template options are preserved. For example,
 `reasoning_effort: high` with `enable_thinking: false` sends both fields but keeps
 the explicit switch false. Leave the switch unset when effort should control it.
 See the [vLLM reasoning protocol](https://docs.vllm.ai/en/latest/features/reasoning_outputs/#automatic-enable_thinking-activation)
 and [SGLang request protocol](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/entrypoints/openai/protocol.py).
+
+Put SDK body extensions under `extra_body` in either Agent profile. For example,
+a local-server profile can use:
+
+```yaml
+extra_body:
+  chat_template_kwargs:
+    enable_thinking: false
+  top_k: 20
+```
+
+The mapping is passed to the SDK as `extra_body`; the SDK merges its values into
+the top-level HTTP JSON rather than sending a nested `extra_body` object.
+Explicit fields override generated defaults. A local
+`extra_body.reasoning_effort` also overrides the unified `reasoning_effort` setting
+when deriving `enable_thinking`. OpenRouter-specific options, such as
+`extra_body.reasoning`, can be supplied in the same way. Extension values are
+passed through without a local model-support check.
+
+Profiles inherit `extra_body` when omitted and replace the entire mapping when
+specified; `{}` or `null` clears inherited extensions. Unified settings such as
+`reasoning_effort` still apply independently. Legacy top-level
+`chat_template_kwargs` remains accepted: specifying either spelling in a profile
+replaces the inherited extension configuration, and `extra_body` wins if both are
+present in the same profile. OpenAI and native Anthropic adapters omit
+`extra_body`; use their existing native reasoning settings.
 
 **Qwen3.5 limitation:** its standard template implements a thinking switch, so
 `low`/`medium`/`high` all enable thinking; forwarding these labels does not create
@@ -284,7 +313,7 @@ this server-side prefix cache.
 
 ## OpenAI endpoint parameter compatibility
 
-Use `backend: openai` (or `auto` with `https://api.openai.com/v1`) to apply the
+Use an explicit `backend: openai` to apply the
 OpenAI request adapter in `agent_backend.py`. For example:
 
 ```yaml
@@ -296,10 +325,10 @@ agent:
     model: "gpt-6.1-sol"
     reasoning_effort: medium
     max_tokens: 16384
-    chat_template_kwargs: {}
+    extra_body: {}
 ```
 
-The OpenAI adapter omits `temperature` and all local-serving/Anthropic extensions,
+The OpenAI adapter omits `temperature`, `extra_body`, and all local-serving/Anthropic extensions,
 including `chat_template_kwargs`, `thinking`, and `cache_control`. It keeps the
 existing `system` message and JSON response format, and maps the configured
 `max_tokens` budget to `max_completion_tokens`.
@@ -328,7 +357,7 @@ agent:
     model: "claude-sonnet-4-6"
     reasoning_effort: medium
     max_tokens: 8192
-    chat_template_kwargs: {}
+    extra_body: {}
     anthropic_thinking: null
     anthropic_cache_control: {type: ephemeral}
 ```
@@ -367,8 +396,9 @@ remain effective. The adapter retains the existing JSON parser, schema-repair
 flow, and business validation of window identities, counts, and prices. It reads
 only final text blocks, never thinking blocks. `temperature`, OpenAI
 `response_format`, and local `chat_template_kwargs` are not sent as native request
-parameters. Nonempty `chat_template_kwargs` is rejected; use the native thinking
-option instead. A truncated (`max_tokens`) response raises an explicit error. See
+parameters. `extra_body` is omitted for this backend; legacy top-level nonempty
+`chat_template_kwargs` is rejected. Use the native thinking option instead.
+A truncated (`max_tokens`) response raises an explicit error. See
 the [SDK migration](https://platform.claude.com/docs/en/api/migration-2026-10-21)
 and [structured-output requirements](https://platform.claude.com/docs/en/build-with-claude/structured-outputs).
 

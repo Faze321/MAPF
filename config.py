@@ -4,7 +4,6 @@ from dataclasses import dataclass, field
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, TypeVar
-from urllib.parse import urlsplit
 import json
 import math
 import re
@@ -48,25 +47,18 @@ def resolve_backend_blend_alphas(backend: str, global_values: Any, overrides: di
 
 
 PIPELINE_STAGES = {"train", "full", "forecaster", "agent"}
-AGENT_BACKENDS = {"auto", "openai", "openrouter", "openai_compatible", "vllm", "sglang", "anthropic"}
+AGENT_BACKENDS = {"openai", "openrouter", "openai_compatible", "vllm", "sglang", "anthropic"}
 LOCAL_AGENT_BACKENDS = {"vllm", "sglang"}
 LOCAL_REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
 ANTHROPIC_REASONING_EFFORTS = {"none", "low", "medium", "high", "xhigh", "max"}
 DEFAULT_ANTHROPIC_MAX_TOKENS = 8192
 
 
-def resolve_agent_backend(backend: str, base_url: str) -> str:
-    """Resolve automatic routing from the URL hostname, preserving explicit choices."""
+def validate_agent_backend(backend: Any) -> str:
+    """Require an explicit provider protocol; never infer it from a URL."""
     if not isinstance(backend, str) or backend not in AGENT_BACKENDS:
-        raise ValueError(f"agent.backend must be one of: {', '.join(sorted(AGENT_BACKENDS))}")
-    if backend != "auto":
-        return backend
-    hostname = (urlsplit(base_url).hostname or "").lower().rstrip(".")
-    if hostname == "api.openai.com":
-        return "openai"
-    if hostname == "openrouter.ai" or hostname.endswith(".openrouter.ai"):
-        return "openrouter"
-    return "openai_compatible"
+        raise ValueError(f"agent.backend must be explicitly set to one of: {', '.join(sorted(AGENT_BACKENDS))}")
+    return backend
 
 
 def positive_integer(value: Any, key: str) -> int:
@@ -289,16 +281,16 @@ class AgentConfig:
     max_concurrent_requests: int = 4
     provider_json_retries: int = 2
     provider_json_retry_backoff_seconds: float = 1.0
-    backend: str = "auto"
+    backend: str = field(kw_only=True)
     chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     max_tokens: int | None = None
     max_concurrent_requests_total: int | None = None
     anthropic_thinking: dict[str, Any] | None = None
     anthropic_cache_control: dict[str, Any] | None = None
+    extra_body: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not isinstance(self.backend, str) or self.backend not in AGENT_BACKENDS:
-            raise ValueError(f"agent.backend must be one of: {', '.join(sorted(AGENT_BACKENDS))}")
+        validate_agent_backend(self.backend)
         if self.backend in LOCAL_AGENT_BACKENDS or self.backend == "anthropic":
             provider = "anthropic" if self.backend == "anthropic" else "vllm/sglang"
             efforts = ANTHROPIC_REASONING_EFFORTS if self.backend == "anthropic" else LOCAL_REASONING_EFFORTS
@@ -341,6 +333,10 @@ class AgentConfig:
         if self.backend == "anthropic" and kwargs:
             raise ValueError("agent.chat_template_kwargs is unsupported for anthropic; use agent.anthropic_thinking")
         object.__setattr__(self, "chat_template_kwargs", deepcopy(kwargs))
+        extra_body = self.extra_body if self.extra_body is not None else {}
+        if not isinstance(extra_body, dict):
+            raise ValueError("agent.extra_body must contain a mapping or null")
+        object.__setattr__(self, "extra_body", deepcopy(extra_body))
         for name in ("max_tokens", "max_concurrent_requests_total"):
             value = getattr(self, name)
             if value is not None:
@@ -394,7 +390,7 @@ class AgentConfig:
 
     @property
     def resolved_backend(self) -> str:
-        return resolve_agent_backend(self.backend, self.base_url)
+        return self.backend
 
     @property
     def client_api_key(self) -> str | None:
@@ -415,11 +411,11 @@ class AgentConfig:
     ) -> "AgentConfig":
         profile = agent_config_profile(agent_mode)
         if not path.exists():
-            if required:
-                raise FileNotFoundError(
-                    f"Config file not found: {path}. Copy config.example.yaml to config.yaml."
-                )
-            return cls.default(model=model, profile=profile)
+            # Keep the required argument for existing callers, but an Agent
+            # cannot be configured without an explicitly selected backend.
+            raise FileNotFoundError(
+                f"Config file not found: {path}. Copy config.example.yaml to config.yaml and set agent.backend."
+            )
 
         # Expand only the selected profile. This lets either provider use its own
         # environment variables without requiring credentials for the inactive one.
@@ -447,13 +443,24 @@ class AgentConfig:
             "provider_json_retry_backoff_seconds",
             "backend",
             "chat_template_kwargs",
+            "extra_body",
             "max_tokens",
             "max_concurrent_requests_total",
             "anthropic_thinking",
             "anthropic_cache_control",
         )
-        resolved = {name: settings[name] for name in setting_names if name in settings}
-        resolved.update(profile_settings)
+        def extension_settings(layer: dict[str, Any]) -> dict[str, Any]:
+            values = dict(layer)
+            # Treat both spellings as one profile-level setting. New extra_body
+            # replaces legacy templates, including when explicitly cleared.
+            if "extra_body" in values:
+                values["chat_template_kwargs"] = None
+            elif "chat_template_kwargs" in values:
+                values["extra_body"] = None
+            return values
+
+        resolved = extension_settings({name: settings[name] for name in setting_names if name in settings})
+        resolved.update(extension_settings(profile_settings))
 
         # A nested model wins over the legacy single_agent_model, while --model
         # overrides only whichever profile is active for this run.
@@ -484,7 +491,7 @@ class AgentConfig:
                 raise ValueError(f"agent.{name} must be an integer")
             return converted
 
-        backend = resolved.get("backend", "auto")
+        backend = validate_agent_backend(resolved.get("backend"))
         native_anthropic = backend == "anthropic"
         if backend == "openai" and not optional_str(resolved.get("model")):
             raise ValueError("agent.model is required for backend openai; specify the endpoint's model ID")
@@ -494,9 +501,8 @@ class AgentConfig:
             "https://openrouter.ai/api/v1"
         )
         base_url = optional_str(resolved.get("base_url")) or default_base_url
-        resolved_backend = resolve_agent_backend(backend, base_url)
-        reasoning_effort = resolved.get("reasoning_effort", None if resolved_backend == "openai" else "none")
-        if resolved_backend not in LOCAL_AGENT_BACKENDS | {"anthropic", "openai"}:
+        reasoning_effort = resolved.get("reasoning_effort", None if backend == "openai" else "none")
+        if backend not in LOCAL_AGENT_BACKENDS | {"anthropic", "openai"}:
             # Preserve other cloud providers' legacy default; OpenAI and native/
             # local backends retain null so their model or server chooses effort.
             reasoning_effort = optional_str(reasoning_effort) or "none"
@@ -519,6 +525,7 @@ class AgentConfig:
             ),
             backend=backend,
             chat_template_kwargs=resolved.get("chat_template_kwargs"),
+            extra_body=resolved.get("extra_body"),
             max_tokens=resolved.get("max_tokens"),
             max_concurrent_requests_total=resolved.get("max_concurrent_requests_total"),
             anthropic_thinking=resolved.get("anthropic_thinking"),
@@ -529,11 +536,13 @@ class AgentConfig:
     def default(
         cls,
         *,
+        backend: str,
         model: str | None = None,
         profile: str = "multi_agent",
     ) -> "AgentConfig":
         return cls(
             api_key=None,
+            backend=backend,
             base_url="https://openrouter.ai/api/v1",
             model=model or "meta-llama/llama-3.1-8b-instruct",
             profile=profile,
@@ -566,7 +575,7 @@ def normalize_pipeline_stage(value: Any) -> str:
 
 @dataclass(frozen=True)
 class AppConfig:
-    agent: AgentConfig
+    agent: AgentConfig | None
     run: RunConfig
     data: DataConfig = field(default_factory=DataConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
@@ -584,7 +593,10 @@ class AppConfig:
                 raise FileNotFoundError(
                     f"Config file not found: {path}. Copy config.example.yaml to config.yaml."
                 )
-            return cls(agent=AgentConfig.default(), run=RunConfig(), data=DataConfig())
+            return cls(
+                agent=AgentConfig.from_file(path, required=required) if load_agent else None,
+                run=RunConfig(), data=DataConfig(),
+            )
 
         raw = read_config_mapping(path, expand_env=False)
         agent_settings = raw.get("agent")
@@ -606,7 +618,7 @@ class AppConfig:
             agent=(
                 AgentConfig.from_file(path, required=required)
                 if load_agent
-                else AgentConfig.default()
+                else None
             ),
             run=RunConfig.from_mapping(run_settings),
             data=DataConfig.from_mapping(data_settings),

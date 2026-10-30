@@ -266,21 +266,23 @@ def reasoning_extra_body(config: AgentConfig) -> dict[str, Any] | None:
 
 
 def request_extra_body(config: AgentConfig) -> dict[str, Any] | None:
-    """Send only extensions supported/selected for this endpoint's protocol."""
-    if config.resolved_backend == "openai":
+    """Merge provider defaults with explicit extensions without mutating config."""
+    if config.resolved_backend in {"openai", "anthropic"}:
         return None
     body = reasoning_extra_body(config) or {}
-    template_kwargs = copy.deepcopy(config.chat_template_kwargs or {})
+    body.update(copy.deepcopy(config.extra_body))
+    template_kwargs = body.get("chat_template_kwargs", copy.deepcopy(config.chat_template_kwargs or {}))
     if config.resolved_backend in {"vllm", "sglang"}:
-        effort = str(config.reasoning_effort or "").strip().lower()
+        effort = str(body.get("reasoning_effort", config.reasoning_effort) or "").strip().lower()
         if effort:
             # The SDK merges extra_body into the top-level HTTP JSON. Local
             # servers expose this field directly, unlike OpenRouter's envelope.
-            body["reasoning_effort"] = effort
+            body.setdefault("reasoning_effort", effort)
             # Templates such as Qwen3.5 use an on/off switch. An explicitly
             # supplied template option takes precedence over this default.
-            template_kwargs.setdefault("enable_thinking", effort != "none")
-    if template_kwargs:
+            if isinstance(template_kwargs, dict):
+                template_kwargs.setdefault("enable_thinking", effort != "none")
+    if template_kwargs or "chat_template_kwargs" in body:
         body["chat_template_kwargs"] = template_kwargs
     return body or None
 

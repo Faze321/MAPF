@@ -9,9 +9,9 @@ agent:
     api_key: "${MULTI_AGENT_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
     model: "qwen/qwen3-14b"
-    backend: "auto" # auto detects api.openai.com and openrouter.ai; otherwise openai_compatible
+    backend: "openrouter" # required: openai, openrouter, openai_compatible, vllm, sglang, anthropic
     # For a local server, explicitly choose vllm or sglang; api_key may then be null.
-    chat_template_kwargs: {} # explicit enable_thinking overrides the switch derived from reasoning_effort
+    extra_body: {} # SDK body extensions; e.g. {chat_template_kwargs: {enable_thinking: false}}
     reasoning_effort: "none" # OpenRouter/vllm/sglang; none=off, low/medium/high=on; local null=server default
     anthropic_thinking: null # native only: explicit {type: adaptive/disabled} or {type: enabled, budget_tokens: 2048}
     anthropic_cache_control: null # native only: {type: ephemeral} enables automatic prompt caching
@@ -24,8 +24,8 @@ agent:
     api_key: "${SINGLE_AGENT_API_KEY}"
     base_url: "https://openrouter.ai/api/v1"
     model: "meta-llama/llama-3.3-70b-instruct"
-    backend: "auto" # auto, openai, openrouter, openai_compatible, vllm, sglang, anthropic
-    chat_template_kwargs: {} # leave empty to follow reasoning_effort on vllm/sglang
+    backend: "openrouter" # required; select the protocol explicitly, regardless of base_url
+    extra_body: {} # e.g. {chat_template_kwargs: {enable_thinking: false}} for vllm/sglang
     reasoning_effort: "none" # OpenRouter/vllm/sglang; local null leaves the server default
     anthropic_thinking: null # explicit native thinking settings override the derived mode
     anthropic_cache_control: null # optional {type: ephemeral, ttl: 5m} (or 1h)

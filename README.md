@@ -311,6 +311,60 @@ because the earlier attempts may have unreported usage. Existing prompt, complet
 and total token counts retain their meanings. The dataset cache is independent of
 this server-side prefix cache.
 
+## SGLang server metrics
+
+When `backend: sglang` is selected, the Agent stage also collects Prometheus
+metrics. Other backends, dry-run, and training-only runs do not start monitoring.
+Start the SGLang server with `--enable-metrics`; the project does not modify or
+restart the server. See the [official metrics documentation](https://github.com/sgl-project/sglang/blob/main/docs/docs/references/production_metrics.mdx).
+
+```yaml
+agent:
+  multi_agent:
+    backend: sglang
+    sglang_metrics:
+      enabled: true
+      url: null
+      interval_seconds: 5
+      timeout_seconds: 3
+```
+
+By default, a base URL such as `http://127.0.0.1:30000/v1` uses
+`http://127.0.0.1:30000/metrics`; gateway path prefixes are preserved. Set `url`
+explicitly for a separate metrics endpoint. The API key is reused only for
+same-origin metrics requests. Set `enabled: false` to disable collection.
+Profiles may inherit `agent.sglang_metrics` or replace the mapping locally.
+
+Each run saves its files under the current Agent output directory:
+
+```text
+<current agent output>/sglang_metrics/
+  snapshots/       # initial, periodic, and final raw Prometheus snapshots
+  scrapes.jsonl    # collection timestamps and success/failure status
+  samples.csv      # metric samples with complete worker/model labels
+  summary.json     # collection coverage and per-series summaries
+  summary.csv      # per-series counters, gauges, and histogram summaries
+```
+
+Collection starts before Agent calls and stops after all control rounds, including
+on Agent failure. Endpoint errors are recorded without interrupting the
+experiment. Returned artifact paths and the Agent manifest link these files.
+Metrics are sampled during the Agent stage, including time spent in reforecasting;
+they are not a measurement of model execution time alone.
+Polling uses the Agent event loop, so synchronous reforecast work can lengthen the
+sampling interval; use the recorded timestamps rather than assuming exact spacing.
+
+These metrics have **server scope**. Parallel experiments or other users sharing
+the endpoint can contribute to the observed values. Counter changes are measured
+between snapshots; missing baselines, resets, and partial coverage are marked
+instead of treated as zero. Summaries preserve full labels rather than summing
+over workers, cache-source totals/details, or queue-priority totals/details.
+Histogram means use changes in `_sum` divided by changes in `_count`.
+Gauge averages are sample averages, not token-weighted or time-weighted rates.
+In particular, `cache_hit_rate` does not replace the existing API usage cache-hit
+token count, and `token_usage` describes KV/state-pool occupancy rather than GPU
+utilization. Existing per-call token and cache accounting remain separate.
+
 ## OpenAI endpoint parameter compatibility
 
 Use an explicit `backend: openai` to apply the

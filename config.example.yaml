@@ -2,6 +2,13 @@ agent:
   # Profiles inherit this limit; a profile-level value (including null) overrides it.
   # Clients using the same base_url must use the same positive limit.
   max_concurrent_requests_total: null # null disables the shared limit; per-client limits still apply
+  # Server monitoring only for backend: sglang; ignored by every other backend.
+  # The SGLang server must be started with --enable-metrics.
+  sglang_metrics:
+    enabled: true
+    url: null # derive /metrics from base_url; override for a gateway or separate metrics port
+    interval_seconds: 5
+    timeout_seconds: 3
   # Native Claude: set a profile's backend to anthropic, base_url to
   # https://api.anthropic.com, model to a native Claude ID, and api_key to
   # ${ANTHROPIC_API_KEY}. See README for thinking and cache examples.

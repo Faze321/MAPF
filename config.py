@@ -288,6 +288,7 @@ class AgentConfig:
     anthropic_thinking: dict[str, Any] | None = None
     anthropic_cache_control: dict[str, Any] | None = None
     extra_body: dict[str, Any] = field(default_factory=dict)
+    sglang_metrics: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         validate_agent_backend(self.backend)
@@ -337,6 +338,22 @@ class AgentConfig:
         if not isinstance(extra_body, dict):
             raise ValueError("agent.extra_body must contain a mapping or null")
         object.__setattr__(self, "extra_body", deepcopy(extra_body))
+        metrics: dict[str, Any] = {}
+        if self.backend == "sglang":
+            options = self.sglang_metrics if self.sglang_metrics is not None else {}
+            if not isinstance(options, dict):
+                raise ValueError("agent.sglang_metrics must contain a mapping or null")
+            metrics = {"enabled": True, "url": None, "interval_seconds": 5.0, "timeout_seconds": 3.0, **options}
+            if not isinstance(metrics["enabled"], bool):
+                raise ValueError("agent.sglang_metrics.enabled must be a boolean")
+            if metrics["enabled"]:
+                if metrics["url"] is not None and not isinstance(metrics["url"], str):
+                    raise ValueError("agent.sglang_metrics.url must be a string or null")
+                for name in ("interval_seconds", "timeout_seconds"):
+                    value = metrics[name]
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                        raise ValueError(f"agent.sglang_metrics.{name} must be a finite positive number")
+        object.__setattr__(self, "sglang_metrics", deepcopy(metrics))
         for name in ("max_tokens", "max_concurrent_requests_total"):
             value = getattr(self, name)
             if value is not None:
@@ -444,6 +461,7 @@ class AgentConfig:
             "backend",
             "chat_template_kwargs",
             "extra_body",
+            "sglang_metrics",
             "max_tokens",
             "max_concurrent_requests_total",
             "anthropic_thinking",
@@ -475,6 +493,10 @@ class AgentConfig:
             or (legacy_single_model if optional_str(legacy_single_model) else None)
             or (flat_model if optional_str(flat_model) else None)
         )
+        backend = validate_agent_backend(_expand_env_vars(resolved.get("backend")))
+        if backend != "sglang":
+            # Inactive monitoring must not require SGLang-only environment values.
+            resolved.pop("sglang_metrics", None)
         resolved = _expand_env_vars(resolved)
 
         # Keep legacy numeric strings (including environment variables), but do
@@ -491,7 +513,6 @@ class AgentConfig:
                 raise ValueError(f"agent.{name} must be an integer")
             return converted
 
-        backend = validate_agent_backend(resolved.get("backend"))
         native_anthropic = backend == "anthropic"
         if backend == "openai" and not optional_str(resolved.get("model")):
             raise ValueError("agent.model is required for backend openai; specify the endpoint's model ID")
@@ -526,6 +547,7 @@ class AgentConfig:
             backend=backend,
             chat_template_kwargs=resolved.get("chat_template_kwargs"),
             extra_body=resolved.get("extra_body"),
+            sglang_metrics=resolved.get("sglang_metrics"),
             max_tokens=resolved.get("max_tokens"),
             max_concurrent_requests_total=resolved.get("max_concurrent_requests_total"),
             anthropic_thinking=resolved.get("anthropic_thinking"),

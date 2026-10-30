@@ -603,6 +603,8 @@ def run_pipeline(
     except Exception as exc:
         raise PipelineStageError(stage="precomputed_window_data", original=exc) from exc
 
+    metrics_outputs: dict[str, Path] = {}
+
     async def execute_agent_control_stage() -> list[dict[str, Any]]:
         reports_by_zone: dict[str, dict[str, Any]] = {}
         client: AgentChatClient | None = None
@@ -647,6 +649,12 @@ def run_pipeline(
                             cli_model=model,
                         )
                         client = AgentChatClient(config)
+                        await client.start_metrics(resolved_agent_output_dir, context={
+                            "agent_mode": agent_mode, "forecast_backend": backend,
+                            "forecast_origin": str(forecast_parameters.get("forecast_origin")),
+                            "dataset": data_dir.name, "dataset_fingerprint": canonical_dataset.dataset_fingerprint,
+                            "zone_ids": [str(zone) for zone in selected_zone_ids],
+                        })
                     live_reports = await run_all_zone_chains(
                         live_contexts,
                         client=client,
@@ -701,28 +709,36 @@ def run_pipeline(
         finally:
             if client is not None:
                 await client.aclose()
+                metrics_outputs.update(client.metrics_outputs)
 
     reports = asyncio.run(execute_agent_control_stage())
     try:
+        agent_manifest = build_agent_manifest(
+            agent_mode=agent_mode,
+            backend=backend,
+            forecaster_dir=forecaster_dir,
+            selected_zone_ids=selected_zone_ids,
+            forecast_origin=forecast_parameters.get("forecast_origin"),
+            model_ids=forecast_parameters.get("model_ids"),
+            model_provenance=selected_model_provenance,
+            dataset_fingerprint=canonical_dataset.dataset_fingerprint,
+            cache_keys=pipeline_data.cache_keys or {},
+            feature_manifest=pipeline_data.feature_manifest or {},
+        )
+        if metrics_outputs:
+            agent_manifest["sglang_metrics"] = {
+                "scope": "server",
+                "artifacts": {name: path.relative_to(resolved_agent_output_dir).as_posix()
+                              for name, path in metrics_outputs.items()},
+            }
         agent_outputs = write_agent_outputs(
             output_dir=resolved_agent_output_dir,
             reports=reports,
             backend=backend,
             agent_mode=agent_mode,
-            manifest=build_agent_manifest(
-                agent_mode=agent_mode,
-                backend=backend,
-                forecaster_dir=forecaster_dir,
-                selected_zone_ids=selected_zone_ids,
-                forecast_origin=forecast_parameters.get("forecast_origin"),
-                model_ids=forecast_parameters.get("model_ids"),
-                model_provenance=selected_model_provenance,
-                dataset_fingerprint=canonical_dataset.dataset_fingerprint,
-                cache_keys=pipeline_data.cache_keys or {},
-                feature_manifest=pipeline_data.feature_manifest or {},
-            ),
+            manifest=agent_manifest,
         )
-        return {**forecaster_outputs, **agent_outputs}
+        return {**forecaster_outputs, **agent_outputs, **metrics_outputs}
     except Exception as exc:
         raise PipelineStageError(stage="write_outputs", original=exc) from exc
 

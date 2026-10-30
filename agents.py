@@ -6,6 +6,7 @@ import json
 import re
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from usage import (
@@ -19,6 +20,7 @@ from agent_backend import (
     anthropic_request, anthropic_message_content, is_retryable_anthropic_error, openai_request,
 )
 from request_limits import SharedRequestLimiter
+from sglang_metrics import SGLangMetricsCollector
 from load_policy import (
     EXTREMELY_HIGH_STRESS,
     HIGH_STRESS,
@@ -138,6 +140,27 @@ class AgentChatClient:
             else None
         )
 
+    async def start_metrics(self, output_dir: Path, *, context: dict[str, Any] | None = None) -> None:
+        """Collect server metrics only for an explicitly selected SGLang run."""
+        if (self.config.backend != "sglang" or not self.config.sglang_metrics.get("enabled", False)
+                or getattr(self, "_metrics_collector", None) is not None or getattr(self, "_closed", False)):
+            return
+        try:
+            self._metrics_collector = SGLangMetricsCollector(
+                base_url=self.config.base_url, api_key=self.config.api_key,
+                output_dir=output_dir / "sglang_metrics", settings=self.config.sglang_metrics,
+                context={**(context or {}), "agent_model": self.config.model, "agent_profile": self.config.profile},
+            )
+            await self._metrics_collector.start()
+        except Exception as exc:
+            # Never include exception text: URLs or credentials may occur in it.
+            print(f"SGLang metrics could not start ({type(exc).__name__}); continuing experiment.", flush=True)
+
+    @property
+    def metrics_outputs(self) -> dict[str, Path]:
+        collector = getattr(self, "_metrics_collector", None)
+        return dict(collector.outputs) if collector is not None else {}
+
     async def complete_json(
         self, prompt: str, *, temperature: float,
         response_format: dict[str, Any] | None = None,
@@ -198,7 +221,15 @@ class AgentChatClient:
         if client is None or getattr(self, "_closed", False):
             return
         self._closed = True
-        await client.close()
+        try:
+            collector = getattr(self, "_metrics_collector", None)
+            if collector is not None:
+                try:
+                    await collector.stop()
+                except Exception as exc:
+                    print(f"SGLang metrics could not finish ({type(exc).__name__}); continuing experiment.", flush=True)
+        finally:
+            await client.close()
 
     async def __aenter__(self) -> "AgentChatClient":
         return self

@@ -132,9 +132,8 @@ def dataset_metadata(manifest: dict, control: dict | None = None) -> dict:
         name = f"CHARGED_{city or folder}" if city or folder else "CHARGED"
     name = name or folder or (f"dataset_{fingerprint}" if fingerprint else "unknown")
     price_unit = features.get("price_unit")
-    revenue_unit = str(price_unit).replace("/kWh", "").strip() if price_unit else "unspecified source currency"
     return {"dataset": name, "dataset_identity": str(fingerprint or source.get("data_dir") or "unknown"),
-            "revenue_unit": revenue_unit, "price_unit": price_unit,
+            "price_unit": price_unit,
             "dataset_provenance_known": bool(fingerprint or source.get("data_dir"))}
 
 
@@ -259,9 +258,8 @@ def pairing_metadata(control: dict, context: dict | None) -> dict:
         frame = context["frame"]
         keys = ["zone_id", "time", "actual_kwh", "predicted_kwh"]
         if not frame.empty and all(key in frame for key in keys):
-            # Equal window means can conceal different hourly price/load products.
-            # Legacy files without prices still support the original comparisons;
-            # their hourly revenue baseline is independently marked unknown.
+            # Equal window means can conceal different hourly price schedules.
+            # Retain saved prices for fair pairing; legacy files remain readable.
             keys += [key for key in ("e_price", "e_price_valid", "price_valid") if key in frame]
             selected = frame[frame.zone_id.isin(zones)][keys].sort_values(["zone_id", "time"])
             valid = selected[["actual_kwh", "predicted_kwh"]].apply(pd.to_numeric, errors="coerce")

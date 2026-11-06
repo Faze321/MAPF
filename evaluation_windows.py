@@ -6,7 +6,7 @@ controller's ``control_success`` flag, which can include price-policy checks.
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import math
 from typing import Any, Iterable
 
@@ -78,102 +78,6 @@ def _first_present(record: dict[str, Any], *names: str) -> Any:
     return None
 
 
-def _product(price: float | None, load: float | None) -> float | None:
-    if price is None or load is None:
-        return None
-    product = price * load
-    return product if math.isfinite(product) else None
-
-
-def _sum_finite(values: Iterable[float]) -> float | None:
-    values = list(values)
-    if not values:
-        return None
-    try:
-        total = math.fsum(values)
-    except OverflowError:
-        return None
-    return total if math.isfinite(total) else None
-
-
-def _percentage(change: float | None, baseline: float | None) -> float | None:
-    if change is None or baseline is None or baseline == 0:
-        return None
-    value = change / baseline * 100
-    return value if math.isfinite(value) else None
-
-
-def _zone_identity(value: Any) -> str | None:
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        number = _integer(value)
-        return str(number) if number is not None else None
-    text = str(value).strip()
-    return text or None
-
-
-def _hourly_time(value: Any) -> datetime | None:
-    try:
-        text = _time_identity(value)
-        if len(text) < 10 or text[4:5] != "-" or text[7:8] != "-":
-            return None
-        return datetime.fromisoformat(text)
-    except (ValueError, TypeError, OverflowError):
-        return None
-
-
-def _index_baseline_hourly(source: Any) -> tuple[dict[str, dict[datetime, list[dict[str, Any]]]], set[str]]:
-    """Index once per result; invalid times cannot be silently dropped from a zone."""
-    if source is None:
-        return {}, set()
-    records = source.to_dict(orient="records") if hasattr(source, "to_dict") else source
-    indexed: dict[str, dict[datetime, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
-    invalid_zones: set[str] = set()
-    for row in records:
-        if not isinstance(row, dict):
-            continue
-        zone_id = _zone_identity(row.get("zone_id"))
-        if zone_id is None:
-            continue
-        hour = _hourly_time(row.get("time"))
-        if hour is None:
-            invalid_zones.add(zone_id)
-        else:
-            indexed[zone_id][hour].append(row)
-    return indexed, invalid_zones
-
-
-def _baseline_hourly_revenue(
-    indexed: dict[str, dict[datetime, list[dict[str, Any]]]], invalid_zones: set[str],
-    zone_id: Any, key: tuple[str, str],
-) -> float | None:
-    """Sum exact hourly products; the window end is its inclusive last hour."""
-    zone_key = _zone_identity(zone_id)
-    start, end = (_hourly_time(value) for value in key)
-    if zone_key is None or zone_key in invalid_zones or start is None or end is None or end < start:
-        return None
-    duration, remainder = divmod(end - start, timedelta(hours=1))
-    if remainder:
-        return None
-    hours = [(hour, matches) for hour, matches in indexed.get(zone_key, {}).items()
-             if start <= hour <= end]
-    if len(hours) != duration + 1:
-        return None
-    revenues = []
-    for hour, matches in hours:
-        if (hour - start) % timedelta(hours=1) or len(matches) != 1:
-            return None
-        row = matches[0]
-        if row.get("e_price_valid") is False or row.get("price_valid") is False:
-            return None
-        revenue = _product(_number(row.get("e_price")), _number(row.get("predicted_kwh")))
-        if revenue is None:
-            return None
-        revenues.append(revenue)
-    return _sum_finite(revenues)
-
-
 def _history_fields(baseline: bool | None, history: list[tuple[int, bool | None]]) -> dict[str, Any]:
     states = [baseline, *(state for _, state in history)]
     ever = True if True in states else None if None in states else False
@@ -194,20 +98,15 @@ def _history_fields(baseline: bool | None, history: list[tuple[int, bool | None]
     }
 
 
-def extract_window_rounds(control_result: dict[str, Any], *, baseline_hourly: Any = None) -> list[dict[str, Any]]:
+def extract_window_rounds(control_result: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract baseline, every control round, and authoritative final observations.
 
     Missing rounds stay unknown. Only an explicitly successful global early stop
     can supply later rounds from final state. Recorded frozen windows retain the
     prediction recorded for that round rather than an older successful value.
-    ``baseline_hourly`` accepts a DataFrame or iterable of dictionaries with
-    zone_id/time/e_price/predicted_kwh. Only exact, unique, complete hourly
-    coverage supplies the additional hourly-price baseline; no interpolation or
-    replacement of the original window-mean baseline is performed.
     """
     if control_result.get("schema_version") not in (2, 3, 4):
         raise ValueError("Expected control_results.json schema version 2, 3 or 4")
-    hourly_index, invalid_hourly_zones = _index_baseline_hourly(baseline_hourly)
     zones = control_result.get("zones") or []
     prepared = []
     seen_zones: set[str] = set()
@@ -257,16 +156,10 @@ def extract_window_rounds(control_result: dict[str, Any], *, baseline_hourly: An
             if baseline_window.get("baseline_price_valid") is False:
                 baseline_price = None
             baseline_load = _number(baseline_window.get("sum_predicted_kwh"))
-            baseline_revenue = _product(baseline_price, baseline_load)
-            baseline_hourly_revenue = _baseline_hourly_revenue(
-                hourly_index, invalid_hourly_zones, zone.get("zone_id"), key,
-            )
             metadata = {
                 "zone_id": zone_id, "window_start": key[0], "window_end": key[1],
                 "baseline_medium": baseline_medium, "baseline_stress": baseline_stress,
                 "baseline_price": baseline_price, "baseline_load_kwh": baseline_load,
-                "baseline_revenue": baseline_revenue,
-                "baseline_hourly_revenue": baseline_hourly_revenue,
                 "zone_expected_window_count": len(identities),
                 "run_expected_window_count": run_window_count,
                 "run_expected_zone_count": len(prepared),
@@ -285,17 +178,10 @@ def extract_window_rounds(control_result: dict[str, Any], *, baseline_hourly: An
                     load = _number(_first_present(window, "reforecast_load_kwh", "price_conditioned_baseline_load_kwh"))
                     success = window.get("control_success")
                     success = success if isinstance(success, bool) else None
-                revenue = _product(price, load)
-                change = revenue - baseline_revenue if revenue is not None and baseline_revenue is not None else None
-                hourly_change = revenue - baseline_hourly_revenue if revenue is not None and baseline_hourly_revenue is not None else None
                 row = {
                     **metadata, "phase": phase, "round": number, "medium": _medium(stress),
                     "stress": stress, "control_success": success, "previous_medium": previous,
-                    "price": price, "load_kwh": load, "revenue": revenue,
-                    "revenue_change": change,
-                    "revenue_change_pct": _percentage(change, baseline_revenue),
-                    "revenue_change_vs_hourly": hourly_change,
-                    "revenue_change_vs_hourly_pct": _percentage(hourly_change, baseline_hourly_revenue),
+                    "price": price, "load_kwh": load,
                     "observation_source": source,
                     "proposal_status": window.get("proposal_status"),
                     "early_stop_carried": source == "early_stop_carry",
@@ -348,12 +234,8 @@ def _summary_level(rows: list[dict[str, Any]], level: str) -> dict[str, int]:
             f"{level}_all_medium_count": all_medium_count}
 
 
-def summarize_windows(rows: list[dict[str, Any]], *, include_revenue: bool = False) -> dict[str, Any]:
-    """Pool rows for one phase/round without treating unknown values as failures.
-
-    Revenue is deliberately opt-in. Callers must keep both dataset and currency
-    separate; ``build_window_tables`` applies those grouping boundaries.
-    """
+def summarize_windows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pool rows for one phase/round without treating unknown values as failures."""
     medium_known = [row for row in rows if isinstance(row.get("medium"), bool)]
     baseline_pairs = [row for row in rows if isinstance(row.get("baseline_medium"), bool) and isinstance(row.get("medium"), bool)]
     adjacent_pairs = [row for row in rows if isinstance(row.get("previous_medium"), bool) and isinstance(row.get("medium"), bool)]
@@ -399,43 +281,11 @@ def summarize_windows(rows: list[dict[str, Any]], *, include_revenue: bool = Fal
         "stress_distribution": dict(sorted(Counter(row.get("stress") or "Unknown" for row in rows).items())),
         **_summary_level(rows, "zone"), **_summary_level(rows, "run"),
     }
-    if not include_revenue:
-        return result
-    for name in ("dataset", "dataset_identity", "revenue_unit"):
-        identities = {str(row[name]) for row in rows if row.get(name) is not None}
-        if len(identities) > 1:
-            raise ValueError(f"Revenue must not pool different {name} values")
-    for field in ("baseline_revenue", "baseline_hourly_revenue", "revenue"):
-        observed = [_number(row.get(field)) for row in rows]
-        known = [value for value in observed if value is not None]
-        total = _sum_finite(known)
-        complete = bool(rows) and len(known) == len(rows) and total is not None and math.isfinite(total)
-        result.update({field: total if complete else None, f"known_{field}": total,
-                       f"{field}_complete": complete, f"{field}_known_count": len(known),
-                       f"{field}_unknown_count": len(rows) - len(known),
-                       f"{field}_coverage_pct": 100 * len(known) / len(rows) if rows else None})
-    comparable = [(base, value) for row in rows
-                  if (base := _number(row.get("baseline_revenue"))) is not None
-                  and (value := _number(row.get("revenue"))) is not None]
-    known_change = _sum_finite(value - base for base, value in comparable)
-    result["revenue_comparable_count"] = len(comparable)
-    result["known_revenue_change"] = known_change
-    change = result["revenue"] - result["baseline_revenue"] if result["revenue_complete"] and result["baseline_revenue_complete"] else None
-    result["revenue_change"] = change
-    result["revenue_change_pct"] = _percentage(change, result["baseline_revenue"])
-    hourly_comparable = [(base, value) for row in rows
-                         if (base := _number(row.get("baseline_hourly_revenue"))) is not None
-                         and (value := _number(row.get("revenue"))) is not None]
-    result["revenue_hourly_comparable_count"] = len(hourly_comparable)
-    result["known_revenue_change_vs_hourly"] = _sum_finite(value - base for base, value in hourly_comparable)
-    hourly_change = result["revenue"] - result["baseline_hourly_revenue"] if result["revenue_complete"] and result["baseline_hourly_revenue_complete"] else None
-    result["revenue_change_vs_hourly"] = hourly_change
-    result["revenue_change_vs_hourly_pct"] = _percentage(hourly_change, result["baseline_hourly_revenue"])
     return result
 
 
 def build_window_tables(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Build deterministic control and revenue tables from metadata-enriched rows."""
+    """Build deterministic control tables from metadata-enriched rows."""
     control_groups = {
         "round_overall": (),
         "round_by_dataset": ("dataset", "dataset_identity"),
@@ -444,15 +294,9 @@ def build_window_tables(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, 
         "round_by_origin_model_mode": ("dataset", "dataset_identity", "forecast_origin", "backend", "agent_mode"),
         "round_by_zone": ("dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "zone_id"),
     }
-    revenue_groups = {
-        "revenue_by_dataset": ("dataset", "dataset_identity", "revenue_unit"),
-        "revenue_by_dataset_model_mode": ("dataset", "dataset_identity", "backend", "agent_mode", "revenue_unit"),
-        "revenue_by_origin_model_mode": ("dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "revenue_unit"),
-        "revenue_by_zone": ("dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "zone_id", "revenue_unit"),
-    }
     tables = {}
     model_dimensions = ("model_set_id",) if any(row.get("model_set_id") not in (None, "legacy_unknown") for row in rows) else ()
-    for table_name, dimensions in {**control_groups, **revenue_groups}.items():
+    for table_name, dimensions in control_groups.items():
         keys = ("batch", *dimensions, *model_dimensions, "phase", "round")
         grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
@@ -465,6 +309,6 @@ def build_window_tables(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, 
                     _integer(values[-1]) or 0)
 
         for values, group in sorted(grouped.items(), key=sort_key):
-            table.append({**dict(zip(keys, values)), **summarize_windows(group, include_revenue=table_name in revenue_groups)})
+            table.append({**dict(zip(keys, values)), **summarize_windows(group)})
         tables[table_name] = table
     return tables

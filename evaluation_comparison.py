@@ -35,8 +35,8 @@ def _count(value: Any) -> int | None:
     return int(value) if isinstance(value, Integral) and not isinstance(value, bool) and value >= 0 else None
 
 
-def _sum_complete(values: list[Any], *, count: bool = False) -> int | float | None:
-    parsed = [(_count(value) if count else _number(value)) for value in values]
+def _sum_counts(values: list[Any]) -> int | None:
+    parsed = [_count(value) for value in values]
     return sum(parsed) if parsed and all(value is not None for value in parsed) else None
 
 
@@ -87,9 +87,9 @@ def _match_status(runs: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
         if len({_json(run[field]) for run in runs}) > 1:
             mismatches.append(field)
     # The same numeric price in different known currencies is not the same baseline.
-    units = {run.get("revenue_unit") for run in runs if run.get("revenue_unit") is not None}
+    units = {run.get("price_unit") for run in runs if run.get("price_unit") is not None}
     if len(units) > 1:
-        mismatches.append("revenue_unit")
+        mismatches.append("price_unit")
     return ("inconsistent", {"reason": "baseline_mismatch", "mismatched_fields": mismatches}) if mismatches else ("matched", {})
 
 
@@ -97,13 +97,13 @@ def _summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
     outcomes = [run.get("outcome_summary") or {} for run in runs]
     usages = [run.get("usage") or {} for run in runs]
     result: dict[str, Any] = {"matched_run_count": len(runs)}
-    result.update({field: _sum_complete([row.get(field) for row in outcomes], count=True) for field in _COUNT_FIELDS})
+    result.update({field: _sum_counts([row.get(field) for row in outcomes]) for field in _COUNT_FIELDS})
     known_medium = result["medium_known_count"]
     result["medium_rate_pct"] = (
         100 * result["medium_count"] / known_medium
         if known_medium and result["medium_count"] is not None else None
     )
-    result["agent_call_count"] = _sum_complete([row.get("agent_call_count") for row in usages], count=True)
+    result["agent_call_count"] = _sum_counts([row.get("agent_call_count") for row in usages])
     complete_flags = [
         row.get("token_usage_complete") is True and all(_count(row.get(field)) is not None for field in TOKEN_FIELDS)
         for row in usages
@@ -122,38 +122,6 @@ def _summarize(runs: list[dict[str, Any]]) -> dict[str, Any]:
         result["cached_tokens"] / result["agent_call_count"]
         if result["cache_usage_complete"] and result["agent_call_count"] else None
     )
-    for prefix in ("revenue", "baseline_revenue", "baseline_hourly_revenue"):
-        valid = [row.get(f"{prefix}_complete") is True and _number(row.get(prefix)) is not None for row in outcomes]
-        result[f"{prefix}_complete"] = bool(valid) and all(valid)
-        result[prefix] = sum(row[prefix] for row in outcomes) if result[f"{prefix}_complete"] else None
-        known = [_number(row.get(f"known_{prefix}")) for row in outcomes]
-        result[f"known_{prefix}"] = sum(value for value in known if value is not None) if any(value is not None for value in known) else None
-        for suffix in ("known_count", "unknown_count"):
-            result[f"{prefix}_{suffix}"] = _sum_complete([row.get(f"{prefix}_{suffix}") for row in outcomes], count=True)
-        count = result[f"{prefix}_known_count"]
-        result[f"{prefix}_coverage_pct"] = (
-            100 * count / result["window_count"]
-            if count is not None and result["window_count"] else None
-        )
-    revenue, baseline = result["revenue"], result["baseline_revenue"]
-    result["revenue_change"] = revenue - baseline if revenue is not None and baseline is not None else None
-    result["revenue_change_pct"] = 100 * result["revenue_change"] / baseline if baseline and result["revenue_change"] is not None else None
-    hourly_baseline = result["baseline_hourly_revenue"]
-    result["revenue_hourly_comparable_count"] = _sum_complete(
-        [row.get("revenue_hourly_comparable_count") for row in outcomes], count=True,
-    )
-    known_changes = [_number(row.get("known_revenue_change_vs_hourly")) for row in outcomes]
-    result["known_revenue_change_vs_hourly"] = (
-        sum(value for value in known_changes if value is not None)
-        if any(value is not None for value in known_changes) else None
-    )
-    result["revenue_change_vs_hourly"] = (
-        revenue - hourly_baseline if revenue is not None and hourly_baseline is not None else None
-    )
-    result["revenue_change_vs_hourly_pct"] = (
-        100 * result["revenue_change_vs_hourly"] / hourly_baseline
-        if hourly_baseline and result["revenue_change_vs_hourly"] is not None else None
-    )
     return result
 
 
@@ -163,7 +131,7 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
         left, right = by_id[pair["left_run_id"]], by_id[pair["right_run_id"]]
         key = (
             pair["left_batch"], pair["right_batch"], pair["dataset_identity"],
-            pair["backend"], pair["agent_mode"], left.get("revenue_unit"), right.get("revenue_unit"),
+            pair["backend"], pair["agent_mode"], left.get("price_unit"), right.get("price_unit"),
             left.get("model_set_id", "legacy_unknown"), right.get("model_set_id", "legacy_unknown"),
         )
         grouped[key].append(pair)
@@ -172,9 +140,7 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
         left = _summarize([by_id[record["left_run_id"]] for record in records])
         right = _summarize([by_id[record["right_run_id"]] for record in records])
         delta = {}
-        monetary_fields = ("revenue", "revenue_change", "baseline_hourly_revenue",
-                           "revenue_change_vs_hourly", "revenue_change_vs_hourly_pct")
-        for field in ("medium_count", "medium_rate_pct", "zone_all_medium_count", "run_all_medium_count", "agent_call_count", *TOKEN_FIELDS, "cached_tokens", "cache_hit_ratio", *monetary_fields):
+        for field in ("medium_count", "medium_rate_pct", "zone_all_medium_count", "run_all_medium_count", "agent_call_count", *TOKEN_FIELDS, "cached_tokens", "cache_hit_ratio"):
             a, b = _number(left.get(field)), _number(right.get(field))
             delta[field] = b - a if a is not None and b is not None else None
         if left.get("medium_unknown_count") != 0 or right.get("medium_unknown_count") != 0:
@@ -183,14 +149,12 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
             if left.get(f"{scope}_unknown_count") != 0 or right.get(f"{scope}_unknown_count") != 0:
                 delta[f"{scope}_all_medium_count"] = None
         units_agree = key[5] == key[6]
-        if not units_agree:
-            delta.update({field: None for field in monetary_fields})
         first_left = by_id[records[0]["left_run_id"]]
         summaries.append({
             "left_batch": key[0], "right_batch": key[1], "dataset_identity": key[2],
             "dataset": first_left.get("dataset"), "backend": key[3], "agent_mode": key[4],
-            "revenue_unit": key[5] if units_agree else None,
-            "left_revenue_unit": key[5], "right_revenue_unit": key[6],
+            "price_unit": key[5] if units_agree else None,
+            "left_price_unit": key[5], "right_price_unit": key[6],
             "left_model_set_id": key[7], "right_model_set_id": key[8],
             "pair_count": len(records), "left": left, "right": right, "delta": delta,
             "delta_direction": "right_minus_left",

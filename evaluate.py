@@ -11,7 +11,7 @@ import importlib
 import json
 from pathlib import Path
 from typing import Any, Protocol
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -46,11 +46,6 @@ DEFINITIONS = {
     "training_overlap": "training_overlap_sample_count counts forecast hours covered by the saved model's fitted data intervals. Temporal out-of-sample evaluation additionally requires forecast_origin >= model_training_end_exclusive; zero overlap alone is insufficient. Missing training provenance remains unknown.",
     "model_versions": "Known model_set_id values separate trained weight versions in forecast, Agent, window, usage and paired summary tables. Agent overall is an explicit inventory total across model sets, not a model performance group.",
     "medium_new": "Originally non-Medium and currently Medium; separate from adjacent entries and first-ever entries.",
-    "revenue": "Predicted electricity revenue only: window mean energy price * window total predicted kWh. No additional factor of 3, no service fee or costs. Each round is an alternative scenario, not additive income.",
-    "revenue_baseline": "Original mean_energy_price * sum_predicted_kwh, a window-mean approximation. Proposed price * same-round reforecast load for control outcomes.",
-    "revenue_baseline_hourly": "baseline_hourly_revenue = sum(original hourly e_price * original hourly predicted_kwh) within each window, including both endpoints. Requires complete unique hourly records; never substitute actual load or the window-mean approximation.",
-    "revenue_changes": "revenue_change and revenue_change_pct use baseline_revenue (window mean). revenue_change_vs_hourly and revenue_change_vs_hourly_pct use baseline_hourly_revenue. Each percentage is 100 * change / its own baseline. The baseline phase retains window-mean revenue; its hourly-relative change shows the difference between the two baselines.",
-    "revenue_pooling": "Revenue is pooled only within dataset and source currency; missing observations make full totals unknown. Zero baseline has undefined relative change.",
     "cache_tokens": "Cached tokens are included in prompt_tokens, not additional or subtracted tokens. Missing cache reports are unknown; known_cached_tokens is only the observed subtotal.",
     "fair_comparison": "Compare complete matched runs with identical forecast parameters, baseline prices/loads/thresholds and hourly observations/predictions, including hourly energy prices when saved. Batch labels are user-supplied, not verified LLM model IDs.",
 }
@@ -160,13 +155,8 @@ def _window_states(windows: list[dict[str, Any]]) -> dict[tuple[str, str], bool 
 
 def evaluate_agent(
     control_result: dict[str, Any], *, analyzer: AgentAnalyzer | None = None,
-    baseline_hourly: pd.DataFrame | Iterable[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Analyze a schema 2/3/4 result with optional original hourly baseline records.
-
-    ``baseline_hourly`` uses zone_id/time/e_price/predicted_kwh; absent hourly
-    records leave the additional hourly revenue baseline unknown.
-    """
+    """Analyze control outcomes and token usage from a schema 2/3/4 result."""
     control_result = normalize_evaluation_fields(control_result)
     if control_result.get("schema_version") not in (2, 3, 4):
         raise ValueError("Expected control_results.json schema version 2, 3 or 4")
@@ -205,10 +195,10 @@ def evaluate_agent(
         "usage": _usage(control_result), "zones": zones,
     }
     analysis["summary"] = summarize_agents([analysis])
-    analysis["window_rounds"] = extract_window_rounds(control_result, baseline_hourly=baseline_hourly)
+    analysis["window_rounds"] = extract_window_rounds(control_result)
     analysis["usage_details"] = extract_usage_details(control_result)
     analysis["outcome_summary"] = summarize_windows(
-        [row for row in analysis["window_rounds"] if row["phase"] == "final"], include_revenue=True)
+        [row for row in analysis["window_rounds"] if row["phase"] == "final"])
     if analyzer is None:
         analysis["llm_analysis"] = {"status": "not_configured"}
     else:
@@ -390,8 +380,7 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
                 raw = read_json(path)
                 context = find_forecast_context(path, contexts)
                 try:
-                    analysis = evaluate_agent(raw, analyzer=analyzer,
-                                              baseline_hourly=(context or {}).get("frame"))
+                    analysis = evaluate_agent(raw, analyzer=analyzer)
                 except (ValueError, KeyError, TypeError) as exc:
                     raise ValueError(f"Cannot evaluate {path}: {exc}") from exc
                 meta = {"batch": label, **dataset_metadata((context or {}).get("manifest", {}), raw),
@@ -409,7 +398,7 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
                 run_calls = [{**c, **meta} for c in detail["calls"]]
                 run_rounds = [{**u, **meta} for u in detail["rounds"]]
                 audits.extend({**a, **meta} for a in detail["audit"])
-                analysis["outcome_summary"] = summarize_windows([w for w in run_windows if w["phase"] == "final"], include_revenue=True)
+                analysis["outcome_summary"] = summarize_windows([w for w in run_windows if w["phase"] == "final"])
                 analysis["pairing_ready"] &= analysis["outcome_summary"]["run_complete_count"] == 1
                 windows.extend(run_windows)
                 calls.extend(run_calls)
@@ -550,7 +539,7 @@ def render_evaluation_report(report: dict[str, Any]) -> str:
         for raw, record in zip(tables.get(name, []), records):
             if raw.get("model_set_id") not in (None, "legacy_unknown"):
                 record["模型版本集合"] = raw["model_set_id"]
-    sections = ["# 实验评估报告", "本报告离线读取保存结果；控制效果和收益均为模型预测，未代表真实调价后的观测。",
+    sections = ["# 实验评估报告", "本报告离线读取保存结果；控制效果基于模型预测，未代表真实调价后的观测。",
                 "批次标签用于区分输入目录；旧结果未记录实际 LLM 型号时，标签不构成型号验证。",
                 f"读取 {len(report['agent']['runs'])} 个控制结果；同批模式共同样本包含 "
                 f"{len(comparison.get('common_run_ids', []))} 个运行；跨批成功配对 "
@@ -575,28 +564,13 @@ def render_evaluation_report(report: dict[str, Any]) -> str:
         "cached_tokens", "known_cached_tokens", "mean_cached_tokens_per_call", "cache_hit_ratio",
         "cache_reported_call_count", "cache_usage_complete"]),
         "缓存命中比例为累计命中输入 tokens ÷ 累计输入 tokens（0–1）。服务端未返回时完整统计为未知；known_cached_tokens 仅代表已知部分，不能把部分数据视为完整总量。"])
-    revenue = tables.get("revenue_by_dataset_model_mode", [])
-    sections.extend(["## 电价收益（全量，按数据集分开）", "同时使用两个基准：窗口基准 baseline_revenue = 窗口均价 × 原始预测总 kWh；逐小时基准 baseline_hourly_revenue = Σ（原始小时电价 e_price × 同小时预测负荷 predicted_kwh），按窗口起止小时（含两端）求和。每轮及最终收益 = 实际采用价格 × 同轮重预测总 kWh。无需再乘 3，各轮是独立方案，不累加为收入。仅含电费、不含服务费、未扣成本；未改变 Medium 达标规则。",
-                     _markdown_table(revenue, ["batch", "dataset", "backend", "agent_mode", "revenue_unit", "phase", "round",
-                                               "baseline_revenue", "baseline_hourly_revenue", "revenue", "revenue_change", "revenue_change_pct",
-                                               "revenue_change_vs_hourly", "revenue_change_vs_hourly_pct"]),
-                     "revenue_change / revenue_change_pct 相对窗口基准；revenue_change_vs_hourly / revenue_change_vs_hourly_pct 相对逐小时基准，各自除以对应基准计算百分比。baseline 行的 revenue 保留窗口基准，因此该行相对逐小时的差额表示两种基准的差异。不同数据集/币种不直接合计收益。基准为零时其增减比例未知。缺少完整小时价格/预测负荷时逐小时基准未知，不用窗口均价或实际负荷代替。"])
-    incomplete_revenue = [row for row in revenue if not all(row.get(f"{field}_complete") for field in
-                                                          ("baseline_revenue", "baseline_hourly_revenue", "revenue"))]
-    if incomplete_revenue:
-        sections.extend(["### 收益数据覆盖（仅列不完整项）", _markdown_table(incomplete_revenue, [
-            "batch", "dataset", "backend", "agent_mode", "revenue_unit", "phase", "round", "window_count",
-            "known_baseline_revenue", "baseline_revenue_coverage_pct", "known_baseline_hourly_revenue",
-            "baseline_hourly_revenue_coverage_pct", "known_revenue", "revenue_coverage_pct"]),
-            "known_* 仅为完整有效窗口的已知部分和，不能作为完整收益或基准；覆盖率以窗口数计算，窗口内缺小时不计为完整窗口。"])
     paired = []
     for row in tables.get("paired_summary", []):
         flattened = {}
         for key, value in row.items():
             if isinstance(value, dict):
                 flattened.update({f"{key}_{name}": item for name, item in value.items() if name in
-                                  ("medium_count", "total_tokens", "cached_tokens", "revenue", "baseline_revenue",
-                                   "baseline_hourly_revenue", "revenue_change", "revenue_change_vs_hourly")})
+                                  ("medium_count", "total_tokens", "cached_tokens")})
             else:
                 flattened[key] = value
         paired.append(flattened)
@@ -637,6 +611,10 @@ def write_evaluation(report: dict[str, Any], output_dir: Path | str) -> Path:
         ],
     }
     tables.update({f"{name}.csv": rows for name, rows in report.get("tables", {}).items()})
+    # Retire only the known generated tables, leaving source data and user files alone.
+    for filename in ("revenue_by_dataset.csv", "revenue_by_dataset_model_mode.csv",
+                     "revenue_by_origin_model_mode.csv", "revenue_by_zone.csv"):
+        (output / filename).unlink(missing_ok=True)
     for filename, rows in tables.items():
         if rows:
             csv_rows = [{key: json.dumps(value, ensure_ascii=False, allow_nan=False) if isinstance(value, (dict, list)) else value

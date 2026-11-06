@@ -804,32 +804,6 @@ An explicitly successful early stop carries its final outcome with zero further
 calls; missing intermediate observations are unknown. Internal discussion rounds
 are not additional observed control outcomes.
 
-Revenue is an independent, predicted electricity-income metric with two baselines:
-
-- `baseline_revenue`: original `mean_energy_price * sum_predicted_kwh`, the existing
-  window-mean-price approximation.
-- `baseline_hourly_revenue`: `sum(e_price * predicted_kwh)` over the original hourly
-  forecast records in that window. Both window endpoints are included. This uses
-  predicted load, not `actual_kwh`, and requires complete, unique, valid hourly
-  records. Missing hourly prices or loads leave this baseline unknown.
-
-Each control round uses the actual `proposed_energy_price` times its reforecast
-total kWh. `revenue_change` / `revenue_change_pct` retain the window baseline;
-`revenue_change_vs_hourly` / `revenue_change_vs_hourly_pct` use the hourly baseline.
-Each percentage divides by its own baseline. The `baseline` phase keeps the
-window-mean revenue, so its hourly-relative change shows the difference between
-the two baseline calculations. Directory evaluation loads hourly CSVs automatically;
-direct callers can pass `evaluate_agent(control_result, baseline_hourly=hourly)`
-with a DataFrame or record iterable containing `zone_id`, `time`, `e_price` and
-`predicted_kwh`.
-
-Do not multiply by three again, infer price from the declared percentage, include
-service fees/costs, or add alternative rounds together.
-`revenue_by_dataset_model_mode.csv` and finer tables preserve source
-currency and never pool different datasets/currencies. Missing/invalid values
-keep each full baseline/revenue unknown while exposing known subtotals and coverage; a zero
-baseline has undefined relative change. Existing Medium success rules are unchanged.
-
 `call_details.csv`, `usage_per_run_round.csv`, and grouped `usage_by_*.csv` include
 input/output/total tokens, per-call means, medians/P95 where individual calls are
 complete, repair/role/discussion breakdowns, and cached input tokens. Cache fields

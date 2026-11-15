@@ -231,7 +231,7 @@ class NativeForecasterArtifact:
     fitted_state: dict[str, Any]
 
     def __post_init__(self) -> None:
-        if self.backend in {"lstm", "xgboost"}:
+        if self.backend in {"lstm", "xgboost"} or self.fitted_state.get("model_reference") is not None:
             from zone_training import validate_model_reference
 
             reference = self.fitted_state.get("model_reference")

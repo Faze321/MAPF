@@ -1518,6 +1518,7 @@ dependencies = [
     { name = "openpyxl" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "peft" },
     { name = "pyyaml" },
     { name = "requests" },
     { name = "scikit-learn", version = "1.7.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1539,6 +1540,7 @@ requires-dist = [
     { name = "openai", specifier = ">=2.38.0" },
     { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "pandas", specifier = ">=2.3.3" },
+    { name = "peft", specifier = ">=0.13,<0.18" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "requests", specifier = ">=2.34.2" },
     { name = "scikit-learn", specifier = ">=1.7.2" },
@@ -2343,6 +2345,28 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/30/4b/90c937815137d43ce71ba043cd3566221e9df6b9c805f24b5d138c9d40a7/parso-0.8.7.tar.gz", hash = "sha256:eaaac4c9fdd5e9e8852dc778d2d7405897ec510f2a298071453e5e3a07914bb1", size = 401824, upload-time = "2026-05-01T23:13:02.138Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/99/5d/8268b644392ee874ee82a635cd0df1773de230bde356c38de28e298392cc/parso-0.8.7-py2.py3-none-any.whl", hash = "sha256:a8926eb2a1b915486941fdbd31e86a4baf88fe8c210f25f2f35ecec5b574ca1c", size = 107025, upload-time = "2026-05-01T23:12:58.867Z" },
+]
+
+[[package]]
+name = "peft"
+version = "0.17.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "accelerate" },
+    { name = "huggingface-hub" },
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "packaging" },
+    { name = "psutil" },
+    { name = "pyyaml" },
+    { name = "safetensors" },
+    { name = "torch" },
+    { name = "tqdm" },
+    { name = "transformers" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/70/b8/2e79377efaa1e5f0d70a497db7914ffd355846e760ffa2f7883ab0f600fb/peft-0.17.1.tar.gz", hash = "sha256:e6002b42517976c290b3b8bbb9829a33dd5d470676b2dec7cb4df8501b77eb9f", size = 568192, upload-time = "2025-08-21T09:25:22.703Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/49/fe/a2da1627aa9cb6310b6034598363bd26ac301c4a99d21f415b1b2855891e/peft-0.17.1-py3-none-any.whl", hash = "sha256:3d129d64def3d74779c32a080d2567e5f7b674e77d546e3585138216d903f99e", size = 504896, upload-time = "2025-08-21T09:25:18.974Z" },
 ]
 
 [[package]]

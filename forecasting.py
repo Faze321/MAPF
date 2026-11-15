@@ -38,15 +38,15 @@ def forecast_zone(
     profile: dict[str, Any],
     forecast_origin: pd.Timestamp | None,
     horizon_days: int = 1,
-    history_days: int = 30,
-    validation_days: int = 5,
+    history_days: int = 35,
+    validation_days: int = 7,
     backend: str = "timesfm",
     diurnal_blend_alpha: float = 0.0,
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch",
-    timesfm_context_hours: int = 168,
+    timesfm_context_hours: int = 840,
     timesfm_exog_cols: list[str] | None = None,
     chronos_repo: str = "amazon/chronos-2",
-    chronos_context_hours: int = 512,
+    chronos_context_hours: int = 840,
     chronos_exog_cols: list[str] | None = None,
     chronos_device: str = "auto",
     model_reference: dict[str, Any] | None = None,
@@ -249,10 +249,10 @@ def forecast_load(
     backend: str,
     diurnal_blend_alpha: float = 0.0,
     timesfm_repo: str = 'google/timesfm-2.5-200m-pytorch',
-    timesfm_context_hours: int = 168,
+    timesfm_context_hours: int = 840,
     timesfm_exog_cols: list[str] | None = None,
     chronos_repo: str = 'amazon/chronos-2',
-    chronos_context_hours: int = 512,
+    chronos_context_hours: int = 840,
     chronos_exog_cols: list[str] | None = None,
     chronos_device: str = 'auto',
     fitted_state: dict[str, Any] | None = None,
@@ -314,7 +314,7 @@ def forecast_load(
         if model_reference is not None and model_reference != saved_reference:
             raise ValueError("Reusable calibration cannot be paired with a different model reference")
         model_reference = saved_reference
-    if backend in {"lstm", "xgboost"} and model_reference is not None:
+    if model_reference is not None:
         dimensions = model_reference.get("parameters", {})
         if dimensions.get("input_hours") != history_hours or dimensions.get("output_hours") != horizon_hours:
             raise ValueError("Offline model input/output windows do not match history_days/horizon_days; prepare the matching model")
@@ -331,7 +331,7 @@ def forecast_load(
             day_frame = validation.iloc[offset:offset + 24].copy()
             context = pd.concat([history, validation.iloc[:offset]], ignore_index=True).tail(history_hours)
             day_covariates = day_frame.drop(columns=["actual_kwh", "load"], errors="ignore")
-            if backend in {"lstm", "xgboost"} and model_reference is not None:
+            if model_reference is not None:
                 # A direct model always receives and returns its entire trained
                 # horizon. Daily bias uses only its first 24 offsets. Future
                 # covariates may cross T, but no future actual load is included.
@@ -466,6 +466,16 @@ def prepare_forecast_backend(
     if set(exog_cols) - KNOWN_FUTURE_COVARIATES:
         raise ValueError("Forecaster covariates must be known future features, never load or evaluation fields")
 
+    reference = model_reference or state.get("model_reference")
+    if reference is not None:
+        from zone_training import load_cached_predictor
+
+        if not isinstance(reference, dict) or reference.get("backend") != backend:
+            raise ValueError(f"The prepared model reference does not match backend {backend}")
+        return load_cached_predictor(reference), {
+            "model_reference": deepcopy(reference), "model_id": reference["model_id"],
+        }
+
     if backend == "timesfm":
         context_hours = p["timesfm_context_hours"]
         model = load_timesfm_model(p["timesfm_repo"], context_hours, max(32, max_horizon))
@@ -490,14 +500,7 @@ def prepare_forecast_backend(
                                  "q10_kwh": q10, "q90_kwh": q90})
         return predict, {}
     if backend in {"lstm", "xgboost"}:
-        from zone_training import load_cached_predictor
-
-        reference = model_reference or state.get("model_reference")
-        if not isinstance(reference, dict) or reference.get("backend") != backend:
-            raise ValueError(f"{backend} requires a prepared per-zone model_reference; run the train stage first")
-        return load_cached_predictor(reference), {
-            "model_reference": deepcopy(reference), "model_id": reference["model_id"],
-        }
+        raise ValueError(f"{backend} requires a prepared per-zone model_reference; run the train stage first")
     if backend == "AR":
         response = state["energy_price_response"] if fitted_state is not None else estimate_energy_price_response(history)
         def predict(context, future):

@@ -70,8 +70,8 @@ run:
   forecast_starts: null # explicit dates override automatic selection
   forecast_start_count: 1 # 1: latest window; 2+: evenly spaced valid origins per dataset
   horizon_days: 1 # forecast length; multi-day forecasts reuse the 24-hour bias pattern
-  history_days: 30 # LSTM/XGBoost input window = 720 hours; each output window uses horizon_days
-  validation_days: 5 # average daily validation errors for each forecast hour
+  history_days: 35 # model input window = 840 hours; each output window uses horizon_days
+  validation_days: 7 # seven-day prediction bias calibration; separate from offline training validation
   forecast_models:
     - "timesfm"
     - "chronos"
@@ -105,7 +105,7 @@ run:
     # - "single_agent_full_retry"
 # TimesFM
   timesfm_repo: "google/timesfm-2.5-200m-pytorch"
-  timesfm_context_hours: 168
+  timesfm_context_hours: 840
   timesfm_exog_cols:
     - "T"
     - "U"
@@ -117,7 +117,7 @@ run:
 
 # Chronos
   chronos_repo: "amazon/chronos-2"
-  chronos_context_hours: 168
+  chronos_context_hours: 840
 
   zones: null # automatically select sites from the current dataset
   experiment_zone_count: 12
@@ -132,8 +132,8 @@ run:
 
 # Train only selected sites; reuse weights across origins, alpha and Agent modes for the same H/P.
 training:
-  train_ratio: 0.8 # chronological complete-window split; purge overlapping target windows
-  validation_ratio: 0.2 # separate from the five-day bias calibration in run.validation_days
+  train_ratio: 0.9 # chronological complete-window split; purge overlapping target windows
+  validation_ratio: 0.1 # separate from the seven-day bias calibration in run.validation_days
   min_history_days: 45
   min_samples: 512 # complete input + output windows before splitting
   sample_stride_hours: 1
@@ -154,6 +154,33 @@ training:
     xgboost_max_depth: 3
     xgboost_early_stopping_rounds: 50
     xgboost_n_jobs: 2 # host threads per XGBoost model
+    # LoRA uses automatic device selection and an independent adapter per dataset/Zone.
+    # Enable switches belong here or in CLI; other parameters support dataset/Zone overrides.
+    timesfm_lora_enabled: true # false restores pretrained TimesFM inference without an adapter
+    timesfm_lora_rank: 8
+    timesfm_lora_alpha: 16
+    timesfm_lora_dropout: 0.05
+    timesfm_lora_target_modules: [qkv_proj, out]
+    timesfm_learning_rate: 0.0001
+    timesfm_batch_size: 4
+    timesfm_gradient_accumulation_steps: 4 # effective batch size: 16 complete windows
+    timesfm_epochs: 10 # upper limit; save the adapter with the best validation loss
+    timesfm_early_stopping_patience: 3
+    timesfm_weight_decay: 0.01
+    timesfm_grad_clip: 1.0
+    chronos_lora_enabled: true # false restores pretrained Chronos 2 inference without an adapter
+    chronos_lora_rank: 8
+    chronos_lora_alpha: 16
+    chronos_lora_dropout: 0.05
+    chronos_lora_target_modules: [self_attention.q, self_attention.v, self_attention.k, self_attention.o, output_patch_embedding.output_layer]
+    chronos_learning_rate: 0.0001
+    chronos_batch_size: 4
+    chronos_gradient_accumulation_steps: 4 # effective batch size: 16 complete windows
+    chronos_epochs: 10 # upper limit; save the adapter with the best validation loss
+    chronos_early_stopping_patience: 3
+    chronos_weight_decay: 0.01
+    chronos_grad_clip: 1.0
+    # Both LoRA seeds inherit training.seed unless timesfm_seed/chronos_seed is specified.
   dataset_overrides: {} # dataset folder -> flat training parameter overrides
   zone_overrides: {} # dataset folder -> quoted zone/site ID -> flat overrides
   # dataset_overrides:

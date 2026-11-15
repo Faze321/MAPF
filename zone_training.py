@@ -28,9 +28,12 @@ from request_limits import _try_file_lock, _release_file_lock
 
 MODEL_CACHE_SCHEMA_VERSION = 2
 TRAINING_IMPLEMENTATION_VERSION = "selected_zone_direct_windows_v2"
-TRAINABLE_BACKENDS = frozenset({"lstm", "xgboost"})
+TRAINABLE_BACKENDS = frozenset({"lstm", "xgboost", "timesfm", "chronos"})
+FOUNDATION_BACKENDS = frozenset({"timesfm", "chronos"})
+FOUNDATION_REPOS = {"timesfm": "google/timesfm-2.5-200m-pytorch", "chronos": "amazon/chronos-2"}
 DEFAULT_EXOG = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
 _PREDICTORS: OrderedDict[tuple[str, str], Any] = OrderedDict()
+_FOUNDATION_PREDICTORS: OrderedDict[tuple[str, str], Any] = OrderedDict()
 _PREDICTOR_LOCK = threading.Lock()
 
 
@@ -64,7 +67,7 @@ def complete_target_indices(frame: pd.DataFrame, context_hours: int,
 
 
 def inspect_training_window(
-    frame: pd.DataFrame, *, history_days: int = 30, horizon_days: int = 1,
+    frame: pd.DataFrame, *, history_days: int = 35, horizon_days: int = 1,
     train_ratio: float = 0.8, validation_ratio: float = 0.2,
     min_history_days: int = 45, min_samples: int = 512, sample_stride_hours: int = 1,
 ) -> dict[str, Any]:
@@ -125,7 +128,7 @@ def inspect_training_window(
 
 
 def assess_dataset_training(dataset: Any, training_config: Any, *, zone_ids=None,
-                            history_days: int = 30, horizon_days: int = 1) -> dict[str, Any]:
+                            history_days: int = 35, horizon_days: int = 1) -> dict[str, Any]:
     """Read-only eligibility for selection; no directories, models or cache writes."""
     available = set(dataset.timeseries["zone_id"].astype(str))
     selected = sorted(available) if zone_ids is None else list(dict.fromkeys(str(zone) for zone in zone_ids))
@@ -198,6 +201,25 @@ def _zone_model_lock(path: Path):
         _release_file_lock(handle)
 
 
+def _required_model_files(backend: str) -> set[str]:
+    common = {"preprocess.json", "training_history.csv"}
+    if backend in FOUNDATION_BACKENDS:
+        return common | {"adapter_config.json", "adapter_model.safetensors"}
+    if backend in {"lstm", "xgboost"}:
+        return common | {"model.pt" if backend == "lstm" else "model.json"}
+    raise ValueError(f"Unsupported offline model backend: {backend}")
+
+
+def _checked_model_files(backend: str, files: Any) -> list[str]:
+    if (not isinstance(files, (list, tuple, set, dict))
+            or any(not isinstance(name, str) or Path(name).name != name
+                   or name in {"", ".", "..", "manifest.json"} for name in files)):
+        raise ValueError("Invalid offline model file names")
+    if not _required_model_files(backend).issubset(files):
+        raise ValueError("Offline model manifest is missing required file checksums")
+    return sorted(set(files))
+
+
 def validate_model_reference(reference: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(reference, dict) or reference.get("schema_version") != MODEL_CACHE_SCHEMA_VERSION:
         raise ValueError("Unsupported or missing offline model reference; run the train stage")
@@ -214,10 +236,10 @@ def validate_model_reference(reference: dict[str, Any]) -> dict[str, Any]:
                   "training_intervals", "file_checksums"):
         if manifest.get(field) != reference.get(field):
             raise ValueError(f"Offline model reference {field} does not match its manifest")
-    required = {"model.pt" if manifest["backend"] == "lstm" else "model.json", "preprocess.json", "training_history.csv"}
     checksums = manifest.get("file_checksums")
-    if not isinstance(checksums, dict) or not required.issubset(checksums):
+    if not isinstance(checksums, dict):
         raise ValueError("Offline model manifest is missing required file checksums")
+    _checked_model_files(manifest["backend"], checksums)
     for filename, expected in checksums.items():
         if Path(filename).name != filename or filename in {".", ".."}:
             raise ValueError("Invalid offline model file name")
@@ -239,6 +261,7 @@ def _reference(directory: Path, manifest: dict[str, Any]) -> dict[str, Any]:
 def _ensure_zone_model(
     dataset: Any, data_dir: Path, zone_id: str, backend: str, training_config: Any,
     cli_overrides: dict[str, Any] | None, force_train: bool, history_days: int, horizon_days: int,
+    backend_parameters: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
     root = Path(dataset.cache_dir) / "weight" / backend
     folder = root / zone_key(zone_id)
@@ -257,6 +280,16 @@ def _ensure_zone_model(
         parameters.update(input_hours=history_days * 24, output_hours=horizon_days * 24,
                           sample_stride_hours=training_config.sample_stride_hours,
                           train_ratio=training_config.train_ratio, validation_ratio=training_config.validation_ratio)
+        if backend in FOUNDATION_BACKENDS:
+            supplied = backend_parameters or {}
+            parameters[f"{backend}_repo"] = supplied.get(f"{backend}_repo") or FOUNDATION_REPOS[backend]
+            # A fixed H-to-P adapter must retain the entire configured history.
+            parameters[f"{backend}_context_hours"] = history_days * 24
+            if supplied.get(f"{backend}_exog_cols") is not None:
+                parameters[f"{backend}_exog_cols"] = list(supplied[f"{backend}_exog_cols"])
+            else:
+                parameters.setdefault(f"{backend}_exog_cols", list(DEFAULT_EXOG))
+            parameters["adapter_implementation"] = "native_lora_v1"
         frame = assessment["frame"]
         start, end = assessment["validation_start"], assessment["validation_end"]
         signature = training_fingerprint(frame, data_dir=data_dir, zone_id=zone_id, backend=backend,
@@ -302,14 +335,21 @@ def _ensure_zone_model(
         pending = folder / (".pending-" + uuid.uuid4().hex)
         pending.mkdir(parents=True)
         try:
-            from offline_models import PREPROCESS_SCHEMA_VERSION, train_zone_model
             print(f"Training {backend} zone={zone_id}: {history_days * 24}->{horizon_days * 24} hours, "
                   f"{assessment['train_samples']} train/{assessment['validation_samples']} validation samples", flush=True)
-            report = train_zone_model(backend, frame, start, end, parameters, pending)
-            files = ["model.pt" if backend == "lstm" else "model.json", "preprocess.json", "training_history.csv"]
+            if backend in FOUNDATION_BACKENDS:
+                from foundation_models import train_foundation_model
+                report = train_foundation_model(backend, frame, start, end, parameters, pending)
+                preprocess_version = report.get("preprocess_schema_version", 1)
+                files = _checked_model_files(backend, report.get("artifact_files", _required_model_files(backend)))
+            else:
+                from offline_models import PREPROCESS_SCHEMA_VERSION, train_zone_model
+                report = train_zone_model(backend, frame, start, end, parameters, pending)
+                preprocess_version = PREPROCESS_SCHEMA_VERSION
+                files = _checked_model_files(backend, _required_model_files(backend))
             manifest = {
                 "schema_version": MODEL_CACHE_SCHEMA_VERSION, "implementation": TRAINING_IMPLEMENTATION_VERSION,
-                "preprocess_schema_version": PREPROCESS_SCHEMA_VERSION,
+                "preprocess_schema_version": preprocess_version,
                 "model_id": model_id, "training_fingerprint": signature,
                 "backend": backend, "zone_id": str(zone_id), "dataset": dataset_path_key(data_dir),
                 "dataset_fingerprint_at_training": dataset.dataset_fingerprint,
@@ -338,14 +378,18 @@ def _ensure_zone_model(
 
 def ensure_dataset_models(
     dataset: Any, backends: list[str], training_config: Any, *, zone_ids: list[str],
-    history_days: int = 30, horizon_days: int = 1, data_dir: Path | None = None,
+    history_days: int = 35, horizon_days: int = 1, data_dir: Path | None = None,
     cli_overrides: dict[str, Any] | None = None, force_train: bool = False,
+    backend_parameters: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Prepare only explicitly selected zones for the configured H-to-P windows."""
     data_dir = Path(data_dir) if data_dir is not None else Path(dataset.cache_dir).parent
     backends = list(dict.fromkeys(normalize_forecast_model_name(name) for name in backends))
     if any(name not in TRAINABLE_BACKENDS for name in backends):
-        raise ValueError("Offline training supports only lstm and xgboost")
+        raise ValueError("Offline training supports lstm, xgboost, timesfm and chronos")
+    backends = training_config.enabled_backends(backends, cli_overrides=cli_overrides)
+    if not backends:
+        return {}
     if not zone_ids or isinstance(zone_ids, (str, bytes)):
         raise ValueError("zone_ids must explicitly select at least one zone before training")
     zones = list(dict.fromkeys(str(zone) for zone in zone_ids))
@@ -360,7 +404,8 @@ def ensure_dataset_models(
         root = Path(dataset.cache_dir) / "weight" / backend
         references: dict[str, dict[str, Any]] = {}
         audit: dict[str, Any] = {}
-        workers = training_config.lstm_workers if backend == "lstm" else training_config.xgboost_workers
+        workers = (1 if backend in FOUNDATION_BACKENDS else
+                   training_config.lstm_workers if backend == "lstm" else training_config.xgboost_workers)
         # Concurrent LSTMs require separate RNG/CUDA contexts: manual_seed and
         # dropout use process-global state. Spawn is safe after CUDA initialization.
         isolated_lstm = backend == "lstm" and workers > 1
@@ -370,7 +415,8 @@ def ensure_dataset_models(
             jobs = {executor.submit(_ensure_zone_model,
                                     _zone_training_payload(dataset, zone) if isolated_lstm else dataset,
                                     data_dir, zone, backend,
-                                    training_config, cli_overrides, force_train, history_days, horizon_days): zone
+                                    training_config, cli_overrides, force_train, history_days, horizon_days,
+                                    backend_parameters): zone
                     for zone in zones}
             for job in as_completed(jobs):
                 zone = jobs[job]
@@ -413,12 +459,20 @@ def load_cached_predictor(reference: dict[str, Any]):
     validate_model_reference(reference)
     key = (str(Path(reference["model_dir"]).resolve()), reference["manifest_sha256"])
     with _PREDICTOR_LOCK:
-        if key in _PREDICTORS:
-            _PREDICTORS.move_to_end(key)
-            return _PREDICTORS[key]
-        from offline_models import load_zone_predictor
-        predictor = load_zone_predictor(reference["backend"], Path(reference["model_dir"]))
-        _PREDICTORS[key] = predictor
-        while len(_PREDICTORS) > 32:
-            _PREDICTORS.popitem(last=False)
+        foundation = reference["backend"] in FOUNDATION_BACKENDS
+        cache = _FOUNDATION_PREDICTORS if foundation else _PREDICTORS
+        limit = 2 if foundation else 32
+        if key in cache:
+            cache.move_to_end(key)
+            return cache[key]
+        # Evict before loading a large base model to bound peak retained models.
+        while len(cache) >= limit:
+            cache.popitem(last=False)
+        if foundation:
+            from foundation_models import load_foundation_predictor
+            predictor = load_foundation_predictor(reference["backend"], Path(reference["model_dir"]))
+        else:
+            from offline_models import load_zone_predictor
+            predictor = load_zone_predictor(reference["backend"], Path(reference["model_dir"]))
+        cache[key] = predictor
         return predictor

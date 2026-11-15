@@ -157,8 +157,8 @@ class RunConfig:
     precomputed_window_data: str | None = None
     max_poi_rows: int | None = None
     horizon_days: int = 1
-    history_days: int = 30
-    validation_days: int = 5
+    history_days: int = 35
+    validation_days: int = 7
     zone_ids: list[str] | None = None
     experiment_zone_count: int = 12
     experiment_zone_counts: dict[str, int] = field(default_factory=dict)
@@ -177,10 +177,10 @@ class RunConfig:
     xgboost_diurnal_blend_alphas: list[float] | None = None
     ar_diurnal_blend_alphas: list[float] | None = None
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch"
-    timesfm_context_hours: int = 168
+    timesfm_context_hours: int = 840
     timesfm_exog_cols: list[str] | None = None
     chronos_repo: str = "amazon/chronos-2"
-    chronos_context_hours: int = 512
+    chronos_context_hours: int = 840
     chronos_device: str = "auto"
     temperature: float = 0.2
 
@@ -197,8 +197,9 @@ class RunConfig:
     def from_mapping(cls, raw: dict[str, Any] | None) -> "RunConfig":
         settings = raw or {}
         reject_retired_forecast_settings(settings)
-        moved = [key for key in settings if key.startswith(("lstm_", "xgboost_"))
-                 and key not in ("lstm_diurnal_blend_alphas", "xgboost_diurnal_blend_alphas")]
+        moved = [key for key in settings if key in TRAINING_PARAMETER_NAMES or (
+            key.startswith(("lstm_", "xgboost_"))
+            and key not in ("lstm_diurnal_blend_alphas", "xgboost_diurnal_blend_alphas"))]
         if moved:
             raise ValueError("Training settings moved out of run; use training.defaults: " + ", ".join(moved))
         zone_ids = settings.get("zone_ids", settings.get("zones"))

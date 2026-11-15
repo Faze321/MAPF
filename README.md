@@ -500,7 +500,8 @@ unreported tokens. No native SDK or model request is loaded by offline evaluatio
 
 ## Offline training for each Zone
 
-Each selected Zone has its own LSTM and XGBoost. The pipeline checks training
+Each selected Zone has its own LSTM and XGBoost, and can have separate TimesFM
+and Chronos 2 LoRA adapters. The pipeline checks training
 eligibility before selecting Zones, then prepares weights only for that selection.
 Training uses each Zone's available historical series independently of forecast
 origins, alpha values, Agent modes, and experiment seeds. Explicit training runs use:
@@ -520,11 +521,11 @@ records the recovery reason. Agent-only replay remains bound to the saved versio
 and fails if that version is missing or damaged.
 
 `run.history_days` determines the input window H and `run.horizon_days` the
-direct output window P, both in hours. Defaults are 720 input hours and 24 output
+direct output window P, both in hours. Defaults are 840 input hours and 24 output
 hours. With stride 1, N consecutive hourly observations yield N-H-P+1 complete
 samples. Every input and output hour must exist; windows never cross gaps or pad
 missing loads. A Zone needs at least 45 days of valid history and 512 complete
-samples, so default windows require at least 1,255 consecutive hours. Duplicate
+samples, so default windows require at least 1,375 consecutive hours. Duplicate
 timestamps, insufficient samples, and constant load or price are rejected.
 
 Complete samples are ordered chronologically and split using `train_ratio: 0.8`
@@ -535,7 +536,9 @@ Reports retain requested ratios, actual counts,
 and purged counts. Preprocessing uses only the training prefix. Each model fits
 once, stops early if validation no longer improves, and saves its best weights
 or trees. It is not refitted on validation data. This internal split is separate
-from the forecast's five-day bias calibration.
+from the forecast's seven-day bias calibration. The supplied configuration
+uses a 90%/10% chronological training split; these ratios are unchanged by
+`run.validation_days`.
 
 Defaults are fixed: LSTM hidden size 32, one layer, batch size 64, learning rate
 0.001, and at most 100 epochs; XGBoost depth 3, learning rate 0.03, and at most
@@ -593,6 +596,77 @@ datasets can each use their configured workers. XGBoost uses two host threads
 per model by default. CLI overrides remain `--training-lstm-workers` and
 `--training-xgboost-workers`.
 
+### TimesFM and Chronos 2 LoRA
+
+Enable adaptation through `training.defaults`; base model IDs stay in
+`run.timesfm_repo` and `run.chronos_repo`. The supplied configuration enables
+both adapters. Configurations that omit the switches retain pretrained inference.
+Setting a switch to `false` selects the pretrained model again. Each dataset and
+Zone stores its own immutable adapter under its existing weight cache, without
+modifying the base model or another Zone's adapter. Changes to the configured
+base-model repository/path, LoRA parameters or training data select a different
+cache version. Each adapter records its Hub revision or local base-weight checksums
+so replay uses the same base weights.
+
+```yaml
+run:
+  history_days: 35
+  validation_days: 7
+  horizon_days: 1
+  forecast_models: [timesfm, chronos]
+  timesfm_context_hours: 840
+  chronos_context_hours: 840
+training:
+  defaults:
+    timesfm_lora_enabled: true
+    timesfm_lora_rank: 8
+    timesfm_lora_alpha: 16
+    timesfm_lora_dropout: 0.05
+    timesfm_lora_target_modules: [qkv_proj, out]
+    timesfm_learning_rate: 0.0001
+    timesfm_batch_size: 4
+    timesfm_gradient_accumulation_steps: 4
+    timesfm_epochs: 10
+    timesfm_early_stopping_patience: 3
+    timesfm_weight_decay: 0.01
+    timesfm_grad_clip: 1.0
+    chronos_lora_enabled: true
+    chronos_lora_rank: 8
+    chronos_lora_alpha: 16
+    chronos_lora_dropout: 0.05
+    chronos_lora_target_modules: [self_attention.q, self_attention.v, self_attention.k, self_attention.o, output_patch_embedding.output_layer]
+    chronos_learning_rate: 0.0001
+    chronos_batch_size: 4
+    chronos_gradient_accumulation_steps: 4
+    chronos_epochs: 10
+    chronos_early_stopping_patience: 3
+    chronos_weight_decay: 0.01
+    chronos_grad_clip: 1.0
+```
+
+Rank controls adapter size; `lora_alpha / lora_rank` scales its update.
+The initial effective batch size is 16 complete windows (4 per batch with 4
+gradient accumulation steps); the final incomplete group can be smaller.
+Training updates only adapter weights and restores the best validation checkpoint.
+LoRA uses automatic device selection, with no additional device setting.
+Seeds inherit `training.seed` unless `timesfm_seed` or `chronos_seed` overrides it.
+Hyperparameters can use the same dataset/Zone override hierarchy as LSTM/XGBoost.
+Enable switches belong only in global `training.defaults` or CLI, keeping one
+model's adapted/pretrained choice consistent across the selected Zones.
+
+Use `python main.py --stage train --forecast-models timesfm chronos` to prepare
+enabled adapters without Agent calls. Forecaster/Full prepare missing adapters;
+prediction and Agent reforecasting reuse frozen adapters. Training requires the
+project's PEFT dependency and the configured pretrained weights. Existing
+forecast calibration, diurnal blending and covariate handling still apply.
+
+Both adapters use their native PyTorch models through PEFT and the same complete
+window training loop. TimesFM learns the load sequence and retains its existing
+xreg covariates during prediction; Chronos trains with known future covariates,
+with loss applied only to load targets. TimesFM adapter training supports up to
+128 output hours; the configured one-day horizon uses 24. Missing PEFT raises an
+error rather than switching to full-weight training.
+
 Offline fitting and early-stopping validation can include dates later than a historical forecast origin.
 The forecast is still generated without reading future observations as inputs,
 but it is not a strict out-of-sample backtest when its labels influenced fitting or early stopping.
@@ -606,14 +680,14 @@ model versions; the overall Agent inventory explicitly spans all versions.
 
 ## Forecast windows and daily bias calibration
 
-All five backends use the same default forecast split: 30 days of history,
-5 days of validation, and 1 day of forecasting. The lengths remain configurable.
-For forecast origin `T`, the default history window is `[T-35d, T-5d)`,
-validation is `[T-5d, T)`, and the forecast is `[T, T+1d)`. LSTM/XGBoost input
-length equals `history_days`; TimesFM/Chronos retain their own context settings.
+All five backends use the same default forecast split: 35 days of history,
+7 days of validation, and 1 day of forecasting. The lengths remain configurable.
+For forecast origin `T`, the default history window is `[T-42d, T-7d)`,
+validation is `[T-7d, T)`, and the forecast is `[T, T+1d)`. LSTM/XGBoost input
+length equals `history_days`; TimesFM/Chronos contexts default to the same 840 hours.
 
 LSTM/XGBoost load the Zone's offline model without fitting at the forecast origin.
-AR estimates its price response from the history window. Validation evaluates five
+AR estimates its price response from the history window. Validation evaluates seven
 separate 24-hour predictions. LSTM/XGBoost predict the full configured output
 window each time and use its first 24 hours for calibration. At each validation origin, context consists
 of the most recent `history_days` of already observed load; observations from
@@ -624,7 +698,7 @@ For each validation day, model predictions are blended once with the history
 diurnal profile. Their signed errors (`blended prediction - actual`) are averaged
 across validation days at each of the 24 horizon offsets. The final prediction
 is `max(0, blended prediction - bias[offset % 24])`. Thus the default produces
-24 biases from all 120 validation hours, rather than one scalar bias or a bias
+24 biases from all 168 validation hours, rather than one scalar bias or a bias
 from only the first validation day. Saved calibration records include daily
 predictions, hourly residuals, and the averaged bias vector.
 
@@ -638,8 +712,8 @@ Configuration selects dates and models through plural keys, even for one run:
 
 ```yaml
 run:
-  history_days: 30
-  validation_days: 5
+  history_days: 35
+  validation_days: 7
   horizon_days: 1
   forecast_starts: null
   forecast_start_count: 2

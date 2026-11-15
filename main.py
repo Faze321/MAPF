@@ -21,7 +21,7 @@ from config import (
 from dataset_adapter import (DatasetSpec, default_forecast_start, evenly_spaced_forecast_starts,
                              load_canonical_dataset, resolve_dataset_spec)
 from training_config import (TRAINING_PARAMETER_NAMES, INTEGER_PARAMETERS, LIST_PARAMETERS,
-                             STRING_PARAMETERS)
+                             STRING_PARAMETERS, BOOL_PARAMETERS)
 from reporting import output_lock, scoped_output
 from orchestrator import (format_failure_message, run_dataset_batch, run_experiment_matrix,
                           run_pipeline, run_training_stage, normalize_experiment_name)
@@ -36,7 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="config.yaml", help="YAML config file for run and model settings.")
     for name in TRAINING_PARAMETER_NAMES:
         options = {"default": None, "help": "Override this offline training parameter for every selected dataset/site."}
-        if name in LIST_PARAMETERS:
+        if name in BOOL_PARAMETERS:
+            options["action"] = argparse.BooleanOptionalAction
+        elif name in LIST_PARAMETERS:
             options.update(nargs="*", type=int if name.endswith("_lags") else str)
         elif name in INTEGER_PARAMETERS:
             options["type"] = int
@@ -263,7 +265,8 @@ def main(argv: list[str] | None = None):
         selected_backends = normalize_forecast_model_list(args.forecast_models) or run_config.forecast_models or ["lstm", "xgboost"]
         outputs = run_training_stage(
             data_dir=resolved_data_dir, dataset_spec=dataset_spec,
-            backends=[backend for backend in selected_backends if backend in {"lstm", "xgboost"}],
+            backends=selected_backends,
+            backend_parameters={name: getattr(run_config, name) for name in BACKEND_PARAMETER_NAMES},
             training_config=training_config, training_cli_overrides=training_cli_overrides,
             zone_ids=args.zones if args.zones is not None else run_config.zone_ids,
             experiment_zone_count=(args.experiment_zone_count if args.experiment_zone_count is not None

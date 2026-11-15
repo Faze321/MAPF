@@ -9,7 +9,8 @@ from pathlib import Path
 from typing import Any
 
 
-TRAINING_BACKENDS = ("lstm", "xgboost")
+TRAINING_BACKENDS = ("lstm", "xgboost", "timesfm", "chronos")
+LORA_BACKENDS = ("timesfm", "chronos")
 TRAINING_EXOG_COLS = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
 TRAINING_PARAMETER_DEFAULTS = {
     "lstm_hidden_size": 32, "lstm_num_layers": 1,
@@ -27,6 +28,18 @@ TRAINING_PARAMETER_DEFAULTS = {
     "xgboost_device": "cuda", "xgboost_n_jobs": 2, "xgboost_max_bin": 256,
     "xgboost_seed": 42,
 }
+for _backend, _targets in (
+    ("timesfm", ["qkv_proj", "out"]),
+    ("chronos", ["self_attention.q", "self_attention.v", "self_attention.k",
+                 "self_attention.o", "output_patch_embedding.output_layer"]),
+):
+    TRAINING_PARAMETER_DEFAULTS.update({f"{_backend}_{key}": value for key, value in {
+        "lora_enabled": False, "lora_rank": 8, "lora_alpha": 16,
+        "lora_dropout": .05, "lora_target_modules": _targets,
+        "learning_rate": 1e-4, "batch_size": 4, "gradient_accumulation_steps": 4,
+        "epochs": 10, "early_stopping_patience": 3, "weight_decay": .01,
+        "grad_clip": 1.0, "seed": 42,
+    }.items()})
 TRAINING_PARAMETER_NAMES = tuple(TRAINING_PARAMETER_DEFAULTS)
 INTEGER_PARAMETERS = {
     "lstm_hidden_size", "lstm_num_layers", "lstm_batch_size",
@@ -34,7 +47,11 @@ INTEGER_PARAMETERS = {
     "xgboost_n_estimators", "xgboost_max_depth", "xgboost_early_stopping_rounds",
     "xgboost_n_jobs", "xgboost_max_bin", "xgboost_seed",
 }
-LIST_PARAMETERS = {"lstm_exog_cols", "xgboost_exog_cols"}
+INTEGER_PARAMETERS.update(f"{backend}_{name}" for backend in LORA_BACKENDS for name in (
+    "lora_rank", "batch_size", "gradient_accumulation_steps", "epochs", "early_stopping_patience", "seed"))
+BOOL_PARAMETERS = {f"{backend}_lora_enabled" for backend in LORA_BACKENDS}
+LIST_PARAMETERS = {"lstm_exog_cols", "xgboost_exog_cols",
+                   *(f"{backend}_lora_target_modules" for backend in LORA_BACKENDS)}
 STRING_PARAMETERS = {"lstm_device", "xgboost_device", "xgboost_tree_method"}
 
 
@@ -54,7 +71,10 @@ def validate_training_parameters(raw: Any, label: str) -> dict[str, Any]:
             raise ValueError(f"Unknown training parameter {name}")
         if value is None:
             raise ValueError(f"{name} cannot be null; omit it to inherit the default")
-        if key in INTEGER_PARAMETERS:
+        if key in BOOL_PARAMETERS:
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be a boolean")
+        elif key in INTEGER_PARAMETERS:
             minimum = 0 if key.endswith("_seed") else 1
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
@@ -67,6 +87,8 @@ def validate_training_parameters(raw: Any, label: str) -> dict[str, Any]:
                 raise ValueError(f"{name} must contain nonempty feature names")
             if len(set(value)) != len(value):
                 raise ValueError(f"{name} cannot contain duplicate values")
+            if key.endswith("_lora_target_modules") and not value:
+                raise ValueError(f"{name} must select at least one model module")
             if key.endswith("_exog_cols") and set(value) - {*TRAINING_EXOG_COLS, "hour", "occupancy"}:
                 raise ValueError(f"{name} may contain only known covariates, never actual load or evaluation fields")
         elif key in STRING_PARAMETERS:
@@ -83,11 +105,11 @@ def validate_training_parameters(raw: Any, label: str) -> dict[str, Any]:
         else:
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
                 raise ValueError(f"{name} must be a finite number")
-            if key in {"lstm_dropout", "lstm_head_dropout"}:
+            if key in {"lstm_dropout", "lstm_head_dropout"} or key.endswith("_lora_dropout"):
                 valid = 0 <= value < 1
             elif key in {"xgboost_subsample", "xgboost_colsample_bytree"}:
                 valid = 0 < value <= 1
-            elif key in {"lstm_weight_decay", "lstm_min_delta", "xgboost_min_child_weight", "xgboost_reg_lambda", "xgboost_reg_alpha"}:
+            elif key.endswith("_weight_decay") or key in {"lstm_min_delta", "xgboost_min_child_weight", "xgboost_reg_lambda", "xgboost_reg_alpha"}:
                 valid = value >= 0
             else:
                 valid = value > 0
@@ -116,8 +138,12 @@ def _path_overrides(raw: Any, label: str, *, zones: bool = False) -> dict[str, A
                 if not isinstance(zone_id, str) or not zone_id.strip():
                     raise ValueError(f"{label}[{folder}] requires string zone IDs; quote numeric IDs in YAML")
                 result[path][zone_id] = validate_training_parameters(parameters, f"{label}[{folder}][{zone_id}]")
+                if BOOL_PARAMETERS.intersection(result[path][zone_id]):
+                    raise ValueError("LoRA enable switches belong in training.defaults or CLI, not zone overrides")
         else:
             result[path] = validate_training_parameters(values, f"{label}[{folder}]")
+            if BOOL_PARAMETERS.intersection(result[path]):
+                raise ValueError("LoRA enable switches belong in training.defaults or CLI, not dataset overrides")
     return result
 
 
@@ -162,13 +188,32 @@ class TrainingConfig:
             raise ValueError("Unknown training setting(s): " + ", ".join(sorted(unknown)))
         return cls(**raw)
 
+    def backend_enabled(self, backend: str, *, data_dir: str | Path | None = None,
+                        zone_id: str | None = None,
+                        cli_overrides: dict[str, Any] | None = None) -> bool:
+        """Whether a backend needs offline weights; enable switches are global."""
+        backend = backend.lower()
+        if backend not in TRAINING_BACKENDS:
+            return False
+        if backend not in LORA_BACKENDS:
+            return True
+        key = f"{backend}_lora_enabled"
+        cli = validate_training_parameters(cli_overrides, "CLI training override")
+        if key in cli:
+            return cli[key]
+        return self.defaults.get(key, TRAINING_PARAMETER_DEFAULTS[key])
+
+    def enabled_backends(self, backends, **selection) -> list[str]:
+        return list(dict.fromkeys(backend.lower() for backend in backends
+                                 if self.backend_enabled(backend, **selection)))
+
     def resolve(self, data_dir: str | Path, zone_id: str, backend: str,
                 cli_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         backend = backend.lower()
         if backend not in TRAINING_BACKENDS:
-            raise ValueError("Offline training supports lstm and xgboost only")
+            raise ValueError("Offline training supports lstm, xgboost, timesfm and chronos only")
         values = deepcopy(TRAINING_PARAMETER_DEFAULTS)
-        values.update(lstm_seed=self.seed, xgboost_seed=self.seed)
+        values.update({f"{name}_seed": self.seed for name in TRAINING_BACKENDS})
         dataset_key = training_path_key(data_dir)
         for override in (self.defaults, self.dataset_overrides.get(dataset_key, {}),
                          self.zone_overrides.get(dataset_key, {}).get(str(zone_id), {}),

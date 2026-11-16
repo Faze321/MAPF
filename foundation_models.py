@@ -18,9 +18,10 @@ import numpy as np
 import pandas as pd
 
 from offline_models import _checked_frame, _raw_covariates, complete_target_indices, DEFAULT_EXOG_COLS, KNOWN_EXOG_COLS
+from training_config import LORA_BACKENDS, base_backend
 
 
-FOUNDATION_PREPROCESS_SCHEMA_VERSION = 1
+FOUNDATION_PREPROCESS_SCHEMA_VERSION = 2
 _TARGETS = {
     "timesfm": ["qkv_proj", "out"],
     "chronos": ["self_attention.q", "self_attention.v", "self_attention.k", "self_attention.o",
@@ -31,9 +32,8 @@ _REPOS = {"timesfm": "google/timesfm-2.5-200m-pytorch", "chronos": "amazon/chron
 
 def _parameters(backend: str, supplied: dict[str, Any]) -> dict[str, Any]:
     from training_config import TRAINING_PARAMETER_DEFAULTS, validate_training_parameters
-    if backend not in _TARGETS:
-        raise ValueError(f"Unsupported foundation backend: {backend}")
-    p = {name: value for name, value in TRAINING_PARAMETER_DEFAULTS.items() if name.startswith(backend + "_")}
+    family = _adapter_family(backend)
+    p = {name: value for name, value in TRAINING_PARAMETER_DEFAULTS.items() if name.startswith(family + "_")}
     p.update({name: value for name, value in supplied.items() if name in p})
     validate_training_parameters(p, f"{backend} LoRA")
     for name in ("input_hours", "output_hours", "sample_stride_hours"):
@@ -41,17 +41,23 @@ def _parameters(backend: str, supplied: dict[str, Any]) -> dict[str, Any]:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ValueError(f"{name} must be a positive integer")
         p[name] = value
-    p[f"{backend}_repo"] = str(supplied.get(f"{backend}_repo", _REPOS[backend]))
-    exog = supplied.get(f"{backend}_exog_cols")
+    p[f"{family}_repo"] = str(supplied.get(f"{family}_repo", _REPOS[family]))
+    exog = supplied.get(f"{family}_exog_cols")
     exog = list(DEFAULT_EXOG_COLS if exog is None else exog)
     if len(set(exog)) != len(exog) or set(exog) - KNOWN_EXOG_COLS:
         raise ValueError("LoRA exog_cols must contain unique known covariates, never actual load")
-    p[f"{backend}_exog_cols"] = exog
+    p[f"{family}_exog_cols"] = exog
     # Native TimesFM emits 128 values per decoding patch. Longer horizons need
     # a separate autoregressive training objective, not truncated target labels.
-    if backend == "timesfm" and p["output_hours"] > 128:
+    if family == "timesfm" and p["output_hours"] > 128:
         raise ValueError("TimesFM LoRA currently supports output_hours <= 128")
     return p
+
+
+def _adapter_family(backend: str) -> str:
+    if backend not in LORA_BACKENDS:
+        raise ValueError(f"Unsupported LoRA backend: {backend}; use timesfm_lora or chronos_lora")
+    return base_backend(backend)
 
 
 def _split_targets(frame, input_hours, output_hours, stride, start, end):
@@ -206,6 +212,7 @@ def train_foundation_model(backend: str, frame: pd.DataFrame, validation_start: 
                            validation_end: pd.Timestamp, parameters: dict[str, Any], model_dir: Path) -> dict[str, Any]:
     """Train frozen-base LoRA once and save the best chronological validation adapter."""
     backend = backend.lower()
+    family = _adapter_family(backend)
     p = _parameters(backend, parameters)
     frame = _checked_frame(frame, actuals=True)
     start, end = pd.Timestamp(validation_start), pd.Timestamp(validation_end)
@@ -213,30 +220,30 @@ def train_foundation_model(backend: str, frame: pd.DataFrame, validation_start: 
         raise ValueError("validation_end must be after validation_start")
     train, valid, purged = _split_targets(frame, p["input_hours"], p["output_hours"], p["sample_stride_hours"], start, end)
     torch, LoraConfig, _, get_peft_model = _dependencies()
-    seed = p[f"{backend}_seed"]
+    seed = p[f"{family}_seed"]
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    wrapper, provenance = _load_base(backend, p[f"{backend}_repo"])
-    base, _ = _peft_ready_model(wrapper, backend)
-    if backend == "timesfm" and math.ceil(p["input_hours"] / base.p) * base.p + base.o > 16384:
+    wrapper, provenance = _load_base(family, p[f"{family}_repo"])
+    base, _ = _peft_ready_model(wrapper, family)
+    if family == "timesfm" and math.ceil(p["input_hours"] / base.p) * base.p + base.o > 16384:
         raise ValueError("TimesFM LoRA context plus output exceeds its context limit")
-    if backend == "chronos":
+    if family == "chronos":
         if p["input_hours"] > base.chronos_config.context_length:
             raise ValueError("Chronos LoRA input_hours exceeds this base model's context_length; history cannot be truncated")
         if p["output_hours"] > base.chronos_config.max_output_patches * base.chronos_config.output_patch_size:
             raise ValueError("Chronos LoRA output_hours exceeds this base model's direct prediction limit")
-    model = get_peft_model(base, LoraConfig(r=p[f"{backend}_lora_rank"], lora_alpha=p[f"{backend}_lora_alpha"],
-        lora_dropout=p[f"{backend}_lora_dropout"], target_modules=p[f"{backend}_lora_target_modules"], bias="none"))
+    model = get_peft_model(base, LoraConfig(r=p[f"{family}_lora_rank"], lora_alpha=p[f"{family}_lora_alpha"],
+        lora_dropout=p[f"{family}_lora_dropout"], target_modules=p[f"{family}_lora_target_modules"], bias="none"))
     model.peft_config["default"].base_model_name_or_path = provenance["repo"]
     model.peft_config["default"].revision = provenance["revision"]
     trained, total = model.get_nb_trainable_parameters()
     if not 0 < trained < total:
         raise ValueError("LoRA must train a nonempty subset of the base model parameters")
     development = frame[frame["time"] < start]
-    requested = p[f"{backend}_exog_cols"]
+    requested = p[f"{family}_exog_cols"]
     raw = _raw_covariates(development, requested)
     chosen = [i for i in range(len(requested)) if np.isfinite(raw[:, i]).any()]
     state = dict(schema_version=FOUNDATION_PREPROCESS_SCHEMA_VERSION, backend=backend, parameters=p,
@@ -248,8 +255,8 @@ def train_foundation_model(backend: str, frame: pd.DataFrame, validation_start: 
     covariates = _covariates(frame, state)
     device = next(model.parameters()).device
     optimizer = torch.optim.AdamW([value for value in model.parameters() if value.requires_grad],
-                                  lr=p[f"{backend}_learning_rate"], weight_decay=p[f"{backend}_weight_decay"])
-    batch_size, accumulation = p[f"{backend}_batch_size"], p[f"{backend}_gradient_accumulation_steps"]
+                                  lr=p[f"{family}_learning_rate"], weight_decay=p[f"{family}_weight_decay"])
+    batch_size, accumulation = p[f"{family}_batch_size"], p[f"{family}_gradient_accumulation_steps"]
     best, best_epoch, stale, history = math.inf, 0, 0, []
     model_dir = Path(model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -261,7 +268,7 @@ def train_foundation_model(backend: str, frame: pd.DataFrame, validation_start: 
                   [covariates[i - h:i] for i in indices], [covariates[i:i + out] for i in indices])
         return [torch.as_tensor(np.stack(values), device=device, dtype=torch.float32) for values in arrays]
 
-    for epoch in range(1, p[f"{backend}_epochs"] + 1):
+    for epoch in range(1, p[f"{family}_epochs"] + 1):
         model.train()
         order = rng.permutation(train)
         train_sum = 0.0
@@ -273,19 +280,19 @@ def train_foundation_model(backend: str, frame: pd.DataFrame, validation_start: 
             group_count = sum(len(indices) for indices in group)
             optimizer.zero_grad(set_to_none=True)
             for indices in group:
-                loss = _batch_loss(backend, model, *tensors(indices))
+                loss = _batch_loss(family, model, *tensors(indices))
                 if not torch.isfinite(loss):
                     raise RuntimeError("LoRA training produced a nonfinite loss")
                 (loss * (len(indices) / group_count)).backward()
                 train_sum += float(loss.detach().cpu()) * len(indices)
-            torch.nn.utils.clip_grad_norm_([v for v in model.parameters() if v.requires_grad], p[f"{backend}_grad_clip"])
+            torch.nn.utils.clip_grad_norm_([v for v in model.parameters() if v.requires_grad], p[f"{family}_grad_clip"])
             optimizer.step()
         model.eval()
         valid_sum = 0.0
         with torch.no_grad():
             for offset in range(0, len(valid), batch_size):
                 indices = valid[offset:offset + batch_size]
-                loss = _batch_loss(backend, model, *tensors(indices))
+                loss = _batch_loss(family, model, *tensors(indices))
                 if not torch.isfinite(loss):
                     raise RuntimeError("LoRA validation produced a nonfinite loss")
                 valid_sum += float(loss.cpu()) * len(indices)
@@ -296,7 +303,7 @@ def train_foundation_model(backend: str, frame: pd.DataFrame, validation_start: 
             model.save_pretrained(model_dir, safe_serialization=True)
         else:
             stale += 1
-        if stale >= p[f"{backend}_early_stopping_patience"]:
+        if stale >= p[f"{family}_early_stopping_patience"]:
             break
     state["best_epoch"] = best_epoch
     (model_dir / "preprocess.json").write_text(json.dumps(state, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
@@ -313,22 +320,24 @@ def train_foundation_model(backend: str, frame: pd.DataFrame, validation_start: 
                 training_label_start=frame.iloc[train[0]]["time"].isoformat(),
                 training_label_end_exclusive=(frame.iloc[train[-1] + p["output_hours"] - 1]["time"] + pd.Timedelta(hours=1)).isoformat(),
                 validation_start=start.isoformat(), validation_end_exclusive=end.isoformat(),
-                covariate_policy="native_xreg_at_inference" if backend == "timesfm" else "known_future_covariates",
+                covariate_policy="native_xreg_at_inference" if family == "timesfm" else "known_future_covariates",
                 history=history)
 
 
 def load_foundation_predictor(backend: str, model_dir: Path):
     """Load an immutable adapter; no fitting and no shared zero-shot mutation."""
-    from forecasting import run_timesfm_prediction, run_chronos_prediction
     backend, model_dir = backend.lower(), Path(model_dir)
+    family = _adapter_family(backend)
     state = json.loads((model_dir / "preprocess.json").read_text(encoding="utf-8"))
-    if state.get("schema_version") != FOUNDATION_PREPROCESS_SCHEMA_VERSION or state.get("backend") != backend:
+    if (state.get("schema_version") != FOUNDATION_PREPROCESS_SCHEMA_VERSION
+            or state.get("backend") != backend or state.get("adapter_type") != "lora"):
         raise ValueError("Foundation adapter preprocessing schema/backend mismatch")
+    from forecasting import run_timesfm_prediction, run_chronos_prediction
     _, _, PeftModel, _ = _dependencies()
-    wrapper, _ = _load_base(backend, state["base_model"]["repo"], state["base_model"])
-    base, original_config = _peft_ready_model(wrapper, backend)
+    wrapper, _ = _load_base(family, state["base_model"]["repo"], state["base_model"])
+    base, original_config = _peft_ready_model(wrapper, family)
     wrapper.model = PeftModel.from_pretrained(base, str(model_dir), is_trainable=False).merge_and_unload()
-    if backend == "timesfm":
+    if family == "timesfm":
         from timesfm import ForecastConfig
         wrapper.model.config = original_config
         wrapper.compile(ForecastConfig(max_context=state["input_hours"], max_horizon=max(32, state["output_hours"]),
@@ -347,7 +356,7 @@ def load_foundation_predictor(backend: str, model_dir: Path):
         values = context["actual_kwh"].to_numpy(dtype=np.float32)
         past_cov, future_cov = _covariates(context, state), _covariates(future, state)
         cols = state["exog_cols"]
-        if backend == "timesfm":
+        if family == "timesfm":
             raw, q10, q90 = run_timesfm_prediction(wrapper, values, past_cov if cols else None,
                                                   future_cov if cols else None, out, h, cols)
         else:

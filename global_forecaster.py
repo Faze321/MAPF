@@ -9,11 +9,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from training_config import FORECAST_BACKENDS, TRAINABLE_BACKENDS
 
 
 SCHEMA_VERSION = 1
-NATIVE_ARTIFACT_SCHEMA_VERSION = 5
-SUPPORTED_BACKENDS = {"timesfm", "chronos", "chronos_2", "lstm", "xgboost", "ar", "AR"}
+NATIVE_ARTIFACT_SCHEMA_VERSION = 6
+SUPPORTED_BACKENDS = {*FORECAST_BACKENDS, "chronos_2", "ar"}
 CORE_COLUMNS = {"timestamp", "time", "zone", "zone_id", "load", "actual_kwh", "energy_price", "e_price"}
 
 
@@ -231,7 +232,13 @@ class NativeForecasterArtifact:
     fitted_state: dict[str, Any]
 
     def __post_init__(self) -> None:
-        if self.backend in {"lstm", "xgboost"} or self.fitted_state.get("model_reference") is not None:
+        if self.backend not in FORECAST_BACKENDS:
+            raise ValueError(f"Unsupported native forecaster backend: {self.backend}")
+        if self.fitted_state.get("backend") not in {None, self.backend}:
+            raise ValueError("Native artifact fitted backend does not match its forecaster identity")
+        if self.backend not in TRAINABLE_BACKENDS and self.fitted_state.get("model_reference") is not None:
+            raise ValueError("Pretrained forecaster artifacts cannot contain a LoRA/offline model reference")
+        if self.backend in TRAINABLE_BACKENDS:
             from zone_training import validate_model_reference
 
             reference = self.fitted_state.get("model_reference")

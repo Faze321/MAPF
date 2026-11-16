@@ -44,7 +44,8 @@ agent:
 
 data:
   adapter: "auto" # detects the format from files in run.data_dir
-  cache_dir: null # defaults to <run.data_dir>/cache
+  cache_dir: null # exact dataset cache override; default <project>/cache/<path relative to project data/>
+  # Examples: cache/UrbanEV, cache/MP-EVData, cache/CHARGED/JHB; external sources use cache/_external/<name>_<path-hash>.
   timeseries_file: null # required for long_format
   column_mapping: {} # semantic field -> source column
   static_file: null
@@ -74,7 +75,9 @@ run:
   validation_days: 7 # seven-day prediction bias calibration; separate from offline training validation
   forecast_models:
     - "timesfm"
+    - "timesfm_lora"
     - "chronos"
+    - "chronos_lora"
     - "lstm"
     - "xgboost"
     - "AR"
@@ -93,7 +96,9 @@ run:
   # A non-null model-specific list overrides the global list above.
   # Null inherits; if the global list is also null, the effective list is [0.0].
   timesfm_diurnal_blend_alphas: null # example: [0.0, 0.5]
+  timesfm_lora_diurnal_blend_alphas: null
   chronos_diurnal_blend_alphas: null
+  chronos_lora_diurnal_blend_alphas: null
   lstm_diurnal_blend_alphas: null
   xgboost_diurnal_blend_alphas: null
   ar_diurnal_blend_alphas: null
@@ -103,7 +108,7 @@ run:
     # - "multi_agent_discussion_3rounds"
     # - "single_agent_price_retry"
     # - "single_agent_full_retry"
-# TimesFM
+# TimesFM family: repository/covariates are shared; context_hours is for the base model only.
   timesfm_repo: "google/timesfm-2.5-200m-pytorch"
   timesfm_context_hours: 840
   timesfm_exog_cols:
@@ -115,7 +120,7 @@ run:
     - "is_weekend"
     - "temp_price_idx"
 
-# Chronos
+# Chronos family: repository is shared; LoRA input length always follows history_days.
   chronos_repo: "amazon/chronos-2"
   chronos_context_hours: 840
 
@@ -155,8 +160,8 @@ training:
     xgboost_early_stopping_rounds: 50
     xgboost_n_jobs: 2 # host threads per XGBoost model
     # LoRA uses automatic device selection and an independent adapter per dataset/Zone.
-    # Enable switches belong here or in CLI; other parameters support dataset/Zone overrides.
-    timesfm_lora_enabled: true # false restores pretrained TimesFM inference without an adapter
+    # Selecting timesfm_lora or chronos_lora in forecast_models enables its adapter training.
+    # Original timesfm/chronos always use pretrained weights, without an adapter.
     timesfm_lora_rank: 8
     timesfm_lora_alpha: 16
     timesfm_lora_dropout: 0.05
@@ -168,7 +173,6 @@ training:
     timesfm_early_stopping_patience: 3
     timesfm_weight_decay: 0.01
     timesfm_grad_clip: 1.0
-    chronos_lora_enabled: true # false restores pretrained Chronos 2 inference without an adapter
     chronos_lora_rank: 8
     chronos_lora_alpha: 16
     chronos_lora_dropout: 0.05

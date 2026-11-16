@@ -25,6 +25,24 @@ CANONICAL_TIME_COLUMN = "timestamp"
 CANONICAL_ZONE_COLUMN = "zone_id"
 CANONICAL_LOAD_COLUMN = "load_kwh"
 CANONICAL_ENERGY_PRICE_COLUMN = "energy_price"
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def default_dataset_cache_dir(data_path: Path) -> Path:
+    """Keep dataset caches under this checkout, independently of the process cwd."""
+    resolved = Path(data_path).resolve()
+    cache_root = PROJECT_ROOT / "cache"
+    try:
+        relative = resolved.relative_to((PROJECT_ROOT / "data").resolve())
+    except ValueError:
+        relative = None
+    if relative is not None and relative.parts:
+        return cache_root / relative
+    # External datasets with identical folder names must never share weights or
+    # preprocessing. Resolve aliases before hashing their source directory.
+    label = re.sub(r"[^a-zA-Z0-9_-]+", "_", resolved.name).strip("_.")[:64] or "dataset"
+    digest = hashlib.sha256(os.path.normcase(str(resolved)).encode("utf-8")).hexdigest()[:12]
+    return cache_root / "_external" / f"{label}_{digest}"
 
 
 @dataclass(frozen=True)
@@ -43,7 +61,7 @@ class DatasetSpec:
 
     @property
     def resolved_cache_dir(self) -> Path:
-        return Path(self.cache_dir) if self.cache_dir is not None else Path(self.path) / "cache"
+        return Path(self.cache_dir) if self.cache_dir is not None else default_dataset_cache_dir(self.path)
 
 
 @dataclass(frozen=True)
@@ -102,6 +120,7 @@ class CanonicalDataset:
     dataset_fingerprint: str
     cache_dir: Path
     cache_keys: dict[str, str]
+    source_path: Path | None = None
 
     def select_zones(self, zone_ids: Iterable[str]) -> "CanonicalDataset":
         requested = {str(zone_id) for zone_id in zone_ids}
@@ -119,6 +138,7 @@ class CanonicalDataset:
             dataset_fingerprint=self.dataset_fingerprint,
             cache_dir=self.cache_dir,
             cache_keys=dict(self.cache_keys),
+            source_path=self.source_path,
         )
 
     def wide_frame(self, value_column: str, zone_ids: Iterable[str]) -> pd.DataFrame:
@@ -217,7 +237,7 @@ class DatasetAdapter(ABC):
                         artifacts=artifacts,
                     ),
                 )
-                return cached
+                return replace(cached, source_path=data_dir.resolve())
 
         timeseries, static, feature_manifest = self.build(spec)
         for semantic, factor in spec.unit_conversions.items():
@@ -280,6 +300,7 @@ class DatasetAdapter(ABC):
             dataset_fingerprint=fingerprint,
             cache_dir=cache_root,
             cache_keys={"dataset": fingerprint},
+            source_path=data_dir.resolve(),
         )
 
 

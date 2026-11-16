@@ -23,13 +23,13 @@ import pandas as pd
 
 from config import dataset_path_key, normalize_forecast_model_name
 from dataset_adapter import atomic_write_json, process_file_lock
+from training_config import LORA_BACKENDS, TRAINABLE_BACKENDS, base_backend
 from request_limits import _try_file_lock, _release_file_lock
 
 
 MODEL_CACHE_SCHEMA_VERSION = 2
 TRAINING_IMPLEMENTATION_VERSION = "selected_zone_direct_windows_v2"
-TRAINABLE_BACKENDS = frozenset({"lstm", "xgboost", "timesfm", "chronos"})
-FOUNDATION_BACKENDS = frozenset({"timesfm", "chronos"})
+FOUNDATION_BACKENDS = frozenset(LORA_BACKENDS)
 FOUNDATION_REPOS = {"timesfm": "google/timesfm-2.5-200m-pytorch", "chronos": "amazon/chronos-2"}
 DEFAULT_EXOG = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
 _PREDICTORS: OrderedDict[tuple[str, str], Any] = OrderedDict()
@@ -171,7 +171,7 @@ def training_fingerprint(
     frame: pd.DataFrame, *, data_dir: Path, zone_id: str, backend: str,
     parameters: dict[str, Any], validation_start: pd.Timestamp, validation_end: pd.Timestamp,
 ) -> str:
-    exog = parameters.get(f"{backend}_exog_cols")
+    exog = parameters.get(f"{base_backend(backend)}_exog_cols")
     columns = list(dict.fromkeys(["actual_kwh", "e_price", *(DEFAULT_EXOG if exog is None else exog)]))
     features = frame.reindex(columns=columns).apply(pd.to_numeric, errors="coerce").astype("float64")
     features = features.replace([np.inf, -np.inf], np.nan)
@@ -223,6 +223,8 @@ def _checked_model_files(backend: str, files: Any) -> list[str]:
 def validate_model_reference(reference: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(reference, dict) or reference.get("schema_version") != MODEL_CACHE_SCHEMA_VERSION:
         raise ValueError("Unsupported or missing offline model reference; run the train stage")
+    if reference.get("backend") not in TRAINABLE_BACKENDS:
+        raise ValueError("Offline model references require lstm, xgboost, timesfm_lora or chronos_lora")
     directory = Path(reference["model_dir"])
     manifest_path = directory / "manifest.json"
     if not manifest_path.is_file():
@@ -281,15 +283,16 @@ def _ensure_zone_model(
                           sample_stride_hours=training_config.sample_stride_hours,
                           train_ratio=training_config.train_ratio, validation_ratio=training_config.validation_ratio)
         if backend in FOUNDATION_BACKENDS:
+            family = base_backend(backend)
             supplied = backend_parameters or {}
-            parameters[f"{backend}_repo"] = supplied.get(f"{backend}_repo") or FOUNDATION_REPOS[backend]
+            parameters[f"{family}_repo"] = supplied.get(f"{family}_repo") or FOUNDATION_REPOS[family]
             # A fixed H-to-P adapter must retain the entire configured history.
-            parameters[f"{backend}_context_hours"] = history_days * 24
-            if supplied.get(f"{backend}_exog_cols") is not None:
-                parameters[f"{backend}_exog_cols"] = list(supplied[f"{backend}_exog_cols"])
+            parameters[f"{family}_context_hours"] = history_days * 24
+            if supplied.get(f"{family}_exog_cols") is not None:
+                parameters[f"{family}_exog_cols"] = list(supplied[f"{family}_exog_cols"])
             else:
-                parameters.setdefault(f"{backend}_exog_cols", list(DEFAULT_EXOG))
-            parameters["adapter_implementation"] = "native_lora_v1"
+                parameters.setdefault(f"{family}_exog_cols", list(DEFAULT_EXOG))
+            parameters["adapter_implementation"] = "native_lora_v2"
         frame = assessment["frame"]
         start, end = assessment["validation_start"], assessment["validation_end"]
         signature = training_fingerprint(frame, data_dir=data_dir, zone_id=zone_id, backend=backend,
@@ -338,9 +341,9 @@ def _ensure_zone_model(
             print(f"Training {backend} zone={zone_id}: {history_days * 24}->{horizon_days * 24} hours, "
                   f"{assessment['train_samples']} train/{assessment['validation_samples']} validation samples", flush=True)
             if backend in FOUNDATION_BACKENDS:
-                from foundation_models import train_foundation_model
+                from foundation_models import FOUNDATION_PREPROCESS_SCHEMA_VERSION, train_foundation_model
                 report = train_foundation_model(backend, frame, start, end, parameters, pending)
-                preprocess_version = report.get("preprocess_schema_version", 1)
+                preprocess_version = report.get("preprocess_schema_version", FOUNDATION_PREPROCESS_SCHEMA_VERSION)
                 files = _checked_model_files(backend, report.get("artifact_files", _required_model_files(backend)))
             else:
                 from offline_models import PREPROCESS_SCHEMA_VERSION, train_zone_model
@@ -383,10 +386,12 @@ def ensure_dataset_models(
     backend_parameters: dict[str, Any] | None = None,
 ) -> dict[str, dict[str, dict[str, Any]]]:
     """Prepare only explicitly selected zones for the configured H-to-P windows."""
-    data_dir = Path(data_dir) if data_dir is not None else Path(dataset.cache_dir).parent
+    data_dir = Path(data_dir) if data_dir is not None else Path(
+        getattr(dataset, "source_path", None) or Path(dataset.cache_dir).parent
+    )
     backends = list(dict.fromkeys(normalize_forecast_model_name(name) for name in backends))
     if any(name not in TRAINABLE_BACKENDS for name in backends):
-        raise ValueError("Offline training supports lstm, xgboost, timesfm and chronos")
+        raise ValueError("Offline training supports lstm, xgboost, timesfm_lora and chronos_lora")
     backends = training_config.enabled_backends(backends, cli_overrides=cli_overrides)
     if not backends:
         return {}

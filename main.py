@@ -21,7 +21,7 @@ from config import (
 from dataset_adapter import (DatasetSpec, default_forecast_start, evenly_spaced_forecast_starts,
                              load_canonical_dataset, resolve_dataset_spec)
 from training_config import (TRAINING_PARAMETER_NAMES, INTEGER_PARAMETERS, LIST_PARAMETERS,
-                             STRING_PARAMETERS, BOOL_PARAMETERS)
+                             STRING_PARAMETERS)
 from reporting import output_lock, scoped_output
 from orchestrator import (format_failure_message, run_dataset_batch, run_experiment_matrix,
                           run_pipeline, run_training_stage, normalize_experiment_name)
@@ -36,9 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", default="config.yaml", help="YAML config file for run and model settings.")
     for name in TRAINING_PARAMETER_NAMES:
         options = {"default": None, "help": "Override this offline training parameter for every selected dataset/site."}
-        if name in BOOL_PARAMETERS:
-            options["action"] = argparse.BooleanOptionalAction
-        elif name in LIST_PARAMETERS:
+        if name in LIST_PARAMETERS:
             options.update(nargs="*", type=int if name.endswith("_lags") else str)
         elif name in INTEGER_PARAMETERS:
             options["type"] = int
@@ -60,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cache-dir",
         default=None,
-        help="Dataset feature cache directory. Defaults to <data-dir>/cache.",
+        help=("Exact cache directory for this dataset. Defaults to <project>/cache/<path relative to project data/>; "
+              "external datasets use cache/_external/<name>_<path-hash>."),
     )
     parser.add_argument(
         "--timeseries-file",
@@ -153,7 +152,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--forecast-models",
         nargs="+",
         default=None,
-        help="Forecast model(s) for an experiment matrix: timesfm, chronos, lstm, xgboost, or AR.",
+        help="Forecast model(s): timesfm, timesfm_lora, chronos, chronos_lora, lstm, xgboost, or AR.",
     )
     parser.add_argument(
         "--experiment-zone-count",
@@ -263,6 +262,11 @@ def main(argv: list[str] | None = None):
     ))
     if pipeline_stage == "train":
         selected_backends = normalize_forecast_model_list(args.forecast_models) or run_config.forecast_models or ["lstm", "xgboost"]
+        selected_backends = training_config.enabled_backends(
+            selected_backends, data_dir=resolved_data_dir, cli_overrides=training_cli_overrides,
+        )
+        if not selected_backends:
+            raise ValueError("The train stage requires lstm, xgboost, timesfm_lora or chronos_lora in forecast_models")
         outputs = run_training_stage(
             data_dir=resolved_data_dir, dataset_spec=dataset_spec,
             backends=selected_backends,

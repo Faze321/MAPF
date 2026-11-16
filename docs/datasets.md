@@ -36,8 +36,8 @@ run:
   data_dir: data/MP-EVData
   forecast_starts: null
   forecast_models: [timesfm]
-  history_days: 30
-  validation_days: 5
+  history_days: 35
+  validation_days: 7
   horizon_days: 1
   zones: null
 ```
@@ -58,12 +58,15 @@ run:
 
 `forecast_starts` 留空且 `forecast_start_count: 1`（默认）时，
 使用当前数据最后 `horizon_days` 天作为预测窗口。默认预测起点为 `T` 时，
-预测历史取 `[T-35天, T-5天)` 的 720 小时，Bias 验证取 `[T-5天, T)` 的 120 小时，
+预测历史取 `[T-42天, T-7天)` 的 840 小时，Bias 验证取 `[T-7天, T)` 的 168 小时，
 正式预测 `[T, T+1天)` 的 24 小时。三个天数可以独立配置。
-每天验证只读取当天起点之前的真实历史，五日同一预测偏移小时的残差均值形成
-24 个 bias；调价重预测复用已保存模型及 bias。LSTM/XGBoost 权重来自独立离线训练，
+每天验证只读取当天起点之前的真实历史，七日同一预测偏移小时的残差均值形成
+24 个 bias；调价重预测复用已保存模型及 bias。LSTM/XGBoost 及两种 LoRA 权重来自独立离线训练，
 `history_days` 同时决定离线训练样本和预测的输入长度，`horizon_days` 决定直接输出长度。
-默认每个样本输入 720 小时、输出 24 小时；预测历史还用于固定日内均值曲线。
+默认每个样本输入 840 小时、输出 24 小时；预测历史还用于固定日内均值曲线。
+每个验证日，LSTM、XGBoost、`timesfm_lora`、`chronos_lora` 先直接预测完整
+`horizon_days * 24` 小时，再取前 24 小时校准；原版 TimesFM、Chronos 和 AR
+每个验证日预测 24 小时。
 `zones: null` 从当前数据自动选站。
 显式填写日期或站点时会按你的配置执行，因此跨数据集切换时需使用该数据集的日期和编号。
 预测模型、Agent 模式等实验参数使用 `run`；LSTM/XGBoost 的训练参数使用独立
@@ -76,6 +79,21 @@ XGBoost 继续使用 `tree_method: hist`。设备设置参与训练指纹，修�
 CLI 对应 `--forecast-starts`、`--forecast-models`，单次实验也使用单元素列表。
 旧的单数日期、模型和 alpha 配置会明确报错。Python 单次调用与输出字段使用
 `forecast_origin` 和 `backend`。
+
+支持 `timesfm`、`timesfm_lora`、`chronos`、`chronos_lora`、`lstm`、`xgboost` 和 `AR`。
+原版 `timesfm`、`chronos` 始终直接使用预训练权重，不训练或加载 LoRA；选择对应
+`*_lora` 模型即启用各站点适配器训练。可用
+`forecast_models: [timesfm, timesfm_lora, chronos, chronos_lora]` 在同一矩阵中比较。
+两种 LoRA 分别使用 `timesfm_lora_diurnal_blend_alphas` 和
+`chronos_lora_diurnal_blend_alphas`；非空值独立覆盖全局 alpha，`null` 继承全局，
+不继承原版模型的独立 alpha 设置。
+
+同一家族共用 `run.timesfm_repo` 或 `run.chronos_repo`，原版使用对应
+`*_context_hours`，LoRA 输入长度固定为 `history_days * 24`。LoRA 超参数仍以
+`timesfm_*`、`chronos_*` 为前缀放在 `training.defaults`，并保留数据集、区域和 CLI
+覆盖。旧 `timesfm_lora_enabled`、`chronos_lora_enabled` 配置及 CLI 开关已移除并报错。
+适配器分别保存在 `<dataset-cache>/weight/timesfm_lora/` 和 `weight/chronos_lora/`；
+旧 LoRA 预测产物不迁移或回放为新模型身份。
 
 每个数据集随机选择 5 个区域，可设置：
 
@@ -148,17 +166,19 @@ run:
 
 ## 各区域独立离线训练
 
-先筛选训练资格并完成实验选区，只为选中区域训练独立的 LSTM 和 XGBoost：
+先筛选训练资格并完成实验选区，只为选中区域训练独立的 LSTM、XGBoost 或 LoRA 适配器：
 
 ```powershell
 python main.py --stage train --forecast-models lstm xgboost
+python main.py --stage train --forecast-models timesfm_lora chronos_lora
 ```
 
 `train`、`forecaster`、`full` 使用相同的显式站点或自动抽样规则；未选中区域不会训练。
+`train` 阶段从模型列表中过滤原版预训练模型；至少需要一个可训练的模型。
 每个区域只使用自己的有效历史，训练不依赖预测起点、alpha、Agent 模式或实验种子。
 默认至少需要 45 天有效小时记录和 512 个完整输入/输出样本。
 设输入 H 小时、输出 P 小时，N 个连续小时按步长 1 产生 N-H-P+1 个样本；
-默认 H=720、P=24 时至少需要 1,255 个连续小时才能满足样本数门槛。
+默认 H=840、P=24 时至少需要 1,375 个连续小时才能满足样本数门槛。
 负荷或电价恒定、重复时间戳和样本不足会明确报错。无效小时形成缺口，
 样本的输入与标签都不能跨缺口；不插值补负荷。
 
@@ -168,7 +188,7 @@ python main.py --stage train --forecast-models lstm xgboost
 删除输出标签触及验证起点的训练样本，记录实际训练/验证数量和删除数量。
 预处理只拟合训练前缀。模型仅训练一次，LSTM 按验证误差早停并恢复最佳权重；
 XGBoost 为 P 个输出小时分别训练和保存最佳树数。不会重新拟合验证数据。
-该内部验证与预测前的 5 天 Bias 校准相互独立。
+该内部验证与预测前默认 7 天的 Bias 校准相互独立。
 
 固定默认值为 LSTM 隐藏大小 32、1 层、batch 64、学习率 0.001、最多 100 epochs；
 XGBoost 最大深度 3、每小时模型最多 800 棵树、学习率 0.03。没有自动参数档位。
@@ -222,12 +242,25 @@ CLI 仍使用 `--training-lstm-workers` 和 `--training-xgboost-workers`。
 
 ## 缓存与结果隔离
 
-每个数据目录的 `cache/` 保存指纹缓存、特征、时间划分和离线权重。
+指纹缓存、特征、时间划分和离线权重默认保存在项目根目录的 `cache/` 中，
+每个数据集使用独立目录，并保留其相对于项目 `data/` 的路径：
+
+| 数据目录 | 默认缓存目录 |
+|---|---|
+| `data/UrbanEV` | `cache/UrbanEV` |
+| `data/MP-EVData` | `cache/MP-EVData` |
+| `data/CHARGED/JHB` | `cache/CHARGED/JHB` |
+
+缓存位置锚定项目根目录，不随启动时的工作目录改变。项目 `data/` 之外的数据源使用
+`<project>/cache/_external/<safe-leaf>_<path-hash>/`；`path-hash` 为规范化绝对数据路径
+的 SHA-256 前 12 位十六进制字符。显式设置 `data.cache_dir` 或 `--cache-dir` 时，
+该路径就是此数据集的完整缓存目录，不再追加数据集子目录。
+下文的 `<dataset-cache>` 均指最终解析出的缓存目录。
 
 ```text
-<data_dir>/cache/weight/<backend>/index.json
-<data_dir>/cache/weight/<backend>/<safe-zone-key>/current.json
-<data_dir>/cache/weight/<backend>/<safe-zone-key>/<model_id>/
+<dataset-cache>/weight/<backend>/index.json
+<dataset-cache>/weight/<backend>/<safe-zone-key>/current.json
+<dataset-cache>/weight/<backend>/<safe-zone-key>/<model_id>/
     manifest.json
     model.pt 或 model.json
     preprocess.json
@@ -238,12 +271,15 @@ CLI 仍使用 `--training-lstm-workers` 和 `--training-xgboost-workers`。
 加载时校验清单及每个文件的哈希，损坏或缺失时明确报错，不在预测期间静默训练。
 `train` 或实验开始前的准备阶段会为缺失、损坏的缓存创建新版本并记录原因；已有预测的
 Agent-only 重放仍严格绑定原版本，原版本损坏时直接失败。
+旧缓存和模型文件不会自动移动；使用新默认配置运行时，会在新位置构建缓存。
+已有预测产物仍引用原位置的权重，因此需保留这些文件供 Agent 重放。
+若需继续使用旧缓存，可用 `data.cache_dir` 或 `--cache-dir` 显式指定其路径。
 随机选区的资格缓存由 `zone_eligibility.load_zone_eligibility` 读取或生成，默认路径为：
 
 ```text
-<data_dir>/cache/zone_selection_manifest.json
-<data_dir>/cache/datasets/<dataset-fingerprint>/zone_selection/<policy-hash>/zone_eligibility.json
-<data_dir>/cache/datasets/<dataset-fingerprint>/zone_selection/<policy-hash>/zone_eligibility.csv
+<dataset-cache>/zone_selection_manifest.json
+<dataset-cache>/datasets/<dataset-fingerprint>/zone_selection/<policy-hash>/zone_eligibility.json
+<dataset-cache>/datasets/<dataset-fingerprint>/zone_selection/<policy-hash>/zone_eligibility.csv
 ```
 
 `zone_selection_manifest.json` 是资格缓存索引。JSON 包含 `eligible_zone_ids`、
@@ -281,7 +317,7 @@ Agent-only 重放仍严格绑定原版本，原版本损坏时直接失败。
 
 使用相同实验名重新运行会复用目录，并更新同名产物、调度清单和日志。
 若需要保留两次运行的独立结果，请修改 `experiment_name`。
-旧结果保留在原位置，不会自动迁移；数据目录下的缓存位置保持不变。
+旧结果保留在原位置，不会自动迁移；缓存默认位置按本节的项目根目录规则解析。
 
 列表运行时，`data.cache_dir`、`run.forecaster_output_dir`、
 `run.agent_output_dir`、`run.precomputed_window_data` 保持 `null`，
@@ -294,8 +330,11 @@ Agent-only 重放仍严格绑定原版本，原版本损坏时直接失败。
 位于各自模式目录，权重仍共用数据集缓存。Agent 阶段优先读取对应模式目录中的 `forecaster_manifest.json`，
 没有时再读取共享模型目录，支持这两种来源。
 使用单个 `data_dir` 时，可以通过 `forecaster_output_dir` 精确指定当前协议模型的
-`forecaster` 目录或 `forecaster_manifest.json` 文件。旧协议的预测器产物需要重新生成，
-不提供旧模型迁移或回放；历史结果字段兼容仅在离线评估读取边界处理。
+`forecaster` 目录或 `forecaster_manifest.json` 文件。当前 Native 预测器产物为 schema 6，
+Forecaster manifest 为 schema 7；旧版本需通过 `forecaster` 或 `full` 阶段重新生成，
+再用于 Agent-only。LSTM/XGBoost 离线权重仍为 schema 2，缓存位置、训练内容及参数
+匹配时可直接复用，无需因此设置 `--force-train`。旧 LoRA 权重不自动迁移到新后端身份。
+历史结果字段兼容仅在离线评估读取边界处理。
 Agent 阶段校验适配器、数据目录和数据指纹，拒绝混用其他数据集的模型。
 
 ## 数据语义和质量策略

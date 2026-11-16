@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from config import CALIBRATION_METHOD, normalize_forecast_model_name
+from training_config import FORECAST_BACKENDS, LORA_BACKENDS, TRAINABLE_BACKENDS, base_backend
 
 
 _TIMESFM_MODEL_CACHE: dict[tuple[str, int, int], Any] = {}
@@ -52,11 +53,19 @@ def forecast_zone(
     model_reference: dict[str, Any] | None = None,
     raw_prediction_cache: dict | None = None,
 ) -> ForecastResult:
+    timesfm_exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if timesfm_exog_cols is None else timesfm_exog_cols)
+    chronos_exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if chronos_exog_cols is None else chronos_exog_cols)
     for name, value, minimum in (("history_days", history_days, 1), ("validation_days", validation_days, 0), ("horizon_days", horizon_days, 1)):
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
     zone_id = str(zone_id)
     normalized_model = normalize_forecast_model_name(backend)
+    model_family = base_backend(normalized_model)
+    if normalized_model in LORA_BACKENDS:
+        if model_family == "timesfm":
+            timesfm_context_hours = history_days * 24
+        else:
+            chronos_context_hours = history_days * 24
     if model_reference is not None and (
         str(model_reference.get("zone_id")) != zone_id
         or model_reference.get("backend") != normalized_model
@@ -92,10 +101,10 @@ def forecast_zone(
         diurnal_blend_alpha=diurnal_blend_alpha,
         timesfm_repo=timesfm_repo,
         timesfm_context_hours=timesfm_context_hours,
-        timesfm_exog_cols=timesfm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS,
+        timesfm_exog_cols=timesfm_exog_cols,
         chronos_repo=chronos_repo,
         chronos_context_hours=chronos_context_hours,
-        chronos_exog_cols=chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS,
+        chronos_exog_cols=chronos_exog_cols,
         chronos_device=chronos_device,
         model_reference=model_reference,
         raw_prediction_cache=raw_prediction_cache,
@@ -153,12 +162,12 @@ def forecast_zone(
         "backend": normalized_model,
         "diurnal_blend_alpha": float(diurnal_blend_alpha),
         "calibration_method": CALIBRATION_METHOD,
-        "timesfm_repo": timesfm_repo if normalized_model == "timesfm" else None,
-        "timesfm_context_hours": int(timesfm_context_hours) if normalized_model == "timesfm" else None,
-        "timesfm_covariates": (timesfm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS) if normalized_model == "timesfm" else None,
+        "timesfm_repo": timesfm_repo if model_family == "timesfm" else None,
+        "timesfm_context_hours": int(timesfm_context_hours) if model_family == "timesfm" else None,
+        "timesfm_covariates": timesfm_exog_cols if model_family == "timesfm" else None,
         "chronos_repo": chronos_repo if normalized_model.startswith("chronos") else None,
         "chronos_context_hours": int(chronos_context_hours) if normalized_model.startswith("chronos") else None,
-        "chronos_covariates": (chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS)
+        "chronos_covariates": chronos_exog_cols
         if normalized_model.startswith("chronos")
         else None,
         "chronos_device": chronos_device if normalized_model.startswith("chronos") else None,
@@ -189,7 +198,7 @@ def forecast_zone(
     summary = {
         key: value for key, value in summary.items()
         if not key.startswith(("timesfm_", "chronos_", "lstm_", "xgboost_", "ar_"))
-        or key.startswith(normalized_model.lower() + "_")
+        or key.startswith(model_family.lower() + "_")
     }
     if model_reference is not None:
         overlap = training_overlap_mask(hourly["time"], model_reference)
@@ -217,17 +226,17 @@ def forecast_zone(
         "forecast_parameters": {
             "timesfm_repo": timesfm_repo,
             "timesfm_context_hours": int(timesfm_context_hours),
-            "timesfm_exog_cols": list(timesfm_exog_cols or DEFAULT_TIMESFM_EXOG_COLS),
+            "timesfm_exog_cols": list(timesfm_exog_cols),
             "chronos_repo": chronos_repo,
             "chronos_context_hours": int(chronos_context_hours),
-            "chronos_exog_cols": list(chronos_exog_cols or DEFAULT_TIMESFM_EXOG_COLS),
+            "chronos_exog_cols": list(chronos_exog_cols),
             "chronos_device": chronos_device,
         },
         "fitted_state": forecast_attrs.get("reusable_forecaster_state"),
     }
     reusable_forecaster["forecast_parameters"] = {
         key: value for key, value in reusable_forecaster["forecast_parameters"].items()
-        if key.startswith(normalized_model.lower() + "_")
+        if key.startswith(model_family.lower() + "_")
     }
     reusable_forecaster["forecast_parameters"].update(
         diurnal_blend_alpha=float(diurnal_blend_alpha), calibration_method=CALIBRATION_METHOD,
@@ -263,7 +272,7 @@ def forecast_load(
     parameters = {name: value for name, value in locals().copy().items()
                   if name.startswith(("timesfm_", "chronos_"))}
     backend = normalize_forecast_model_name(backend)
-    if backend not in {"timesfm", "chronos", "lstm", "xgboost", "AR"}:
+    if backend not in FORECAST_BACKENDS:
         raise ValueError(f"Unsupported backend: {backend}")
     if isinstance(horizon_hours, bool) or not isinstance(horizon_hours, (int, np.integer)) or horizon_hours < 1:
         raise ValueError("horizon_hours must be a positive integer")
@@ -460,7 +469,7 @@ def prepare_forecast_backend(
     """Prepare one frozen model and return an uncalibrated inference callable."""
     p = parameters
     state = fitted_state or {}
-    prefix = backend.lower() + "_"
+    prefix = base_backend(backend).lower() + "_"
     cols = p.get(prefix + "exog_cols")
     exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if cols is None else cols)
     if set(exog_cols) - KNOWN_FUTURE_COVARIATES:
@@ -468,6 +477,8 @@ def prepare_forecast_backend(
 
     reference = model_reference or state.get("model_reference")
     if reference is not None:
+        if backend not in TRAINABLE_BACKENDS:
+            raise ValueError(f"Pretrained backend {backend} cannot use an offline model reference; select its LoRA forecaster")
         from zone_training import load_cached_predictor
 
         if not isinstance(reference, dict) or reference.get("backend") != backend:
@@ -499,7 +510,7 @@ def prepare_forecast_backend(
             return pd.DataFrame({"time": future["time"].to_numpy(), "raw_predicted_kwh": raw,
                                  "q10_kwh": q10, "q90_kwh": q90})
         return predict, {}
-    if backend in {"lstm", "xgboost"}:
+    if backend in TRAINABLE_BACKENDS:
         raise ValueError(f"{backend} requires a prepared per-zone model_reference; run the train stage first")
     if backend == "AR":
         response = state["energy_price_response"] if fitted_state is not None else estimate_energy_price_response(history)

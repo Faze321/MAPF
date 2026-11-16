@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from training_config import base_backend
 
 
 THRESHOLD_FIELDS = (
@@ -70,7 +71,7 @@ def canonical_forecast_parameters(raw: dict[str, Any]) -> dict[str, Any]:
     for key in list(parameters):
         if key in ("forecast_starts", "forecast_start_count", "forecast_models", "diurnal_blend_alphas") or key.endswith("_diurnal_blend_alphas"):
             parameters.pop(key)
-        elif backend and key.startswith(prefixes) and not key.startswith(f"{backend}_"):
+        elif backend and key.startswith(prefixes) and not key.startswith(f"{base_backend(backend)}_"):
             parameters.pop(key)
         elif key == active_alpha:
             parameters.pop(key)

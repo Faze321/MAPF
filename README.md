@@ -4,7 +4,7 @@ MAPF separates forecasting from price control and keeps forecast-period ground t
 
 ## Architecture
 
-1. **Dataset adapter and cache** converts UrbanEV, CHARGED, MP-EVData, or a mapped long-format dataset to a canonical schema. Reusable dataset features are stored under `<dataset_path>/cache/`.
+1. **Dataset adapter and cache** converts UrbanEV, CHARGED, MP-EVData, or a mapped long-format dataset to a canonical schema. Reusable dataset features are stored in a separate directory for each dataset under `<project>/cache/`.
 2. **Offline models** train a separate LSTM and XGBoost for each available Zone from that Zone's full valid history. Forecasting reads these cached weights, calibrates each origin, and persists reusable inference state. Price proposals reuse the same model and bias.
 3. **Control engine** runs either Grid → Behaviour → Economist or a single Agent, proposes one energy price per continuous 3-hour window, reforecasts, and accepts a run only when every Zone/window is `Medium`.
 4. **Evaluation** is kept separate from the no-leakage handoff and authoritative control result.
@@ -49,7 +49,7 @@ A generic long-format dataset can be configured with explicit semantic mappings:
 data:
   adapter: long_format
   timeseries_file: series.csv
-  cache_dir: null  # defaults to <run.data_dir>/cache
+  cache_dir: null  # exact dataset cache override; default <project>/cache/<path relative to project data/>
   column_mapping:
     timestamp: when
     zone_id: area
@@ -59,10 +59,26 @@ data:
 
 Required canonical fields are timestamp, Zone, load, and a strictly positive baseline energy-price schedule. Optional dynamic fields include weather, occupancy, service price, and calendar values; optional static fields include coordinates, Zone type, POIs, geography, and charging capacity. Explicit mappings win over alias discovery, and ambiguous aliases fail fast.
 
+The default cache root mirrors the dataset's path relative to `<project>/data/`:
+
+| Dataset directory | Default cache directory |
+|---|---|
+| `data/UrbanEV` | `cache/UrbanEV` |
+| `data/MP-EVData` | `cache/MP-EVData` |
+| `data/CHARGED/JHB` | `cache/CHARGED/JHB` |
+
+These cache paths are anchored to the project root, independently of the working
+directory. Sources outside `<project>/data/` use
+`<project>/cache/_external/<safe-leaf>_<path-hash>/`, where the hash is the first
+12 hexadecimal characters of the normalized absolute source path's SHA-256.
+An explicit `data.cache_dir` or `--cache-dir` specifies the exact cache directory
+for that dataset; no dataset subdirectory is appended. Below, `<dataset-cache>`
+means this resolved directory.
+
 The cache is fingerprinted by adapter/schema version, source paths, sizes, mtimes, column/header signatures, and mappings:
 
 ```text
-<dataset_path>/cache/
+<dataset-cache>/
   cache_manifest.json
   datasets/<dataset_fingerprint>/
     canonical_schema.json
@@ -76,7 +92,13 @@ The cache is fingerprinted by adapter/schema version, source paths, sizes, mtime
       historical_3h_load_policy.csv
 ```
 
-`--force-cache` rebuilds dataset caches. Writes use a temporary file followed by atomic replacement. Offline LSTM/XGBoost weights live under `<dataset_path>/cache/weight/<backend>/`; forecast-specific calibration, forecasts, Agent output and evaluation remain in experiment outputs.
+`--force-cache` rebuilds dataset caches. Writes use a temporary file followed by atomic replacement. Offline LSTM/XGBoost weights live under `<dataset-cache>/weight/<backend>/`; forecast-specific calibration, forecasts, Agent output and evaluation remain in experiment outputs.
+
+Existing caches and model files are not moved automatically. Runs using the new
+default build caches in the new location. Existing forecast artifacts keep their
+references to the original weight files, so retain those files for Agent replay.
+To keep using an old dataset cache, set its path explicitly with `data.cache_dir`
+or `--cache-dir`.
 
 ## Running
 
@@ -598,11 +620,17 @@ per model by default. CLI overrides remain `--training-lstm-workers` and
 
 ### TimesFM and Chronos 2 LoRA
 
-Enable adaptation through `training.defaults`; base model IDs stay in
-`run.timesfm_repo` and `run.chronos_repo`. The supplied configuration enables
-both adapters. Configurations that omit the switches retain pretrained inference.
-Setting a switch to `false` selects the pretrained model again. Each dataset and
-Zone stores its own immutable adapter under its existing weight cache, without
+Select the separate `timesfm_lora` and `chronos_lora` forecasters to train and
+use adapters. The original `timesfm` and `chronos` forecasters always use
+pretrained weights, without training or attaching an adapter. All four can run
+in one experiment matrix, with separate alpha lists and output identities.
+The supplied configurations include both originals and LoRA variants.
+
+Each family shares its base model setting, `run.timesfm_repo` or
+`run.chronos_repo`. Base models use their respective `*_context_hours` settings;
+LoRA variants use `history_days * 24` input hours for training and prediction.
+Each dataset and Zone stores its own immutable adapter under
+`<dataset-cache>/weight/timesfm_lora/` or `weight/chronos_lora/`, without
 modifying the base model or another Zone's adapter. Changes to the configured
 base-model repository/path, LoRA parameters or training data select a different
 cache version. Each adapter records its Hub revision or local base-weight checksums
@@ -613,12 +641,14 @@ run:
   history_days: 35
   validation_days: 7
   horizon_days: 1
-  forecast_models: [timesfm, chronos]
+  forecast_models: [timesfm, timesfm_lora, chronos, chronos_lora]
+  diurnal_blend_alphas: [0.0, 0.5]
+  timesfm_lora_diurnal_blend_alphas: [0.0, 0.25]
+  chronos_lora_diurnal_blend_alphas: null
   timesfm_context_hours: 840
   chronos_context_hours: 840
 training:
   defaults:
-    timesfm_lora_enabled: true
     timesfm_lora_rank: 8
     timesfm_lora_alpha: 16
     timesfm_lora_dropout: 0.05
@@ -630,7 +660,6 @@ training:
     timesfm_early_stopping_patience: 3
     timesfm_weight_decay: 0.01
     timesfm_grad_clip: 1.0
-    chronos_lora_enabled: true
     chronos_lora_rank: 8
     chronos_lora_alpha: 16
     chronos_lora_dropout: 0.05
@@ -650,12 +679,15 @@ gradient accumulation steps); the final incomplete group can be smaller.
 Training updates only adapter weights and restores the best validation checkpoint.
 LoRA uses automatic device selection, with no additional device setting.
 Seeds inherit `training.seed` unless `timesfm_seed` or `chronos_seed` overrides it.
-Hyperparameters can use the same dataset/Zone override hierarchy as LSTM/XGBoost.
-Enable switches belong only in global `training.defaults` or CLI, keeping one
-model's adapted/pretrained choice consistent across the selected Zones.
+Hyperparameters retain their `timesfm_*` and `chronos_*` names under
+`training.defaults`, with the same dataset/Zone/CLI override hierarchy as LSTM/XGBoost.
+The old `timesfm_lora_enabled` and `chronos_lora_enabled` keys and CLI switches
+are rejected; choose the forecaster IDs instead. Existing LoRA forecast artifacts
+are not migrated or replayed under the new identities.
 
-Use `python main.py --stage train --forecast-models timesfm chronos` to prepare
-enabled adapters without Agent calls. Forecaster/Full prepare missing adapters;
+Use `python main.py --stage train --forecast-models timesfm_lora chronos_lora`
+to prepare adapters without Agent calls. The train stage filters out original
+pretrained forecasters. Forecaster/Full prepare missing adapters;
 prediction and Agent reforecasting reuse frozen adapters. Training requires the
 project's PEFT dependency and the configured pretrained weights. Existing
 forecast calibration, diurnal blending and covariate handling still apply.
@@ -680,16 +712,19 @@ model versions; the overall Agent inventory explicitly spans all versions.
 
 ## Forecast windows and daily bias calibration
 
-All five backends use the same default forecast split: 35 days of history,
+All seven backends use the same default forecast split: 35 days of history,
 7 days of validation, and 1 day of forecasting. The lengths remain configurable.
 For forecast origin `T`, the default history window is `[T-42d, T-7d)`,
-validation is `[T-7d, T)`, and the forecast is `[T, T+1d)`. LSTM/XGBoost input
-length equals `history_days`; TimesFM/Chronos contexts default to the same 840 hours.
+validation is `[T-7d, T)`, and the forecast is `[T, T+1d)`. LSTM, XGBoost and
+both LoRA variants use `history_days * 24` input hours; original TimesFM/Chronos
+contexts default to the same 840 hours.
 
-LSTM/XGBoost load the Zone's offline model without fitting at the forecast origin.
+LSTM, XGBoost and both LoRA variants load the Zone's offline weights without fitting at the forecast origin.
 AR estimates its price response from the history window. Validation evaluates seven
-separate 24-hour predictions. LSTM/XGBoost predict the full configured output
-window each time and use its first 24 hours for calibration. At each validation origin, context consists
+separate 24-hour predictions. LSTM, XGBoost, `timesfm_lora` and `chronos_lora`
+predict the full configured output window P each time and use its first 24 hours
+for calibration. Original TimesFM, Chronos and AR predict 24 hours per validation day.
+At each validation origin, context consists
 of the most recent `history_days` of already observed load; observations from
 the current or later validation day cannot enter its forecast input. Saved weights,
 scalers, the AR price response, and the history diurnal profile remain frozen.
@@ -704,7 +739,7 @@ predictions, hourly residuals, and the averaged bias vector.
 
 Incomplete or invalid validation load is an error. `validation_days: 0` disables
 calibration. A longer configured forecast repeats the 24-hour bias vector; it
-never consumes forecast-period actual load. LSTM and XGBoost directly predict
+never consumes forecast-period actual load. LSTM, XGBoost and both LoRA variants directly predict
 the entire configured horizon. The old `roll_actuals` and per-model
 `step_horizon` settings have been removed.
 
@@ -717,10 +752,12 @@ run:
   horizon_days: 1
   forecast_starts: null
   forecast_start_count: 2
-  forecast_models: [timesfm, chronos, lstm, xgboost, AR]
+  forecast_models: [timesfm, timesfm_lora, chronos, chronos_lora, lstm, xgboost, AR]
   diurnal_blend_alphas: [0.0, 0.5]
   timesfm_diurnal_blend_alphas: null
+  timesfm_lora_diurnal_blend_alphas: null
   chronos_diurnal_blend_alphas: null
+  chronos_lora_diurnal_blend_alphas: null
   lstm_diurnal_blend_alphas: [0.0, 0.25]
   xgboost_diurnal_blend_alphas: [0.0]
   ar_diurnal_blend_alphas: null
@@ -751,6 +788,13 @@ message instead of silently falling back. Python single-run APIs and new output
 fields use `forecast_origin` and `backend`. Offline evaluation accepts legacy
 field names at its reading boundary and writes the new names. Model artifacts
 use the new protocol and do not replay legacy calibration states.
+
+Native forecast artifacts now use schema 6 and Forecaster manifests use schema 7.
+Regenerate older forecast artifacts through the Forecaster or Full stage before
+Agent-only replay. LSTM/XGBoost offline weights remain at schema 2 and can be
+reused when the cache location, training content and parameters match; this
+protocol change does not require `--force-train`. Old LoRA weights are not
+automatically migrated to the new backend identities.
 
 ## XGBoost forecaster
 

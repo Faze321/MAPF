@@ -53,6 +53,7 @@ from data_loader import (
 from dataset_adapter import (DatasetSpec, load_canonical_dataset, split_cache_key,
                              validate_forecaster_dataset_source, process_file_lock, atomic_write_json)
 from forecasting import ForecastResult, forecast_zone
+from training_config import LORA_BACKENDS, TRAINABLE_BACKENDS, base_backend
 from global_forecaster import NATIVE_ARTIFACT_SCHEMA_VERSION, NativeForecasterArtifact
 from load_policy import (
     EXTREMELY_HIGH_STRESS,
@@ -199,7 +200,7 @@ ERROR_CODE_BY_STAGE = {
 }
 MAX_CONTROL_ATTEMPTS = 3
 CONTROL_AGENT_USAGE_KEY = "_control_agent_usage"
-FORECASTER_MANIFEST_SCHEMA_VERSION = 6
+FORECASTER_MANIFEST_SCHEMA_VERSION = 7
 FORECAST_PARAMETER_NAMES = (
     'forecast_origin',
     'horizon_days',
@@ -297,7 +298,7 @@ def run_training_stage(*, data_dir: Path, backends: Iterable[str] = ("lstm", "xg
     training_config = training_config or TrainingConfig()
     selected = training_config.enabled_backends(backends, cli_overrides=training_cli_overrides)
     if not selected:
-        raise ValueError("The train stage requires lstm, xgboost, or a TimesFM/Chronos backend with LoRA enabled")
+        raise ValueError("The train stage requires lstm, xgboost, timesfm_lora or chronos_lora")
     spec = dataset_spec or DatasetSpec(path=data_dir, cache_dir=cache_dir)
     dataset = load_canonical_dataset(spec, force_cache=force_cache)
     selected_zone_ids = normalize_zone_ids(zone_ids)
@@ -783,9 +784,13 @@ def make_forecast_parameters(**values: Any) -> dict[str, Any]:
     parameters["backend"] = backend
     parameters["diurnal_blend_alpha"] = normalize_float_list(alpha)[0]
     parameters.update({name: values.get(name, getattr(defaults, name))
-                       for name in BACKEND_PARAMETER_NAMES if name.startswith(backend.lower() + "_")})
+                       for name in BACKEND_PARAMETER_NAMES if name.startswith(base_backend(backend).lower() + "_")})
+    if backend in LORA_BACKENDS:
+        parameters[f"{base_backend(backend)}_context_hours"] = int(parameters["history_days"]) * 24
     parameters["calibration_method"] = CALIBRATION_METHOD
     if values.get("model_ids"):
+        if backend not in TRAINABLE_BACKENDS:
+            raise ValueError("Pretrained forecasters cannot identify offline models; select the LoRA backend")
         model_ids = values["model_ids"]
         if not isinstance(model_ids, dict) or any(not isinstance(zone, str) or not zone
                                                   or not isinstance(model_id, str) or not model_id
@@ -967,11 +972,23 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
             "Forecaster artifact Zone set does not match the no-leakage handoff."
         )
     model_ids = manifest.get("model_ids") or {}
-    if forecast_parameters["backend"] in {"lstm", "xgboost"} or model_ids:
+    if forecast_parameters["backend"] in TRAINABLE_BACKENDS or model_ids:
         if not isinstance(model_ids, dict) or set(model_ids) != set(selected_ids):
             raise ValueError("Forecaster manifest must identify an offline model for every selected zone")
         if forecast_parameters.get("model_ids") != model_ids:
             raise ValueError("Forecaster model IDs differ between forecast parameters and manifest")
+    provenance = manifest.get("model_provenance") or {}
+    if not isinstance(provenance, dict):
+        raise ValueError("Forecaster model_provenance must contain a per-zone mapping")
+    if forecast_parameters["backend"] not in TRAINABLE_BACKENDS and provenance:
+        raise ValueError("Pretrained forecasters cannot contain offline model provenance")
+    if set(provenance) != set(model_ids):
+        raise ValueError("Forecaster model provenance must cover the same zones as its model IDs")
+    for zone_id, entry in provenance.items():
+        if not isinstance(entry, dict) or entry.get("model_id") != model_ids[zone_id]:
+            raise ValueError(f"Forecaster model provenance model ID differs for zone {zone_id}")
+        if entry.get("backend", forecast_parameters["backend"]) != forecast_parameters["backend"]:
+            raise ValueError(f"Forecaster model provenance backend differs for zone {zone_id}")
     for zone_id, artifact in scenario_artifacts.items():
         metadata = artifact.metadata()
         if metadata.get("backend") != forecast_parameters["backend"]:
@@ -1090,7 +1107,7 @@ def run_experiment_matrix(
     selected_zone_ids = normalize_zone_ids(zone_ids)
     supplied_spec = pipeline_kwargs.get("dataset_spec")
     shared_cache_dir = Path(pipeline_kwargs.pop("cache_dir", None)
-                            or (supplied_spec.resolved_cache_dir if supplied_spec else data_dir / "cache"))
+                            or (supplied_spec or DatasetSpec(path=data_dir)).resolved_cache_dir)
     shared_cache_dir.mkdir(parents=True, exist_ok=True)
     base_force_cache = bool(pipeline_kwargs.pop("force_cache", False))
     selection_artifacts: dict[str, Path] = {}
@@ -2099,7 +2116,7 @@ def apply_price_conditioned_baseline_forecasts(
     chronos_device: str,
 ) -> list[dict[str, Any]]:
     normalized_model = normalize_forecast_model_name(backend)
-    if normalized_model not in {"timesfm", "lstm", "chronos", "xgboost", "AR"}:
+    if normalized_model not in FORECAST_BACKENDS:
         return [
             mark_price_conditioned_baseline_unavailable(
                 report,
@@ -3019,8 +3036,10 @@ def build_contexts(
         )
         try:
             model_reference = (zone_model_references or {}).get(zone_id)
-            if backend in {"lstm", "xgboost"} and model_reference is None:
+            if backend in TRAINABLE_BACKENDS and model_reference is None:
                 raise ValueError(f"No usable offline {backend} weights for zone {zone_id}; see the backend training index")
+            if backend not in TRAINABLE_BACKENDS and model_reference is not None:
+                raise ValueError(f"Pretrained forecaster {backend} cannot use offline weights; select the LoRA backend")
             zone_weather = pipeline_data.weather
             canonical_dataset = getattr(pipeline_data, "canonical_dataset", None)
             if model_reference is not None and canonical_dataset is not None:

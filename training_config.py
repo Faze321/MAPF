@@ -1,4 +1,4 @@
-"""Offline per-zone training settings, independent of forecast experiments."""
+"""Forecast backend identities and offline per-zone training settings."""
 from __future__ import annotations
 
 from copy import deepcopy
@@ -8,9 +8,20 @@ import os
 from pathlib import Path
 from typing import Any
 
+FORECAST_BACKENDS = ("timesfm", "timesfm_lora", "chronos", "chronos_lora", "lstm", "xgboost", "AR")
+LORA_BACKENDS = ("timesfm_lora", "chronos_lora")
+TRAINABLE_BACKENDS = frozenset({"lstm", "xgboost", *LORA_BACKENDS})
 
-TRAINING_BACKENDS = ("lstm", "xgboost", "timesfm", "chronos")
-LORA_BACKENDS = ("timesfm", "chronos")
+
+def base_backend(backend: str) -> str:
+    """Return the family used for native model loading and shared parameters."""
+    return {"timesfm_lora": "timesfm", "chronos_lora": "chronos"}.get(backend, backend)
+
+
+TRAINING_BACKENDS = ("lstm", "xgboost", *LORA_BACKENDS)
+LORA_PARAMETER_PREFIXES = tuple(base_backend(backend) for backend in LORA_BACKENDS)
+RETIRED_LORA_SWITCHES = {f"{backend}_lora_enabled": f"{backend}_lora"
+                        for backend in LORA_PARAMETER_PREFIXES}
 TRAINING_EXOG_COLS = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
 TRAINING_PARAMETER_DEFAULTS = {
     "lstm_hidden_size": 32, "lstm_num_layers": 1,
@@ -34,7 +45,7 @@ for _backend, _targets in (
                  "self_attention.o", "output_patch_embedding.output_layer"]),
 ):
     TRAINING_PARAMETER_DEFAULTS.update({f"{_backend}_{key}": value for key, value in {
-        "lora_enabled": False, "lora_rank": 8, "lora_alpha": 16,
+        "lora_rank": 8, "lora_alpha": 16,
         "lora_dropout": .05, "lora_target_modules": _targets,
         "learning_rate": 1e-4, "batch_size": 4, "gradient_accumulation_steps": 4,
         "epochs": 10, "early_stopping_patience": 3, "weight_decay": .01,
@@ -47,11 +58,10 @@ INTEGER_PARAMETERS = {
     "xgboost_n_estimators", "xgboost_max_depth", "xgboost_early_stopping_rounds",
     "xgboost_n_jobs", "xgboost_max_bin", "xgboost_seed",
 }
-INTEGER_PARAMETERS.update(f"{backend}_{name}" for backend in LORA_BACKENDS for name in (
+INTEGER_PARAMETERS.update(f"{backend}_{name}" for backend in LORA_PARAMETER_PREFIXES for name in (
     "lora_rank", "batch_size", "gradient_accumulation_steps", "epochs", "early_stopping_patience", "seed"))
-BOOL_PARAMETERS = {f"{backend}_lora_enabled" for backend in LORA_BACKENDS}
 LIST_PARAMETERS = {"lstm_exog_cols", "xgboost_exog_cols",
-                   *(f"{backend}_lora_target_modules" for backend in LORA_BACKENDS)}
+                   *(f"{backend}_lora_target_modules" for backend in LORA_PARAMETER_PREFIXES)}
 STRING_PARAMETERS = {"lstm_device", "xgboost_device", "xgboost_tree_method"}
 
 
@@ -67,14 +77,13 @@ def validate_training_parameters(raw: Any, label: str) -> dict[str, Any]:
     result = deepcopy(raw)
     for key, value in result.items():
         name = f"{label}.{key}"
+        if key in RETIRED_LORA_SWITCHES:
+            raise ValueError(f"{name} was removed; select {RETIRED_LORA_SWITCHES[key]} in run.forecast_models to train and use LoRA")
         if key not in TRAINING_PARAMETER_DEFAULTS:
             raise ValueError(f"Unknown training parameter {name}")
         if value is None:
             raise ValueError(f"{name} cannot be null; omit it to inherit the default")
-        if key in BOOL_PARAMETERS:
-            if not isinstance(value, bool):
-                raise ValueError(f"{name} must be a boolean")
-        elif key in INTEGER_PARAMETERS:
+        if key in INTEGER_PARAMETERS:
             minimum = 0 if key.endswith("_seed") else 1
             if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
                 raise ValueError(f"{name} must be an integer >= {minimum}")
@@ -138,12 +147,8 @@ def _path_overrides(raw: Any, label: str, *, zones: bool = False) -> dict[str, A
                 if not isinstance(zone_id, str) or not zone_id.strip():
                     raise ValueError(f"{label}[{folder}] requires string zone IDs; quote numeric IDs in YAML")
                 result[path][zone_id] = validate_training_parameters(parameters, f"{label}[{folder}][{zone_id}]")
-                if BOOL_PARAMETERS.intersection(result[path][zone_id]):
-                    raise ValueError("LoRA enable switches belong in training.defaults or CLI, not zone overrides")
         else:
             result[path] = validate_training_parameters(values, f"{label}[{folder}]")
-            if BOOL_PARAMETERS.intersection(result[path]):
-                raise ValueError("LoRA enable switches belong in training.defaults or CLI, not dataset overrides")
     return result
 
 
@@ -191,17 +196,9 @@ class TrainingConfig:
     def backend_enabled(self, backend: str, *, data_dir: str | Path | None = None,
                         zone_id: str | None = None,
                         cli_overrides: dict[str, Any] | None = None) -> bool:
-        """Whether a backend needs offline weights; enable switches are global."""
-        backend = backend.lower()
-        if backend not in TRAINING_BACKENDS:
-            return False
-        if backend not in LORA_BACKENDS:
-            return True
-        key = f"{backend}_lora_enabled"
-        cli = validate_training_parameters(cli_overrides, "CLI training override")
-        if key in cli:
-            return cli[key]
-        return self.defaults.get(key, TRAINING_PARAMETER_DEFAULTS[key])
+        """Only explicit trainable forecast identities need offline weights."""
+        validate_training_parameters(cli_overrides, "CLI training override")
+        return backend.lower() in TRAINABLE_BACKENDS
 
     def enabled_backends(self, backends, **selection) -> list[str]:
         return list(dict.fromkeys(backend.lower() for backend in backends
@@ -211,13 +208,14 @@ class TrainingConfig:
                 cli_overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         backend = backend.lower()
         if backend not in TRAINING_BACKENDS:
-            raise ValueError("Offline training supports lstm, xgboost, timesfm and chronos only")
+            raise ValueError("Offline training supports " + ", ".join(TRAINING_BACKENDS) + " only")
+        prefix = base_backend(backend)
         values = deepcopy(TRAINING_PARAMETER_DEFAULTS)
-        values.update({f"{name}_seed": self.seed for name in TRAINING_BACKENDS})
+        values.update({f"{base_backend(name)}_seed": self.seed for name in TRAINING_BACKENDS})
         dataset_key = training_path_key(data_dir)
         for override in (self.defaults, self.dataset_overrides.get(dataset_key, {}),
                          self.zone_overrides.get(dataset_key, {}).get(str(zone_id), {}),
                          validate_training_parameters(cli_overrides, "CLI training override")):
             values.update(override)
-        result = {key: value for key, value in values.items() if key.startswith(backend + "_")}
+        result = {key: value for key, value in values.items() if key.startswith(prefix + "_")}
         return validate_training_parameters(result, f"resolved {backend} training")

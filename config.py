@@ -10,19 +10,23 @@ import re
 import os
 import yaml
 
-from training_config import TrainingConfig, TRAINING_PARAMETER_NAMES
+from training_config import (
+    FORECAST_BACKENDS, TrainingConfig, TRAINING_PARAMETER_NAMES, RETIRED_LORA_SWITCHES,
+)
 
 BACKEND_PARAMETER_NAMES = (
     "timesfm_repo", "timesfm_context_hours", "timesfm_exog_cols",
     "chronos_repo", "chronos_context_hours", "chronos_device",
 )
 
-FORECAST_BACKENDS = ("timesfm", "chronos", "lstm", "xgboost", "AR")
 BACKEND_BLEND_PARAMETER_NAMES = tuple(f"{backend.lower()}_diurnal_blend_alphas" for backend in FORECAST_BACKENDS)
 CALIBRATION_METHOD = "daily_hour_mean_v1"
 
 
 def reject_retired_forecast_settings(settings: dict[str, Any]) -> None:
+    for key, backend in RETIRED_LORA_SWITCHES.items():
+        if key in settings:
+            raise ValueError(f"run.{key} was removed; select {backend} in run.forecast_models to train and use LoRA")
     replacements = {
         "forecast_start": "forecast_starts",
         "forecast_model": "forecast_models",
@@ -172,7 +176,9 @@ class RunConfig:
     agent_modes: list[str] | None = None
     diurnal_blend_alphas: list[float] | None = None
     timesfm_diurnal_blend_alphas: list[float] | None = None
+    timesfm_lora_diurnal_blend_alphas: list[float] | None = None
     chronos_diurnal_blend_alphas: list[float] | None = None
+    chronos_lora_diurnal_blend_alphas: list[float] | None = None
     lstm_diurnal_blend_alphas: list[float] | None = None
     xgboost_diurnal_blend_alphas: list[float] | None = None
     ar_diurnal_blend_alphas: list[float] | None = None

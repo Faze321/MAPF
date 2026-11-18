@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from config import VALIDATION_BIAS_DAYS, validation_bias_days
 from dataset_adapter import (
     CANONICAL_ENERGY_PRICE_COLUMN,
     CANONICAL_LOAD_COLUMN,
@@ -21,20 +22,19 @@ from dataset_adapter import (
 )
 
 
-POLICY_VERSION = 2
+POLICY_VERSION = 5
 CONSTANT_RTOL = 1e-9
 CONSTANT_ATOL = 1e-12
 
 
 def load_zone_eligibility(
     dataset: CanonicalDataset, *, forecast_starts: Iterable[str], history_days: int,
-    validation_days: int, force_cache: bool = False,
+    validation_bias: bool = False, validation_days: int = VALIDATION_BIAS_DAYS, force_cache: bool = False,
 ) -> dict[str, Any]:
     """Read or build a versioned eligibility report without altering raw observations."""
     if isinstance(history_days, bool) or int(history_days) != history_days or history_days < 1:
         raise ValueError("history_days must be a positive integer")
-    if isinstance(validation_days, bool) or int(validation_days) != validation_days or validation_days < 0:
-        raise ValueError("validation_days must be a non-negative integer")
+    holdout_days = validation_bias_days(validation_bias, validation_days)
     starts = sorted({pd.Timestamp(start) for start in forecast_starts})
     if not starts or any(pd.isna(start) or start != start.floor("h") for start in starts):
         raise ValueError("forecast_starts must contain valid whole-hour timestamps")
@@ -43,9 +43,10 @@ def load_zone_eligibility(
         "dataset_fingerprint": dataset.dataset_fingerprint,
         "forecast_starts": [start.isoformat() for start in starts],
         "history_days": int(history_days),
-        "validation_days": int(validation_days),
-        "variation_scope": "all_history_before_first_validation",
-        "variation_cutoff": (starts[0] - pd.Timedelta(days=validation_days)).isoformat(),
+        "validation_bias": validation_bias,
+        "validation_days": holdout_days,
+        "variation_scope": "all_history_before_first_validation" if validation_bias else "all_history_before_first_forecast",
+        "variation_cutoff": (starts[0] - pd.Timedelta(days=holdout_days)).isoformat(),
         "constant_rtol": CONSTANT_RTOL,
         "constant_atol": CONSTANT_ATOL,
     }
@@ -100,6 +101,7 @@ def _build_report(dataset: CanonicalDataset, policy: dict[str, Any]) -> dict[str
     groups = frame.groupby(CANONICAL_ZONE_COLUMN)
     cutoff = pd.Timestamp(policy["variation_cutoff"])
     expected_hours = policy["history_days"] * 24
+    holdout_days = policy["validation_days"]
     zones = {}
     for zone_id in zone_ids:
         if zone_id in upstream:
@@ -128,7 +130,7 @@ def _build_report(dataset: CanonicalDataset, policy: dict[str, Any]) -> dict[str
             reasons.append("constant_energy_price")
         training_windows = []
         for origin in policy["forecast_starts"]:
-            end = pd.Timestamp(origin) - pd.Timedelta(days=policy["validation_days"])
+            end = pd.Timestamp(origin) - pd.Timedelta(days=holdout_days)
             start = end - pd.Timedelta(days=policy["history_days"])
             window = group[(group[CANONICAL_TIME_COLUMN] >= start) & (group[CANONICAL_TIME_COLUMN] < end)]
             timestamps = pd.DatetimeIndex(window[CANONICAL_TIME_COLUMN])
@@ -147,6 +149,16 @@ def _build_report(dataset: CanonicalDataset, policy: dict[str, Any]) -> dict[str
                 price["minimum"] is not None and price["minimum"] <= 0
             ):
                 window_reasons.append("invalid_training_energy_price")
+            if holdout_days:
+                calibration = group[(group[CANONICAL_TIME_COLUMN] >= end) &
+                                    (group[CANONICAL_TIME_COLUMN] < pd.Timestamp(origin))]
+                if not pd.DatetimeIndex(calibration[CANONICAL_TIME_COLUMN]).equals(
+                    pd.date_range(end, periods=holdout_days * 24, freq="h")
+                ):
+                    window_reasons.append("incomplete_calibration_window")
+                values = pd.to_numeric(calibration[CANONICAL_LOAD_COLUMN], errors="coerce").to_numpy(dtype=float)
+                if not np.isfinite(values).all() or (values < 0).any():
+                    window_reasons.append("invalid_calibration_load")
             training_windows.append({
                 "forecast_origin": origin,
                 "start": start.isoformat(), "end_exclusive": end.isoformat(),

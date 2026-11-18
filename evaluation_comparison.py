@@ -14,7 +14,7 @@ from numbers import Integral, Real
 from typing import Any
 
 from usage import cache_usage_fields, summarize_cache_usage
-from evaluation_artifacts import canonical_forecast_parameters, normalize_evaluation_fields, signature
+from evaluation_artifacts import bias_metadata, canonical_forecast_parameters, normalize_evaluation_fields, signature
 
 
 TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
@@ -44,7 +44,7 @@ def _json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
 
-def _identity(run: dict[str, Any]) -> tuple[str, str, str, tuple[str, ...]] | None:
+def _identity(run: dict[str, Any]) -> tuple[str, str, str, tuple[str, ...], bool | str, int | str] | None:
     fields = [run.get(name) for name in ("dataset_identity", "forecast_origin", "backend")]
     zones = run.get("zone_ids")
     if not all(isinstance(value, str) and value for value in fields):
@@ -53,11 +53,12 @@ def _identity(run: dict[str, Any]) -> tuple[str, str, str, tuple[str, ...]] | No
         return None
     if len(set(zones)) != len(zones):
         return None
-    return (*fields, tuple(sorted(zones)))
+    return (*fields, tuple(sorted(zones)), run.get("validation_bias", "unknown"), run.get("validation_days", "unknown"))
 
 
-def _metadata(key: tuple[str, str, str, tuple[str, ...]]) -> dict[str, Any]:
-    return dict(zip(("dataset_identity", "forecast_origin", "backend", "zone_ids"), (*key[:3], list(key[3]))))
+def _metadata(key: tuple[str, str, str, tuple[str, ...], bool | str, int | str]) -> dict[str, Any]:
+    return {"dataset_identity": key[0], "forecast_origin": key[1], "backend": key[2],
+            "zone_ids": list(key[3]), "validation_bias": key[4], "validation_days": key[5]}
 
 
 def _unknown_fields(run: dict[str, Any]) -> list[str]:
@@ -133,6 +134,7 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
             pair["left_batch"], pair["right_batch"], pair["dataset_identity"],
             pair["backend"], pair["agent_mode"], left.get("price_unit"), right.get("price_unit"),
             left.get("model_set_id", "legacy_unknown"), right.get("model_set_id", "legacy_unknown"),
+            pair["validation_bias"], pair["validation_days"],
         )
         grouped[key].append(pair)
     summaries = []
@@ -156,6 +158,7 @@ def _paired_summaries(pairs: list[dict[str, Any]], by_id: dict[str, dict[str, An
             "price_unit": key[5] if units_agree else None,
             "left_price_unit": key[5], "right_price_unit": key[6],
             "left_model_set_id": key[7], "right_model_set_id": key[8],
+            "validation_bias": key[9], "validation_days": key[10],
             "pair_count": len(records), "left": left, "right": right, "delta": delta,
             "delta_direction": "right_minus_left",
         })
@@ -174,6 +177,8 @@ def build_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
     for run in runs:
         if isinstance(run.get("forecast_parameters"), dict):
             run["forecast_parameters"] = canonical_forecast_parameters(run["forecast_parameters"])
+            if "validation_bias" in run["forecast_parameters"]:
+                run.update(bias_metadata(run["forecast_parameters"]))
             model_ids = run["forecast_parameters"].get("model_ids")
             if model_ids:
                 run["model_set_id"] = signature(model_ids)
@@ -202,7 +207,7 @@ def build_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
         candidates[batch][key][mode].append(run)
     common = []
     for batch in sorted(batches):
-        for key, per_mode in sorted(candidates[batch].items()):
+        for key, per_mode in sorted(candidates[batch].items(), key=lambda item: _json(item[0])):
             base = {"scope": "within_batch", "batch": batch, **_metadata(key), "run_ids": sorted(run["run_id"] for group in per_mode.values() for run in group)}
             missing_modes = sorted(modes[batch] - per_mode.keys())
             ambiguous = {mode: sorted(run["run_id"] for run in group) for mode, group in per_mode.items() if len(group) != 1}
@@ -217,7 +222,7 @@ def build_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
                 audit.append({**base, "status": status, **details})
     pairs = []
     for left_batch, right_batch in combinations(sorted(batches), 2):
-        for key in sorted(candidates[left_batch].keys() | candidates[right_batch].keys()):
+        for key in sorted(candidates[left_batch].keys() | candidates[right_batch].keys(), key=_json):
             left_modes, right_modes = candidates[left_batch].get(key, {}), candidates[right_batch].get(key, {})
             for mode in sorted(left_modes.keys() | right_modes.keys()):
                 left, right = left_modes.get(mode, []), right_modes.get(mode, [])

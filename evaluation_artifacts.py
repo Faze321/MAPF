@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from numbers import Real
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +17,9 @@ THRESHOLD_FIELDS = (
     "low_medium_threshold_pct", "medium_high_threshold_pct",
     "load_3h_low_medium_threshold_kwh", "load_3h_medium_high_threshold_kwh",
 )
+
+# Switch-only artifacts used a fixed seven-day calibration window.
+LEGACY_VALIDATION_BIAS_DAYS = 7
 
 
 def read_json(path: Path) -> Any:
@@ -69,7 +73,7 @@ def canonical_forecast_parameters(raw: dict[str, Any]) -> dict[str, Any]:
         parameters["diurnal_blend_alpha"] = round(float(parameters["diurnal_blend_alpha"]), 6)
     prefixes = ("timesfm_", "chronos_", "lstm_", "xgboost_", "ar_")
     for key in list(parameters):
-        if key in ("forecast_starts", "forecast_start_count", "forecast_models", "diurnal_blend_alphas") or key.endswith("_diurnal_blend_alphas"):
+        if key in ("forecast_starts", "forecast_start_count", "forecast_models", "diurnal_blend_alphas", "validation_bias_by_dataset") or key.endswith("_diurnal_blend_alphas"):
             parameters.pop(key)
         elif backend and key.startswith(prefixes) and not key.startswith(f"{base_backend(backend)}_"):
             parameters.pop(key)
@@ -77,12 +81,38 @@ def canonical_forecast_parameters(raw: dict[str, Any]) -> dict[str, Any]:
             parameters.pop(key)
         elif key.endswith("_roll_actuals") and parameters[key] is False:
             parameters.pop(key)
-    # Old artifacts cannot establish the new multi-day calibration protocol.
-    parameters.setdefault("calibration_method", "legacy_unknown")
+    if "validation_bias" in parameters and not isinstance(parameters["validation_bias"], bool):
+        raise ValueError("Invalid validation_bias in forecast parameters")
+    if "validation_days" in parameters:
+        days = _recorded_validation_days(parameters["validation_days"])
+        enabled = days > 0
+        if parameters.get("validation_bias", enabled) != enabled:
+            raise ValueError("Conflicting validation_bias and validation_days")
+        parameters["validation_bias"] = enabled
+        parameters["validation_days"] = days
+    if "validation_bias" in parameters:
+        if parameters["validation_bias"]:
+            parameters.setdefault("validation_days", LEGACY_VALIDATION_BIAS_DAYS)
+        else:
+            parameters.pop("validation_days", None)
     if "model_ids" in parameters:
         parameters["model_ids"] = {str(zone): str(model_id) for zone, model_id in
                                    sorted((parameters["model_ids"] or {}).items(), key=lambda item: str(item[0]))}
     return parameters
+
+
+def _recorded_validation_days(value: Any) -> int:
+    if (isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value)
+            or value < 0 or int(value) != value):
+        raise ValueError(f"Invalid validation_days in saved results: {value!r}")
+    return int(value)
+
+
+def bias_metadata(parameters: dict[str, Any]) -> dict[str, Any]:
+    """Expose the effective window from canonical parameters, retaining unknown provenance."""
+    enabled = parameters.get("validation_bias", "unknown")
+    return {"validation_bias": enabled,
+            "validation_days": parameters.get("validation_days", 0 if enabled is False else "unknown")}
 
 
 def clean_json(value: Any) -> Any:
@@ -151,6 +181,22 @@ def load_forecast_context(directory: Path) -> dict:
     metrics = normalize_evaluation_columns(pd.read_csv(metrics_path, dtype={"zone_id": str})) if metrics_path.exists() else pd.DataFrame()
     raw_parameters = dict(manifest.get("forecast_parameters") or {})
     metadata = dataset_metadata(manifest)
+    # Manifest v8 was produced exclusively by the no-calibration forecaster.
+    if manifest.get("schema_version") == 8:
+        raw_parameters.setdefault("validation_bias", False)
+    for source, key in ((metrics, "calibration_enabled"), (metrics, "validation_bias"), (frame, "validation_bias")):
+        if key not in source:
+            continue
+        flags = source[key].dropna().unique().tolist()
+        if any(not isinstance(flag, bool) for flag in flags) or len(flags) > 1:
+            raise ValueError(f"Invalid or mixed {key} in {directory}")
+        if flags and raw_parameters.setdefault("validation_bias", flags[0]) != flags[0]:
+            raise ValueError(f"Conflicting validation_bias provenance in {directory}")
+    for source in (metrics, frame):
+        if "validation_days" in source:
+            days = [_recorded_validation_days(value) for value in source["validation_days"].dropna().unique().tolist()]
+            if len(days) > 1 or (days and raw_parameters.setdefault("validation_days", days[0]) != days[0]):
+                raise ValueError(f"Conflicting validation_days provenance in {directory}")
     for key in ("backend", "diurnal_blend_alpha", "calibration_method", "forecast_origin"):
         unique = metrics[key].dropna().unique() if key in metrics else []
         if len(unique) > 1:
@@ -179,6 +225,7 @@ def load_forecast_context(directory: Path) -> dict:
         frame["model_id"] = frame["zone_id"].map(model_ids).fillna("legacy_unknown")
     for key in ("backend", "diurnal_blend_alpha"):
         metadata[key] = str(parameters.get(key, "unknown"))
+    metadata.update(bias_metadata(parameters))
     metadata["forecast_origin"] = timestamp(parameters.get("forecast_origin"))
     if "zone_id" in frame:
         provenance = manifest.get("model_provenance") or {}
@@ -271,6 +318,10 @@ def pairing_metadata(control: dict, context: dict | None) -> dict:
                     and covered and not selected.duplicated(["zone_id", "time"]).any()):
                 hourly_signature = signature(selected.to_dict("records"))
     parameters = dict((context or {}).get("parameters", {}))
+    for key in ("validation_bias", "validation_days"):
+        if key in control and parameters.setdefault(key, control[key]) != control[key]:
+            raise ValueError(f"Control and forecast artifacts use different {key} settings")
+    parameters = canonical_forecast_parameters(parameters)
     model_ids = {str(zone): str(model_id) for zone, model_id in (control.get("model_ids") or {}).items()}
     for zone in control.get("zones", []):
         if zone.get("model_id"):

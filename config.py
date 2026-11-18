@@ -21,6 +21,7 @@ BACKEND_PARAMETER_NAMES = (
 
 BACKEND_BLEND_PARAMETER_NAMES = tuple(f"{backend.lower()}_diurnal_blend_alphas" for backend in FORECAST_BACKENDS)
 CALIBRATION_METHOD = "daily_hour_mean_v1"
+VALIDATION_BIAS_DAYS = 7
 
 
 def reject_retired_forecast_settings(settings: dict[str, Any]) -> None:
@@ -71,6 +72,18 @@ def positive_integer(value: Any, key: str) -> int:
     return value
 
 
+def strict_bool(value: Any, key: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be true or false")
+    return value
+
+
+def validation_bias_days(enabled: bool, validation_days: int = VALIDATION_BIAS_DAYS) -> int:
+    """Return the historical holdout required by the forecast bias switch."""
+    days = positive_integer(validation_days, "validation_days")
+    return days if strict_bool(enabled, "validation_bias") else 0
+
+
 def dataset_path_key(path: str | Path) -> str:
     """Match dataset folders consistently for relative paths and batch child processes."""
     return os.path.normcase(str(Path(path).resolve()))
@@ -89,20 +102,29 @@ def normalize_data_dirs(value: Any) -> str | list[str]:
     return paths if isinstance(value, list) else paths[0]
 
 
-def normalize_experiment_zone_counts(value: Any) -> dict[str, int]:
+_DatasetValue = TypeVar("_DatasetValue")
+
+
+def normalize_dataset_overrides(
+    value: Any, name: str, validate: Callable[[Any, str], _DatasetValue],
+) -> dict[str, _DatasetValue]:
     if value is None:
         return {}
     if not isinstance(value, dict):
-        raise ValueError("run.experiment_zone_counts must map dataset folder paths to positive integers")
-    counts = {}
-    for folder, count in value.items():
+        raise ValueError(f"run.{name} must be a mapping keyed by dataset folder paths")
+    overrides = {}
+    for folder, setting in value.items():
         if not isinstance(folder, str) or not folder.strip():
-            raise ValueError("run.experiment_zone_counts keys must be non-empty dataset folder paths")
+            raise ValueError(f"run.{name} keys must be non-empty dataset folder paths")
         key = dataset_path_key(folder.strip())
-        if key in counts:
-            raise ValueError(f"run.experiment_zone_counts contains duplicate dataset folder: {folder}")
-        counts[key] = positive_integer(count, f"run.experiment_zone_counts[{folder}]")
-    return counts
+        if key in overrides:
+            raise ValueError(f"run.{name} contains duplicate dataset folder: {folder}")
+        overrides[key] = validate(setting, f"run.{name}[{folder}]")
+    return overrides
+
+
+def normalize_experiment_zone_counts(value: Any) -> dict[str, int]:
+    return normalize_dataset_overrides(value, "experiment_zone_counts", positive_integer)
 
 _ENV_REF_RE = re.compile(r"""
                          \$\{(?P<braced>[A-Za-z_][A-Za-z0-9_]*)\} 
@@ -162,7 +184,9 @@ class RunConfig:
     max_poi_rows: int | None = None
     horizon_days: int = 1
     history_days: int = 35
-    validation_days: int = 7
+    validation_bias: bool = False
+    validation_days: int = VALIDATION_BIAS_DAYS
+    validation_bias_by_dataset: dict[str, bool] = field(default_factory=dict)
     zone_ids: list[str] | None = None
     experiment_zone_count: int = 12
     experiment_zone_counts: dict[str, int] = field(default_factory=dict)
@@ -199,6 +223,9 @@ class RunConfig:
     def zone_count_for(self, data_dir: str | Path) -> int:
         return self.experiment_zone_counts.get(dataset_path_key(data_dir), self.experiment_zone_count)
 
+    def validation_bias_for(self, data_dir: str | Path) -> bool:
+        return self.validation_bias_by_dataset.get(dataset_path_key(data_dir), self.validation_bias)
+
     @classmethod
     def from_mapping(cls, raw: dict[str, Any] | None) -> "RunConfig":
         settings = raw or {}
@@ -220,7 +247,6 @@ class RunConfig:
             (optional_int, (
                 "horizon_days",
                 "history_days",
-                "validation_days",
                 "experiment_zone_count",
                 "experiment_zone_seed",
                 "timesfm_context_hours",
@@ -236,6 +262,11 @@ class RunConfig:
         return cls(
             **numeric_settings,
             data_dir=normalize_data_dirs(settings.get("data_dir")),
+            validation_bias=strict_bool(settings.get("validation_bias", defaults.validation_bias), "run.validation_bias"),
+            validation_days=positive_integer(settings.get("validation_days", defaults.validation_days), "run.validation_days"),
+            validation_bias_by_dataset=normalize_dataset_overrides(
+                settings.get("validation_bias_by_dataset"), "validation_bias_by_dataset", strict_bool,
+            ),
             experiment_zone_counts=normalize_experiment_zone_counts(settings.get("experiment_zone_counts")),
             max_parallel_datasets=positive_integer(settings.get("max_parallel_datasets", 2), "run.max_parallel_datasets"),
             max_dataset_errors=positive_integer(

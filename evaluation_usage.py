@@ -346,7 +346,7 @@ def build_usage_tables(calls: list[dict[str, Any]], rounds: list[dict[str, Any]]
         "tokens_by_mode_round": (*_CONTEXT, "attempt"),
     }
     for name, keys in aggregate_groups.items():
-        keys += model_dimensions
+        keys += ("validation_bias", "validation_days", *model_dimensions)
         call_groups = _group(calls, keys)
         tables[name] = [{**dict(zip(keys, key)), **_group_summary(group, aggregated=True, calls=call_groups.get(key, []))}
                         for key, group in sorted(_group(rounds, keys).items(), key=lambda item: str(item[0]))]
@@ -358,7 +358,7 @@ def build_usage_tables(calls: list[dict[str, Any]], rounds: list[dict[str, Any]]
         "usage_by_repair": (*_CONTEXT, "is_repair"),
     }
     for name, keys in detail_groups.items():
-        keys += model_dimensions
+        keys += ("validation_bias", "validation_days", *model_dimensions)
         tables[name] = [{**dict(zip(keys, key)), **_group_summary(group, aggregated=False)}
                         for key, group in sorted(_group(calls, keys).items(), key=lambda item: str(item[0]))]
     return tables

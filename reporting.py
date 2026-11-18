@@ -584,6 +584,7 @@ def write_control_outputs(
         "result_type": "forecaster_agent_control",
         "status": global_status,
         "forecast_origin": metadata.get("forecast_origin"),
+        **{key: metadata[key] for key in ("validation_bias", "validation_days") if key in metadata},
         "backend": backend,
         "agent_mode": agent_mode,
         "dataset_fingerprint": metadata.get("dataset_fingerprint"),
@@ -964,8 +965,13 @@ def write_forecast_outputs(
     for zone_id, result in forecast_results.items():
         safe_zone = safe_filename(zone_id)
         hourly = result.hourly.copy()
+        calibration = result.summary.get("calibration") or {}
+        validation_bias = result.summary.get("validation_bias", calibration.get("enabled", False))
+        validation_days = calibration["validation_days"] if validation_bias else 0
         hourly.insert(0, "zone_id", zone_id)
         hourly.insert(1, "category", result.summary.get("category"))
+        hourly["validation_bias"] = validation_bias
+        hourly["validation_days"] = validation_days
         for key in MODEL_PROVENANCE_FIELDS:
             if key in result.summary:
                 hourly[key] = result.summary[key]
@@ -987,10 +993,10 @@ def write_forecast_outputs(
                 "category": result.summary.get("category"),
                 "backend": result.summary.get("backend"),
                 "diurnal_blend_alpha": result.summary.get("diurnal_blend_alpha"),
-                "calibration_enabled": (result.summary.get("calibration") or {}).get("enabled"),
-                "calibration_method": (result.summary.get("calibration") or {}).get("method"),
-                "bias_mean": (result.summary.get("calibration") or {}).get("bias_mean"),
-                "bias_max_abs": (result.summary.get("calibration") or {}).get("bias_max_abs"),
+                "validation_bias": validation_bias,
+                "validation_days": validation_days,
+                **({"calibration_method": calibration["method"], "bias_mean": calibration["bias_mean"],
+                    "bias_max_abs": calibration["bias_max_abs"]} if calibration.get("enabled") else {}),
                 "forecast_origin": result.summary.get("forecast_origin"),
                 "forecast_end": result.summary.get("forecast_end"),
                 "n": metrics.get("n"),

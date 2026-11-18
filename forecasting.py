@@ -7,7 +7,7 @@ from typing import Any, Callable
 import numpy as np
 import pandas as pd
 
-from config import CALIBRATION_METHOD, normalize_forecast_model_name
+from config import CALIBRATION_METHOD, VALIDATION_BIAS_DAYS, normalize_forecast_model_name, validation_bias_days
 from training_config import FORECAST_BACKENDS, LORA_BACKENDS, TRAINABLE_BACKENDS, base_backend
 
 
@@ -40,7 +40,8 @@ def forecast_zone(
     forecast_origin: pd.Timestamp | None,
     horizon_days: int = 1,
     history_days: int = 35,
-    validation_days: int = 7,
+    validation_bias: bool = False,
+    validation_days: int = VALIDATION_BIAS_DAYS,
     backend: str = "timesfm",
     diurnal_blend_alpha: float = 0.0,
     timesfm_repo: str = "google/timesfm-2.5-200m-pytorch",
@@ -55,9 +56,9 @@ def forecast_zone(
 ) -> ForecastResult:
     timesfm_exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if timesfm_exog_cols is None else timesfm_exog_cols)
     chronos_exog_cols = list(DEFAULT_TIMESFM_EXOG_COLS if chronos_exog_cols is None else chronos_exog_cols)
-    for name, value, minimum in (("history_days", history_days, 1), ("validation_days", validation_days, 0), ("horizon_days", horizon_days, 1)):
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            raise ValueError(f"{name} must be an integer >= {minimum}")
+    for name, value in (("history_days", history_days), ("horizon_days", horizon_days)):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{name} must be an integer >= 1")
     zone_id = str(zone_id)
     normalized_model = normalize_forecast_model_name(backend)
     model_family = base_backend(normalized_model)
@@ -76,28 +77,30 @@ def forecast_zone(
         forecast_origin = load["time"].max() - pd.Timedelta(hours=horizon_hours - 1)
     forecast_origin = pd.Timestamp(forecast_origin)
     forecast_end = forecast_origin + pd.Timedelta(hours=horizon_hours - 1)
-    validation_hours = max(0, int(validation_days) * 24)
-    validation_start = forecast_origin - pd.Timedelta(hours=validation_hours) if validation_hours else forecast_origin
+    validation_hours = validation_bias_days(validation_bias, validation_days) * 24
+    validation_start = forecast_origin - pd.Timedelta(hours=validation_hours)
     validation_end = forecast_origin - pd.Timedelta(hours=1)
     history_start = validation_start - pd.Timedelta(days=history_days)
     history_end = validation_start - pd.Timedelta(hours=1)
 
     zone_frame = build_zone_model_frame(load, service_price, energy_price, occupancy, weather, zone_id)
     history = zone_frame[(zone_frame["time"] >= history_start) & (zone_frame["time"] <= history_end)]
-    validation = zone_frame[(zone_frame["time"] >= validation_start) & (zone_frame["time"] <= validation_end)]
+    validation = zone_frame[zone_frame["time"].between(validation_start, validation_end)] if validation_bias else None
     forecast_features = zone_frame[(zone_frame["time"] >= forecast_origin) & (zone_frame["time"] <= forecast_end)].copy()
-    if len(history) != history_days * 24 or len(validation) != validation_hours:
-        raise ValueError(f"Zone {zone_id} requires complete history and validation windows")
+    if len(history) != history_days * 24:
+        raise ValueError(f"Zone {zone_id} requires a complete history window of {history_days * 24} hours")
     future_times = pd.date_range(forecast_origin, periods=horizon_hours, freq="h")
     forecast_features = forecast_features.set_index("time").reindex(future_times).rename_axis("time").reset_index()
 
     hourly = forecast_load(
         history,
-        validation,
-        zone_frame,
+        forecast_features,
         forecast_origin,
         horizon_hours,
         backend=backend,
+        validation_bias=validation_bias,
+        validation_days=validation_days,
+        validation=validation,
         diurnal_blend_alpha=diurnal_blend_alpha,
         timesfm_repo=timesfm_repo,
         timesfm_context_hours=timesfm_context_hours,
@@ -153,15 +156,13 @@ def forecast_zone(
         "category": category,
         "history_start": history_start.isoformat(),
         "history_end": history_end.isoformat(),
-        "validation_start": validation_start.isoformat() if validation_hours else None,
-        "validation_end": validation_end.isoformat() if validation_hours else None,
+        "validation_bias": validation_bias,
         "forecast_origin": forecast_origin.isoformat(),
         "forecast_end": forecast_end.isoformat(),
         "forecast_horizon_days": int(horizon_days),
         "forecast_horizon_hours": int(horizon_hours),
         "backend": normalized_model,
         "diurnal_blend_alpha": float(diurnal_blend_alpha),
-        "calibration_method": CALIBRATION_METHOD,
         "timesfm_repo": timesfm_repo if model_family == "timesfm" else None,
         "timesfm_context_hours": int(timesfm_context_hours) if model_family == "timesfm" else None,
         "timesfm_covariates": timesfm_exog_cols if model_family == "timesfm" else None,
@@ -172,7 +173,6 @@ def forecast_zone(
         else None,
         "chronos_device": chronos_device if normalized_model.startswith("chronos") else None,
         "energy_price_adjustment": forecast_attrs.get("energy_price_adjustment"),
-        "calibration": forecast_attrs.get("calibration"),
         "forecast_total_kwh": round(forecast_total, 2),
         "forecast_peak_kwh": round(forecast_peak, 2),
         "predicted_change_pct": round(predicted_change_pct, 2),
@@ -200,6 +200,12 @@ def forecast_zone(
         if not key.startswith(("timesfm_", "chronos_", "lstm_", "xgboost_", "ar_"))
         or key.startswith(model_family.lower() + "_")
     }
+    if validation_bias:
+        summary.update(
+            validation_days=validation_days, validation_start=validation_start.isoformat(),
+            validation_end=validation_end.isoformat(), calibration_method=CALIBRATION_METHOD,
+            calibration=forecast_attrs["calibration"],
+        )
     if model_reference is not None:
         overlap = training_overlap_mask(hourly["time"], model_reference)
         hourly["model_id"] = model_reference["model_id"]
@@ -221,7 +227,6 @@ def forecast_zone(
         "forecast_origin": forecast_origin.isoformat(),
         "horizon_hours": int(horizon_hours),
         "history": history.copy(),
-        "validation": validation.copy(),
         "known_future": known_future,
         "forecast_parameters": {
             "timesfm_repo": timesfm_repo,
@@ -239,8 +244,11 @@ def forecast_zone(
         if key.startswith(model_family.lower() + "_")
     }
     reusable_forecaster["forecast_parameters"].update(
-        diurnal_blend_alpha=float(diurnal_blend_alpha), calibration_method=CALIBRATION_METHOD,
+        diurnal_blend_alpha=float(diurnal_blend_alpha), validation_bias=validation_bias,
     )
+    if validation_bias:
+        reusable_forecaster["forecast_parameters"]["validation_days"] = validation_days
+        reusable_forecaster["validation"] = validation.copy()
     return ForecastResult(
         hourly=hourly,
         summary=summary,
@@ -250,12 +258,14 @@ def forecast_zone(
 
 def forecast_load(
     history: pd.DataFrame,
-    validation: pd.DataFrame,
     full_frame: pd.DataFrame,
     forecast_origin: pd.Timestamp,
     horizon_hours: int,
     *,
     backend: str,
+    validation_bias: bool = False,
+    validation_days: int = VALIDATION_BIAS_DAYS,
+    validation: pd.DataFrame | None = None,
     diurnal_blend_alpha: float = 0.0,
     timesfm_repo: str = 'google/timesfm-2.5-200m-pytorch',
     timesfm_context_hours: int = 840,
@@ -268,7 +278,7 @@ def forecast_load(
     model_reference: dict[str, Any] | None = None,
     raw_prediction_cache: dict | None = None,
 ) -> pd.DataFrame:
-    """Load frozen weights, calibrate daily forecasts, then predict the full horizon."""
+    """Forecast from frozen weights, optionally estimating hourly bias on held-out days."""
     parameters = {name: value for name, value in locals().copy().items()
                   if name.startswith(("timesfm_", "chronos_"))}
     backend = normalize_forecast_model_name(backend)
@@ -283,16 +293,22 @@ def forecast_load(
     if pd.isna(origin) or origin != origin.floor("h"):
         raise ValueError("forecast_origin must be a valid whole-hour timestamp")
     history = checked_hourly_history(history, "history")
-    validation = checked_hourly_history(validation, "validation", allow_empty=True)
+    expected_hours = validation_bias_days(validation_bias, validation_days) * 24
     history_hours = len(history)
     if history_hours < 24:
         raise ValueError("Forecasting requires at least 24 historical hours")
-    if len(validation) % 24:
-        raise ValueError("validation must contain complete 24-hour days")
-    past = pd.concat([history, validation], ignore_index=True)
-    expected_past = pd.date_range(end=origin - pd.Timedelta(hours=1), periods=len(past), freq="h")
-    if not pd.DatetimeIndex(past["time"]).equals(expected_past):
-        raise ValueError("history and validation must be consecutive hourly rows ending before forecast_origin")
+    if validation_bias:
+        if validation is None or len(validation) != expected_hours:
+            raise ValueError(f"Validation bias requires {expected_hours} complete hourly observations")
+        validation = checked_hourly_history(validation, "validation")
+        if validation["time"].iloc[-1] != origin - pd.Timedelta(hours=1):
+            raise ValueError("validation must end one hour before forecast_origin")
+    elif validation is not None:
+        raise ValueError("Validation observations require validation_bias=True")
+    if history["time"].iloc[-1] != origin - pd.Timedelta(hours=expected_hours + 1):
+        raise ValueError("history must end one hour before the validation window" if validation_bias
+                         else "history must end one hour before forecast_origin")
+    past = pd.concat([history, validation], ignore_index=True) if validation_bias else history
     future_times = pd.date_range(origin, periods=horizon_hours, freq="h")
     future_source = full_frame.copy()
     future_source["time"] = pd.to_datetime(future_source["time"])
@@ -304,24 +320,19 @@ def forecast_load(
 
     if fitted_state is not None:
         require_fitted_backend(fitted_state, backend)
-        if (fitted_state.get("calibration", {}).get("method") != CALIBRATION_METHOD
-                or pd.Timestamp(fitted_state.get("forecast_origin")) != origin
-                or fitted_state.get("history_hours") != history_hours
+        if (pd.Timestamp(fitted_state.get("forecast_origin")) != origin
+                or pd.Timestamp(fitted_state.get("history_start")) != history["time"].iloc[0]
                 or fitted_state.get("diurnal_blend_alpha") != alpha):
-            raise ValueError("Reusable forecaster state does not match the origin, history, alpha or calibration protocol")
-        bias = state_vector(fitted_state, "bias_vec")
-        if bias.shape != (24,) or not np.isfinite(bias).all():
-            raise ValueError("Reusable bias_vec must contain 24 finite hourly values")
+            raise ValueError("Reusable forecaster state does not match the origin, history or alpha")
+        check_validation_bias_state(fitted_state, validation_bias, validation_days)
         diurnal = state_diurnal_profile(fitted_state)
-        calibration = dict(fitted_state["calibration"])
     else:
         diurnal = build_diurnal_profile(history)
-        bias = np.zeros(24, dtype=np.float64)
 
     saved_reference = (fitted_state or {}).get("model_reference")
     if saved_reference is not None:
         if model_reference is not None and model_reference != saved_reference:
-            raise ValueError("Reusable calibration cannot be paired with a different model reference")
+            raise ValueError("Reusable forecaster state cannot be paired with a different model reference")
         model_reference = saved_reference
     if model_reference is not None:
         dimensions = model_reference.get("parameters", {})
@@ -333,80 +344,105 @@ def forecast_load(
     )
     if model_reference is not None and raw_prediction_cache is not None:
         predict_raw = cache_raw_predictions(predict_raw, model_reference, raw_prediction_cache)
-    if fitted_state is None:
-        validation_rows: list[dict[str, Any]] = []
-        residual_days = []
-        for day, offset in enumerate(range(0, len(validation), 24)):
-            day_frame = validation.iloc[offset:offset + 24].copy()
-            context = pd.concat([history, validation.iloc[:offset]], ignore_index=True).tail(history_hours)
-            day_covariates = day_frame.drop(columns=["actual_kwh", "load"], errors="ignore")
-            if model_reference is not None:
-                # A direct model always receives and returns its entire trained
-                # horizon. Daily bias uses only its first 24 offsets. Future
-                # covariates may cross T, but no future actual load is included.
-                known = pd.concat([history, validation, future_source], ignore_index=True)
-                known = known.drop(columns=["actual_kwh", "load"], errors="ignore").drop_duplicates("time", keep="last")
-                day_times = pd.date_range(day_frame["time"].iloc[0], periods=horizon_hours, freq="h")
-                day_covariates = known.set_index("time").reindex(day_times).rename_axis("time").reset_index()
-            raw_frame = predict_raw(context, day_covariates).iloc[:24].copy()
-            raw = checked_raw_prediction(raw_frame, day_frame["time"])
-            blended = blend_with_diurnal(raw, diurnal_for_times(day_frame["time"], diurnal), alpha)
-            actual = day_frame["actual_kwh"].to_numpy(dtype=np.float64)
-            residual = blended - actual
-            residual_days.append(residual)
-            for hour, timestamp in enumerate(day_frame["time"]):
-                validation_rows.append({
-                    "time": pd.Timestamp(timestamp).isoformat(), "validation_day": day + 1,
-                    "horizon_offset": hour, "raw_predicted_kwh": float(raw[hour]),
-                    "blended_predicted_kwh": float(blended[hour]), "actual_kwh": float(actual[hour]),
-                    "residual_kwh": float(residual[hour]),
-                })
-        days = len(residual_days)
-        half_width = np.nan
-        metrics = None
-        if days:
-            residual_matrix = np.asarray(residual_days, dtype=np.float64)
-            bias = residual_matrix.mean(axis=0)
-            # All validation days contribute, after the same hourly mean correction.
-            half_width = estimate_interval_half_width((residual_matrix - bias).ravel())
-            comparison = pd.DataFrame(validation_rows).rename(columns={"blended_predicted_kwh": "predicted_kwh"})
-            metrics = compute_forecast_metrics(comparison)
-        calibration = {
-            "method": CALIBRATION_METHOD, "enabled": bool(days), "validation_days": days,
-            "bias_by_hour": bias.tolist(), "samples_per_hour": [days] * 24,
-            "bias_mean": float(bias.mean()), "bias_max_abs": float(np.max(np.abs(bias))),
-            "interval_half_width": float(half_width) if np.isfinite(half_width) else None,
-            "metrics": metrics, "validation_predictions": validation_rows,
-        }
-        fitted_state = {
-            **model_state, "backend": backend, "forecast_origin": origin.isoformat(),
-            "history_hours": history_hours, "diurnal_blend_alpha": alpha,
-            "diurnal_by_hour": serialize_diurnal_profile(diurnal),
-            "bias_vec": bias.tolist(), "calibration": calibration,
-        }
-
+    calibration = None
+    if validation_bias:
+        calibration = fitted_state["calibration"] if fitted_state is not None else estimate_validation_bias(
+            predict_raw, past, history_hours, future, diurnal, alpha,
+            prediction_hours=horizon_hours if model_reference is not None else 24,
+        )
     result = predict_raw(past.tail(history_hours), future).copy()
     raw = checked_raw_prediction(result, future_times)
     blended = blend_with_diurnal(raw, diurnal_for_times(future_times, diurnal), alpha)
-    hourly_bias = bias[np.arange(horizon_hours) % 24]
-    point = np.clip(blended - hourly_bias, 0, None)
-    width = calibration.get("interval_half_width")
-    residual_q10, residual_q90 = deterministic_interval(point, np.nan if width is None else float(width))
+    point = blended
+    if calibration is not None:
+        hourly_bias = np.asarray(calibration["bias_by_hour"])[np.arange(horizon_hours) % 24]
+        point = np.clip(blended - hourly_bias, 0, None)
+        result["bias_kwh"] = hourly_bias
+        result["bias_corrected_kwh"] = point
+        result.attrs["calibration"] = calibration
     if "q10_kwh" in result and "q90_kwh" in result:
         q10, q90 = rebuild_quantile_interval(point, result["q10_kwh"], result["q90_kwh"])
+    else:
+        q10 = q90 = np.full(len(result), np.nan)
+    if calibration is not None and calibration["interval_half_width"] is not None:
+        residual_q10, residual_q90 = deterministic_interval(point, calibration["interval_half_width"])
         available = np.isfinite(q10) & np.isfinite(q90)
         q10, q90 = np.where(available, q10, residual_q10), np.where(available, q90, residual_q90)
-    else:
-        q10, q90 = residual_q10, residual_q90
     result["raw_predicted_kwh"] = raw
     result["blended_predicted_kwh"] = blended
-    result["bias_kwh"] = hourly_bias
-    result["bias_corrected_kwh"] = point
     result["predicted_kwh"] = point
     result["q10_kwh"], result["q50_kwh"], result["q90_kwh"] = q10, point, q90
-    result.attrs["calibration"] = calibration
-    result.attrs["reusable_forecaster_state"] = fitted_state
+    state = {
+        **model_state, "backend": backend, "forecast_origin": origin.isoformat(),
+        "history_start": history["time"].iloc[0].isoformat(), "diurnal_blend_alpha": alpha,
+        "diurnal_by_hour": serialize_diurnal_profile(diurnal), "validation_bias": validation_bias,
+    }
+    if calibration is not None:
+        state["calibration"] = calibration
+    result.attrs["reusable_forecaster_state"] = state
     return result
+
+
+def estimate_validation_bias(
+    predict_raw: Callable[[pd.DataFrame, pd.DataFrame], pd.DataFrame],
+    past: pd.DataFrame, history_hours: int, future: pd.DataFrame, diurnal: pd.Series, alpha: float,
+    *, prediction_hours: int,
+) -> dict[str, Any]:
+    """Average blended prediction errors by hourly offset across all held-out days."""
+    validation = past.iloc[history_hours:]
+    # Direct models need their full output window of known covariates at each
+    # validation origin; only its first day contributes observed residuals.
+    known = pd.concat([validation.drop(columns=["actual_kwh", "load"], errors="ignore"), future],
+                      ignore_index=True)
+    if prediction_hours < 24:
+        raise ValueError("Validation bias requires a model that can forecast a complete day")
+    audit = []
+    residual_days = []
+    for day, offset in enumerate(range(0, len(validation), 24), start=1):
+        context = past.iloc[offset:offset + history_hours]
+        actual_day = validation.iloc[offset:offset + 24]
+        covariates = known.iloc[offset:offset + prediction_hours]
+        raw = checked_raw_prediction(predict_raw(context, covariates).iloc[:24], actual_day["time"])
+        blended = blend_with_diurnal(raw, diurnal_for_times(actual_day["time"], diurnal), alpha)
+        actual = actual_day["actual_kwh"].to_numpy(dtype=np.float64)
+        residual = blended - actual
+        residual_days.append(residual)
+        for hour, timestamp in enumerate(actual_day["time"]):
+            audit.append({
+                "time": timestamp.isoformat(), "validation_day": day, "horizon_offset": hour,
+                "raw_predicted_kwh": float(raw[hour]), "blended_predicted_kwh": float(blended[hour]),
+                "actual_kwh": float(actual[hour]), "residual_kwh": float(residual[hour]),
+            })
+    residuals = np.stack(residual_days)
+    bias = residuals.mean(axis=0)
+    half_width = estimate_interval_half_width((residuals - bias).ravel())
+    return {
+        "method": CALIBRATION_METHOD, "enabled": True, "validation_days": len(residual_days),
+        "bias_by_hour": bias.tolist(), "samples_per_hour": [len(residual_days)] * 24,
+        "bias_mean": float(bias.mean()), "bias_max_abs": float(np.max(np.abs(bias))),
+        "interval_half_width": float(half_width) if np.isfinite(half_width) else None,
+        "metrics": compute_forecast_metrics(pd.DataFrame(audit).rename(columns={"blended_predicted_kwh": "predicted_kwh"})),
+        "validation_predictions": audit,
+    }
+
+
+def check_validation_bias_state(
+    state: dict[str, Any], enabled: bool, validation_days: int = VALIDATION_BIAS_DAYS,
+) -> None:
+    days = validation_bias_days(enabled, validation_days)
+    if state.get("validation_bias", False) is not enabled or ("calibration" in state) != enabled:
+        raise ValueError("Reusable validation bias state differs from the forecast settings")
+    if enabled:
+        calibration = state["calibration"]
+        if not isinstance(calibration, dict) or calibration.get("method") != CALIBRATION_METHOD or (
+                calibration.get("validation_days") != days or calibration.get("enabled") is not True):
+            raise ValueError(f"Reusable calibration must use the configured {days} validation days")
+        bias = np.asarray(calibration.get("bias_by_hour"), dtype=float)
+        if bias.shape != (24,) or not np.isfinite(bias).all():
+            raise ValueError("Reusable validation bias must contain 24 finite hourly values")
+        width = calibration.get("interval_half_width")
+        if width is not None and (not isinstance(width, (int, float)) or not np.isfinite(width) or width < 0):
+            raise ValueError("Reusable calibration interval half-width must be finite and non-negative")
 
 
 def training_overlap_mask(times, reference: dict[str, Any]) -> np.ndarray:
@@ -433,9 +469,7 @@ def cache_raw_predictions(predict, reference: dict[str, Any], cache: dict):
     return cached
 
 
-def checked_hourly_history(frame: pd.DataFrame, label: str, *, allow_empty: bool = False) -> pd.DataFrame:
-    if frame.empty and allow_empty:
-        return frame.copy()
+def checked_hourly_history(frame: pd.DataFrame, label: str) -> pd.DataFrame:
     if "time" not in frame or "actual_kwh" not in frame or frame.empty:
         raise ValueError(f"{label} must contain hourly time and actual_kwh values")
     result = frame.copy()
@@ -847,16 +881,6 @@ def align_vector(values: np.ndarray, target: int) -> np.ndarray:
     return np.concatenate([arr, np.repeat(arr[-1], target - len(arr))])
 
 
-def disabled_calibration(**extra: Any) -> dict[str, Any]:
-    return {
-        "enabled": False,
-        "bias_mean": 0.0,
-        "bias_max_abs": 0.0,
-        "metrics": None,
-        **extra,
-    }
-
-
 def require_fitted_backend(state: dict[str, Any], expected_backend: str) -> None:
     actual = str(state.get("backend") or "").strip().lower().replace("_", "-")
     expected = str(expected_backend).strip().lower().replace("_", "-")
@@ -865,15 +889,6 @@ def require_fitted_backend(state: dict[str, Any], expected_backend: str) -> None
             f"Reusable forecaster state belongs to {actual or 'an unknown backend'}, "
             f"not {expected}."
         )
-
-
-def state_vector(state: dict[str, Any], key: str) -> np.ndarray:
-    if key not in state:
-        raise ValueError(f"Reusable forecaster state is missing {key!r}.")
-    values = np.asarray(state[key], dtype=np.float64)
-    if values.ndim != 1:
-        raise ValueError(f"Reusable forecaster state {key!r} must be one-dimensional.")
-    return values
 
 
 def state_matrix(

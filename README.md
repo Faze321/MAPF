@@ -5,7 +5,7 @@ MAPF separates forecasting from price control and keeps forecast-period ground t
 ## Architecture
 
 1. **Dataset adapter and cache** converts UrbanEV, CHARGED, MP-EVData, or a mapped long-format dataset to a canonical schema. Reusable dataset features are stored in a separate directory for each dataset under `<project>/cache/`.
-2. **Offline models** train a separate LSTM and XGBoost for each available Zone from that Zone's full valid history. Forecasting reads these cached weights, calibrates each origin, and persists reusable inference state. Price proposals reuse the same model and bias.
+2. **Offline models** train a separate LSTM and XGBoost for each selected Zone. Forecasting reads the cached weights and saves the inference state for price proposals. Datasets with validation bias enabled also save an hourly correction for each origin.
 3. **Control engine** runs either Grid → Behaviour → Economist or a single Agent, proposes one energy price per continuous 3-hour window, reforecasts, and accepts a run only when every Zone/window is `Medium`.
 4. **Evaluation** is kept separate from the no-leakage handoff and authoritative control result.
 
@@ -557,10 +557,8 @@ for example, `--training-train-ratio 0.7 --training-validation-ratio 0.3`.
 Reports retain requested ratios, actual counts,
 and purged counts. Preprocessing uses only the training prefix. Each model fits
 once, stops early if validation no longer improves, and saves its best weights
-or trees. It is not refitted on validation data. This internal split is separate
-from the forecast's seven-day bias calibration. The supplied configuration
-uses a 90%/10% chronological training split; these ratios are unchanged by
-`run.validation_days`.
+or trees. The supplied configuration uses a 90%/10% chronological split for
+offline training. The forecast bias switch is independent of these ratios.
 
 Defaults are fixed: LSTM hidden size 32, one layer, batch size 64, learning rate
 0.001, and at most 100 epochs; XGBoost depth 3, learning rate 0.03, and at most
@@ -639,6 +637,7 @@ so replay uses the same base weights.
 ```yaml
 run:
   history_days: 35
+  validation_bias: false
   validation_days: 7
   horizon_days: 1
   forecast_models: [timesfm, timesfm_lora, chronos, chronos_lora]
@@ -712,16 +711,25 @@ model versions; the overall Agent inventory explicitly spans all versions.
 
 ## Forecast windows and daily bias calibration
 
-All seven backends use the same default forecast split: 35 days of history,
-7 days of validation, and 1 day of forecasting. The lengths remain configurable.
-For forecast origin `T`, the default history window is `[T-42d, T-7d)`,
-validation is `[T-7d, T)`, and the forecast is `[T, T+1d)`. LSTM, XGBoost and
+By default all seven backends use the 35 days immediately before the forecast
+origin `T` and predict one day, `[T, T+1d)`. Each dataset inherits
+`run.validation_bias` (default `false`). Override individual dataset folders in
+`run.validation_bias_by_dataset` using YAML booleans. Paths use the same
+relative/absolute matching as `experiment_zone_counts`. An explicit
+`--validation-bias` or `--no-validation-bias` overrides both settings for the invocation.
+
+Set `run.validation_days` to the number of complete days to use for calibration
+(a positive integer, default 7). `--validation-days` overrides the YAML value.
+For example, with `history_days: 35` and `validation_days: 3`, enabled datasets
+use `[T-38d, T-3d)` for the reference history and `[T-3d, T)` for calibration.
+Datasets with bias disabled use the full 35 days immediately before `T`.
+The final inference context always ends immediately before `T`. LSTM, XGBoost and
 both LoRA variants use `history_days * 24` input hours; original TimesFM/Chronos
 contexts default to the same 840 hours.
 
 LSTM, XGBoost and both LoRA variants load the Zone's offline weights without fitting at the forecast origin.
-AR estimates its price response from the history window. Validation evaluates seven
-separate 24-hour predictions. LSTM, XGBoost, `timesfm_lora` and `chronos_lora`
+AR estimates its price response from the history window. Each calibration day
+contributes one 24-hour prediction. LSTM, XGBoost, `timesfm_lora` and `chronos_lora`
 predict the full configured output window P each time and use its first 24 hours
 for calibration. Original TimesFM, Chronos and AR predict 24 hours per validation day.
 At each validation origin, context consists
@@ -732,13 +740,12 @@ scalers, the AR price response, and the history diurnal profile remain frozen.
 For each validation day, model predictions are blended once with the history
 diurnal profile. Their signed errors (`blended prediction - actual`) are averaged
 across validation days at each of the 24 horizon offsets. The final prediction
-is `max(0, blended prediction - bias[offset % 24])`. Thus the default produces
-24 biases from all 168 validation hours, rather than one scalar bias or a bias
-from only the first validation day. Saved calibration records include daily
+is `max(0, blended prediction - bias[offset % 24])`. Saved calibration records include daily
 predictions, hourly residuals, and the averaged bias vector.
 
-Incomplete or invalid validation load is an error. `validation_days: 0` disables
-calibration. A longer configured forecast repeats the 24-hour bias vector; it
+Incomplete or invalid calibration data is an error when the switch is on.
+With the switch off, the final forecast is the nonnegative diurnal blend. A
+longer calibrated forecast repeats the 24-hour bias vector; it
 never consumes forecast-period actual load. LSTM, XGBoost and both LoRA variants directly predict
 the entire configured horizon. The old `roll_actuals` and per-model
 `step_horizon` settings have been removed.
@@ -748,7 +755,12 @@ Configuration selects dates and models through plural keys, even for one run:
 ```yaml
 run:
   history_days: 35
+  validation_bias: false
   validation_days: 7
+  validation_bias_by_dataset:
+    data/UrbanEV: true
+    data/CHARGED/JHB: false
+    data/MP-EVData: true
   horizon_days: 1
   forecast_starts: null
   forecast_start_count: 2
@@ -777,21 +789,24 @@ python main.py --forecast-models lstm xgboost --diurnal-blend-alphas 0 0.5 --lst
 The matrix runs each backend only for its own effective alpha list. Independent
 models' alpha lists are not multiplied together. Every output path contains a
 `blend_<alpha>` component with the same precision as the configuration, including
-single-alpha runs. Single-run artifacts record the resolved scalar alpha and
-only that backend's inference parameters; changing an unrelated model's grid
-does not change their identity. Forecaster, Full, and Agent-only stages share
-the same path convention.
+single-alpha runs. Single-run artifacts record the resolved scalar alpha,
+the effective bias setting and that backend's inference parameters. Seven-day
+calibration uses `validation_bias/` immediately before `blend_<alpha>/`.
+Other lengths use a separate folder, for example `validation_bias_3d/` for three days.
+Use separate experiment names to retain both experiment-level summaries.
 
 The singular date/model configuration and CLI options are removed, as are the
 singular alpha configuration options. Deprecated inputs fail with a migration
 message instead of silently falling back. Python single-run APIs and new output
 fields use `forecast_origin` and `backend`. Offline evaluation accepts legacy
-field names at its reading boundary and writes the new names. Model artifacts
-use the new protocol and do not replay legacy calibration states.
+field names at its reading boundary and writes the new names.
 
-Native forecast artifacts now use schema 6 and Forecaster manifests use schema 7.
-Regenerate older forecast artifacts through the Forecaster or Full stage before
-Agent-only replay. LSTM/XGBoost offline weights remain at schema 2 and can be
+Native artifacts use schema 8 and Forecaster manifests use schema 10. Agent-only
+also reads manifest schema 9 (seven-day calibration or bias disabled) and the
+uncalibrated native schema 7 with manifest schema 8.
+Agent-only requires the effective calibration length to match the saved forecast, including
+when an explicit forecaster directory is supplied. For earlier artifacts, rerun
+Forecaster or Full. LSTM/XGBoost offline weights remain at schema 2 and can be
 reused when the cache location, training content and parameters match; this
 protocol change does not require `--force-train`. Old LoRA weights are not
 automatically migrated to the new backend identities.
@@ -819,11 +834,10 @@ Missing weather and other covariates remain NaN with missingness indicators. Tar
 cannot be selected as covariates. Future prices/weather must be available at
 the forecast origin, as with the other covariate forecasters.
 
-The model follows the shared daily bias-calibration protocol above. All P output
-hours are predicted directly; blending and correction happen once
-on the forecast output. The q10/q90 columns follow the empirical residual-width
-convention and are not learned quantiles. With no validation, bias is zero and
-interval bounds are unavailable.
+XGBoost predicts all P hours directly and applies the configured diurnal blend.
+With validation bias enabled, q10/q90 use the width estimated from
+hourly residuals across all configured calibration days. With the switch off,
+XGBoost supplies the point forecast and leaves q10/q90 empty.
 
 The weight cache stores the P regressors in a bundle using XGBoost's
 [JSON model format](https://xgboost.readthedocs.io/en/stable/tutorials/saving_model.html),

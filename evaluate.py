@@ -18,7 +18,7 @@ import pandas as pd
 
 from usage import cache_usage_fields, summarize_cache_usage
 from evaluation_artifacts import (
-    clean_json, dataset_metadata, find_forecast_context, load_forecast_context,
+    bias_metadata, clean_json, dataset_metadata, find_forecast_context, load_forecast_context,
     normalize_evaluation_fields, pairing_metadata, read_json, timestamp,
 )
 from evaluation_windows import extract_window_rounds, summarize_windows, build_window_tables
@@ -43,6 +43,7 @@ DEFINITIONS = {
     "cache": "Cached input tokens / all input tokens, pooled across calls; null when any cache count is unavailable. Independent of completion-token accounting.",
     "averages": "Calls/tokens per run and per Zone; tokens per call = pooled tokens / pooled calls. All runs, including failures, are included.",
     "forecast_deduplication": "Within each model/blend, identical samples with the same dataset, forecast parameters, Zone, time and predictions are counted once across copied Agent-mode outputs. Per-run metrics retain all rows.",
+    "validation_days": "Tables group by effective calibration days. Disabled runs use 0. Historical switch-only runs used 7 days when enabled. Missing provenance remains unknown.",
     "training_overlap": "training_overlap_sample_count counts forecast hours covered by the saved model's fitted data intervals. Temporal out-of-sample evaluation additionally requires forecast_origin >= model_training_end_exclusive; zero overlap alone is insufficient. Missing training provenance remains unknown.",
     "model_versions": "Known model_set_id values separate trained weight versions in forecast, Agent, window, usage and paired summary tables. Agent overall is an explicit inventory total across model sets, not a model performance group.",
     "medium_new": "Originally non-Medium and currently Medium; separate from adjacent entries and first-ever entries.",
@@ -290,7 +291,7 @@ def _forecast_summary(frame: pd.DataFrame) -> dict:
 def _ppt_tables(runs: list[dict], windows: list[dict], rounds: list[dict], common_ids: list[str]) -> dict:
     selected = set(common_ids)
     medium, entries, tokens = [], [], []
-    keys = ("batch", "agent_mode")
+    keys = ("batch", "agent_mode", "validation_bias", "validation_days")
     if any(run.get("model_set_id") not in (None, "legacy_unknown") for run in runs):
         keys += ("model_set_id",)
     for meta, group in _group_rows([r for r in runs if r["run_id"] in selected], keys):
@@ -389,6 +390,9 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
                         "run_id": f"{label}/{path.relative_to(root)}" if multiple else str(path.relative_to(root))}
                 analysis.update(meta)
                 analysis.update(pairing_metadata(raw, context))
+                policy = bias_metadata(analysis["forecast_parameters"])
+                meta.update(policy)
+                analysis.update(policy)
                 meta["model_set_id"] = analysis["model_set_id"]
                 analysis["pairing_ready"] &= meta["dataset_provenance_known"]
                 analysis["label_source"] = "user_supplied_batch_label" if multiple else "input_directory_name"
@@ -417,10 +421,12 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
         pooled = pd.concat(frames, ignore_index=True)
         keys = ["batch", "_forecast_identity", "zone_id", "time", "actual_kwh", "predicted_kwh"]
         unique = pooled.drop_duplicates(keys) if all(k in pooled for k in keys) else pooled
+        dataset_keys = ["batch", "dataset", "dataset_identity", "backend", "diurnal_blend_alpha",
+                        "validation_bias", "validation_days", "model_set_id"]
         dimensions = {
-            "forecast_by_dataset": ["batch", "dataset", "dataset_identity", "backend", "diurnal_blend_alpha", "model_set_id"],
-            "forecast_by_origin": ["batch", "dataset", "dataset_identity", "backend", "diurnal_blend_alpha", "model_set_id", "forecast_origin"],
-            "forecast_by_zone_origin": ["batch", "dataset", "dataset_identity", "backend", "diurnal_blend_alpha", "model_set_id", "forecast_origin", "zone_id", "model_id"],
+            "forecast_by_dataset": dataset_keys,
+            "forecast_by_origin": [*dataset_keys, "forecast_origin"],
+            "forecast_by_zone_origin": [*dataset_keys, "forecast_origin", "zone_id", "model_id"],
         }
         for name, dimensions_ in dimensions.items():
             rows = []
@@ -429,7 +435,7 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
                 rows.append({**dict(zip(dimensions_, key)), **_forecast_summary(group)})
             tables[name] = rows
         tables["ppt_forecast"] = tables["forecast_by_dataset"]
-        dimensions_ = ["batch", "backend", "diurnal_blend_alpha", "model_set_id"]
+        dimensions_ = ["batch", "backend", "diurnal_blend_alpha", "validation_bias", "validation_days", "model_set_id"]
         for key, group in pooled.groupby(dimensions_, dropna=False, sort=True):
             dedup = group.drop_duplicates(keys) if all(k in group for k in keys) else group
             meta = dict(zip(dimensions_, key))
@@ -448,18 +454,24 @@ def _evaluate_inputs(inputs: Mapping[str, Path | str], *, analyzer: AgentAnalyze
     tables["paired_runs"] = comparison["pairs"]
     tables["paired_summary"] = comparison["paired_summary"]
     tables["control_inventory"] = [{key: run.get(key) for key in
-        ("batch", "dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "run_id",
+        ("batch", "dataset", "dataset_identity", "backend", "agent_mode", "forecast_origin", "validation_bias", "validation_days", "run_id",
          "source_file", "zone_ids", "model_set_id", "model_ids", "pairing_ready", "label_source", "first_success", "final_success", "attempts_used")}
         for run in agent_runs]
     group_keys = ("batch", "backend", "agent_mode") if multiple else ("backend", "agent_mode")
+    group_keys += ("validation_bias", "validation_days")
     known_model_sets = sorted({run["model_set_id"] for run in agent_runs
                                if run.get("model_set_id") not in (None, "legacy_unknown")})
     if known_model_sets:
         group_keys += ("model_set_id",)
-    overall = summarize_agents(agent_runs)
+    policy_groups = list(_group_rows(agent_runs, ("validation_bias", "validation_days")))
+    if len(policy_groups) > 1:
+        overall = {"aggregation_scope": "inventory_across_validation_windows", "run_count": len(agent_runs),
+                   "by_validation_window": [{**policy, **summarize_agents(group)} for policy, group in policy_groups]}
+    else:
+        overall = summarize_agents(agent_runs)
     if known_model_sets:
-        overall.update(aggregation_scope="inventory_across_model_sets", model_set_ids=known_model_sets,
-                       model_set_count=len(known_model_sets))
+        overall.setdefault("aggregation_scope", "inventory_across_model_sets")
+        overall.update(model_set_ids=known_model_sets, model_set_count=len(known_model_sets))
     report = {
         "schema_version": 2, "input_dir": str(next(iter(roots.values()))) if not multiple else None,
         "inputs": {label: str(path) for label, path in roots.items()}, "definitions": DEFINITIONS,
@@ -490,6 +502,10 @@ def _markdown_table(rows: list[dict], columns: list[str] | None = None) -> str:
     columns = list(columns) if columns else list(dict.fromkeys(key for row in rows for key in row))
     if "model_set_id" not in columns and any(row.get("model_set_id") not in (None, "legacy_unknown") for row in rows):
         columns.insert(1, "model_set_id")
+    if "validation_bias" not in columns and any(isinstance(row.get("validation_bias"), bool) for row in rows):
+        columns.insert(1, "validation_bias")
+    if "validation_days" not in columns and any(isinstance(row.get("validation_days"), int) for row in rows):
+        columns.insert(columns.index("validation_bias") + 1 if "validation_bias" in columns else 1, "validation_days")
     def cell(value):
         if value is None:
             return "未知"
@@ -539,6 +555,10 @@ def render_evaluation_report(report: dict[str, Any]) -> str:
         for raw, record in zip(tables.get(name, []), records):
             if raw.get("model_set_id") not in (None, "legacy_unknown"):
                 record["模型版本集合"] = raw["model_set_id"]
+            if isinstance(raw.get("validation_bias"), bool):
+                record["预测偏差校正"] = raw["validation_bias"]
+                if "validation_days" in raw:
+                    record["校正天数"] = raw["validation_days"]
     sections = ["# 实验评估报告", "本报告离线读取保存结果；控制效果基于模型预测，未代表真实调价后的观测。",
                 "批次标签用于区分输入目录；旧结果未记录实际 LLM 型号时，标签不构成型号验证。",
                 f"读取 {len(report['agent']['runs'])} 个控制结果；同批模式共同样本包含 "
@@ -577,7 +597,7 @@ def render_evaluation_report(report: dict[str, Any]) -> str:
     sections.extend(["## 跨批配对比较", _markdown_table(paired),
                      "仅比较同模式、同预测参数、同区域时间范围，且基线价格、负荷、阈值与小时预测（包括已保存的小时电价）一致的完整运行。差值方向见表中标记；不混用两种和五种模式的总体均值。"])
     conclusions = []
-    ranking_keys = ("batch",)
+    ranking_keys = ("batch", "validation_bias", "validation_days")
     if any(row.get("model_set_id") not in (None, "legacy_unknown") for row in tables.get("ppt_medium", [])):
         ranking_keys += ("model_set_id",)
     for meta, rows in _group_rows(tables.get("ppt_medium", []), ranking_keys):
@@ -585,7 +605,10 @@ def render_evaluation_report(report: dict[str, Any]) -> str:
             best = max(row["final_medium"] for row in rows)
             names = "、".join(row["agent_mode"] for row in rows if row["final_medium"] == best)
             model_label = f"（模型版本集合 {meta['model_set_id']}）" if "model_set_id" in meta else ""
-            conclusions.append(f"- {meta['batch']}{model_label}：共同样本中 {names} 的最终 Medium 数量最多，为 {best}。")
+            enabled_label = (f"（{meta['validation_days']} 天偏差校正）" if isinstance(meta["validation_days"], int)
+                             else "（开启偏差校正）")
+            bias_label = {True: enabled_label, False: "（关闭偏差校正）"}.get(meta.get("validation_bias"), "")
+            conclusions.append(f"- {meta['batch']}{bias_label}{model_label}：共同样本中 {names} 的最终 Medium 数量最多，为 {best}。")
     if any(not row.get("cache_usage_complete") for row in usage):
         conclusions.append("- 部分批次缺少完整缓存统计，不能据此比较完整缓存命中数量或加速效果。")
     sections.extend(["## 数据覆盖与结论", "\n".join(conclusions) or "当前样本不足以生成模式排名。",

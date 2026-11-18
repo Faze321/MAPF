@@ -70,9 +70,14 @@ run:
   max_poi_rows: null
   forecast_starts: null # explicit dates override automatic selection
   forecast_start_count: 1 # 1: latest window; 2+: evenly spaced valid origins per dataset
-  horizon_days: 1 # forecast length; multi-day forecasts reuse the 24-hour bias pattern
+  horizon_days: 1 # forecast length in days
   history_days: 35 # model input window = 840 hours; each output window uses horizon_days
-  validation_days: 7 # seven-day prediction bias calibration; separate from offline training validation
+  validation_bias: false # default for datasets without an override
+  validation_days: 7 # complete days used for hourly bias when enabled
+  validation_bias_by_dataset: # example: enable hourly bias calibration only for MP-EVData
+    data/UrbanEV: false
+    data/CHARGED/JHB: false
+    data/MP-EVData: true
   forecast_models:
     - "timesfm"
     - "timesfm_lora"
@@ -138,7 +143,7 @@ run:
 # Train only selected sites; reuse weights across origins, alpha and Agent modes for the same H/P.
 training:
   train_ratio: 0.9 # chronological complete-window split; purge overlapping target windows
-  validation_ratio: 0.1 # separate from the seven-day bias calibration in run.validation_days
+  validation_ratio: 0.1 # fraction of offline training samples held out for early stopping
   min_history_days: 45
   min_samples: 512 # complete input + output windows before splitting
   sample_stride_hours: 1

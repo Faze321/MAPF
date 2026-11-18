@@ -297,7 +297,7 @@ def build_window_tables(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, 
     tables = {}
     model_dimensions = ("model_set_id",) if any(row.get("model_set_id") not in (None, "legacy_unknown") for row in rows) else ()
     for table_name, dimensions in control_groups.items():
-        keys = ("batch", *dimensions, *model_dimensions, "phase", "round")
+        keys = ("batch", *dimensions, "validation_bias", "validation_days", *model_dimensions, "phase", "round")
         grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
         for row in rows:
             grouped[tuple(row.get(key) for key in keys)].append(row)

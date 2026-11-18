@@ -3,17 +3,18 @@ from __future__ import annotations
 import json
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+from config import VALIDATION_BIAS_DAYS, validation_bias_days
 from training_config import FORECAST_BACKENDS, TRAINABLE_BACKENDS
 
 
 SCHEMA_VERSION = 1
-NATIVE_ARTIFACT_SCHEMA_VERSION = 6
+NATIVE_ARTIFACT_SCHEMA_VERSION = 8
 SUPPORTED_BACKENDS = {*FORECAST_BACKENDS, "chronos_2", "ar"}
 CORE_COLUMNS = {"timestamp", "time", "zone", "zone_id", "load", "actual_kwh", "energy_price", "e_price"}
 
@@ -40,8 +41,8 @@ class ForecasterArtifact:
     categorical_levels: dict[str, tuple[str, ...]]
     history_values: dict[str, tuple[float, ...]]
     history_timestamps: dict[str, tuple[str, ...]]
-    validation_bias: dict[str, tuple[float, ...]]
     forecast_origin: str
+    validation_bias: dict[str, tuple[float, ...]] = field(default_factory=dict)
     feature_schema_version: int = SCHEMA_VERSION
 
     def predict(
@@ -182,9 +183,9 @@ class GlobalForecaster:
         self.backend = backend
         self.ridge = float(ridge)
 
-    def fit(self, history: pd.DataFrame, validation: pd.DataFrame) -> ForecasterArtifact:
+    def fit(self, history: pd.DataFrame, validation: pd.DataFrame | None = None) -> ForecasterArtifact:
         train = canonicalize_long_frame(history, require_load=True)
-        valid = canonicalize_long_frame(validation, require_load=True)
+        valid = train.iloc[:0] if validation is None else canonicalize_long_frame(validation, require_load=True)
         if train.empty:
             raise ValueError("history must contain at least one row")
         forecast_origin = valid["timestamp"].min() if not valid.empty else train["timestamp"].max() + pd.Timedelta(hours=1)
@@ -226,12 +227,19 @@ class NativeForecasterArtifact:
     forecast_origin: str
     horizon_hours: int
     history: tuple[dict[str, Any], ...]
-    validation: tuple[dict[str, Any], ...]
     known_future: tuple[dict[str, Any], ...]
     forecast_parameters: dict[str, Any]
     fitted_state: dict[str, Any]
+    validation: tuple[dict[str, Any], ...] = ()
 
     def __post_init__(self) -> None:
+        from forecasting import check_validation_bias_state
+
+        enabled = self.forecast_parameters.get("validation_bias", False)
+        days = self.forecast_parameters.get("validation_days", VALIDATION_BIAS_DAYS)
+        if len(self.validation) != validation_bias_days(enabled, days) * 24:
+            raise ValueError("Native artifact validation history does not match its configured validation days")
+        check_validation_bias_state(self.fitted_state, enabled, days)
         if self.backend not in FORECAST_BACKENDS:
             raise ValueError(f"Unsupported native forecaster backend: {self.backend}")
         if self.fitted_state.get("backend") not in {None, self.backend}:
@@ -288,7 +296,7 @@ class NativeForecasterArtifact:
             forecast_origin=pd.Timestamp(reusable["forecast_origin"]).isoformat(),
             horizon_hours=int(reusable["horizon_hours"]),
             history=dataframe_records(reusable["history"]),
-            validation=dataframe_records(reusable["validation"]),
+            validation=dataframe_records(reusable["validation"]) if "validation" in reusable else (),
             known_future=dataframe_records(reusable["known_future"]),
             forecast_parameters=json_safe_mapping(reusable["forecast_parameters"]),
             fitted_state=json_safe_mapping(fitted_state),
@@ -300,7 +308,6 @@ class NativeForecasterArtifact:
         from forecasting import forecast_load
 
         history = records_dataframe(self.history)
-        validation = records_dataframe(self.validation)
         known_future = records_dataframe(self.known_future)
         if "time" not in known_future:
             raise ValueError("Reusable forecaster artifact has no future timestamps.")
@@ -327,16 +334,15 @@ class NativeForecasterArtifact:
             )
         known_future = known_future.drop(columns=["actual_kwh"], errors="ignore")
 
-        parameters = dict(self.forecast_parameters)
         hourly = forecast_load(
             history,
-            validation,
             known_future,
             pd.Timestamp(self.forecast_origin),
             self.horizon_hours,
             backend=self.backend,
-            **{key: value for key, value in parameters.items() if key != "calibration_method"},
+            validation=records_dataframe(self.validation) if self.validation else None,
             fitted_state=self.fitted_state,
+            **self.forecast_parameters,
         )
         output = hourly[["time", "predicted_kwh"]].copy()
         output = output.rename(
@@ -371,7 +377,8 @@ class NativeForecasterArtifact:
             "artifact_reused": True,
             "model_retrained": False,
             "approximation_used": False,
-            "calibration": dict(self.fitted_state.get("calibration") or {}),
+            "validation_bias": self.forecast_parameters.get("validation_bias", False),
+            **({"calibration": self.fitted_state["calibration"]} if self.validation else {}),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -379,15 +386,16 @@ class NativeForecasterArtifact:
             **self.metadata(),
             "horizon_hours": self.horizon_hours,
             "history": list(self.history),
-            "validation": list(self.validation),
+            **({"validation": list(self.validation)} if self.validation else {}),
             "known_future": list(self.known_future),
-            "forecast_parameters": self.forecast_parameters,
+            "forecast_parameters": {**self.forecast_parameters, "validation_bias": bool(self.validation)},
             "fitted_state": self.fitted_state,
         }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "NativeForecasterArtifact":
-        if payload.get("schema_version") != NATIVE_ARTIFACT_SCHEMA_VERSION:
+        schema = payload.get("schema_version")
+        if schema not in (7, NATIVE_ARTIFACT_SCHEMA_VERSION):
             raise ValueError(
                 "Unsupported native forecaster artifact schema version. "
                 "Run the forecaster stage again; legacy price-mapping artifacts "
@@ -395,15 +403,25 @@ class NativeForecasterArtifact:
             )
         if payload.get("artifact_type") != "native_backend_reforecast":
             raise ValueError("Forecaster artifact is not a native backend artifact.")
+        parameters = dict(payload["forecast_parameters"])
+        if schema == 7:
+            if payload.get("validation_bias", False) is not False or parameters.get("validation_bias", False) is not False:
+                raise ValueError("Schema 7 native artifacts only support forecasts without validation bias")
+            parameters["validation_bias"] = False
+        elif "validation_bias" not in parameters or payload.get("validation_bias") is not parameters["validation_bias"]:
+            raise ValueError("Native artifact metadata and forecast parameters disagree on validation bias")
+        if parameters["validation_bias"]:
+            # Earlier schema 8 artifacts always calibrated on seven days.
+            parameters.setdefault("validation_days", 7)
         return cls(
             zone=str(payload["zone"]),
             backend=str(payload["backend"]),
             forecast_origin=pd.Timestamp(payload["forecast_origin"]).isoformat(),
             horizon_hours=int(payload["horizon_hours"]),
             history=tuple(dict(row) for row in payload["history"]),
-            validation=tuple(dict(row) for row in payload["validation"]),
+            validation=tuple(dict(row) for row in payload.get("validation", ())),
             known_future=tuple(dict(row) for row in payload["known_future"]),
-            forecast_parameters=dict(payload["forecast_parameters"]),
+            forecast_parameters=parameters,
             fitted_state=dict(payload["fitted_state"]),
         )
 

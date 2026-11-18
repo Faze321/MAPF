@@ -17,6 +17,7 @@ from config import (
     normalize_int_list,
     normalize_pipeline_stage,
     normalize_string_list,
+    positive_integer,
 )
 from dataset_adapter import (DatasetSpec, default_forecast_start, evenly_spaced_forecast_starts,
                              load_canonical_dataset, resolve_dataset_spec)
@@ -139,7 +140,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--horizon-days", type=int, default=None, help="Forecast horizon.")
     parser.add_argument("--history-days", type=int, default=None, help="History input length in days; LSTM/XGBoost use the complete window.")
-    parser.add_argument("--validation-days", type=int, default=None, help="Validation window used for bias calibration.")
+    parser.add_argument("--validation-bias", action=argparse.BooleanOptionalAction, default=None,
+                        help="Override the per-dataset forecast bias switch.")
+    parser.add_argument("--validation-days", type=int, default=None,
+                        help="Number of complete days used when forecast bias is enabled.")
     parser.add_argument(
         "--zones",
         nargs="+",
@@ -202,6 +206,8 @@ def main(argv: list[str] | None = None):
     config_path = Path(args.config)
     app_config = AppConfig.from_file(config_path, required=False, load_agent=False)
     run_config = app_config.run
+    validation_days = (run_config.validation_days if args.validation_days is None
+                       else positive_integer(args.validation_days, "--validation-days"))
     data_config = app_config.data
     training_config = app_config.training
     training_policies = {name: getattr(args, "training_" + name) for name in
@@ -369,7 +375,9 @@ def main(argv: list[str] | None = None):
         "max_poi_rows": args.max_poi_rows if args.max_poi_rows is not None else run_config.max_poi_rows,
         "horizon_days": args.horizon_days if args.horizon_days is not None else run_config.horizon_days,
         "history_days": args.history_days if args.history_days is not None else run_config.history_days,
-        "validation_days": args.validation_days if args.validation_days is not None else run_config.validation_days,
+        "validation_days": validation_days,
+        "validation_bias": (args.validation_bias if args.validation_bias is not None
+                            else run_config.validation_bias_for(resolved_data_dir)),
         "zone_ids": args.zones if args.zones is not None else run_config.zone_ids,
         "experiment_zone_count": (
             args.experiment_zone_count
@@ -390,7 +398,8 @@ def main(argv: list[str] | None = None):
                     forecast_starts = evenly_spaced_forecast_starts(
                         dataset.timeseries, count=run_config.forecast_start_count,
                         history_days=common_kwargs["history_days"],
-                        validation_days=common_kwargs["validation_days"],
+                        validation_bias=common_kwargs["validation_bias"],
+                        validation_days=validation_days,
                         horizon_days=common_kwargs["horizon_days"], zone_ids=common_kwargs["zone_ids"],
                     )
                     del dataset

@@ -37,7 +37,12 @@ run:
   forecast_starts: null
   forecast_models: [timesfm]
   history_days: 35
+  validation_bias: false
   validation_days: 7
+  validation_bias_by_dataset:
+    data/UrbanEV: true
+    data/CHARGED/JHB: false
+    data/MP-EVData: true
   horizon_days: 1
   zones: null
 ```
@@ -58,10 +63,18 @@ run:
 
 `forecast_starts` 留空且 `forecast_start_count: 1`（默认）时，
 使用当前数据最后 `horizon_days` 天作为预测窗口。默认预测起点为 `T` 时，
-预测历史取 `[T-42天, T-7天)` 的 840 小时，Bias 验证取 `[T-7天, T)` 的 168 小时，
-正式预测 `[T, T+1天)` 的 24 小时。三个天数可以独立配置。
-每天验证只读取当天起点之前的真实历史，七日同一预测偏移小时的残差均值形成
-24 个 bias；调价重预测复用已保存模型及 bias。LSTM/XGBoost 及两种 LoRA 权重来自独立离线训练，
+默认使用 `[T-35天, T)` 的 840 小时历史，生成 `[T, T+1天)` 的 24 小时预测。
+默认关闭预测偏差校正。未在 `validation_bias_by_dataset` 中列出的目录继承
+`run.validation_bias`。目录键与 `run.data_dir` 一样支持相对和绝对路径，
+写入 YAML 布尔值 `true` 或 `false` 即可单独启用或关闭。
+命令行的 `--validation-bias` 和 `--no-validation-bias` 优先于目录和全局配置。
+
+`run.validation_days` 指定启用校正的数据集使用多少个完整日，取正整数，默认 7。
+例如设为 3，配合 35 天历史窗口时，历史参考窗口为 `[T-38天, T-3天)`，校准窗口为 `[T-3天, T)`。
+可用 `--validation-days 3` 临时覆盖配置。关闭校正的数据集直接使用预测前的 35 天。
+每个校准日只读取当天起点之前的真实负荷。所有校准日相同预测偏移的残差均值形成 24 个 bias。
+正式推理使用截至 T 前一小时的最近历史，调价重预测沿用已保存模型和校正值。
+LSTM/XGBoost 及两种 LoRA 权重来自独立离线训练，
 `history_days` 同时决定离线训练样本和预测的输入长度，`horizon_days` 决定直接输出长度。
 默认每个样本输入 840 小时、输出 24 小时；预测历史还用于固定日内均值曲线。
 每个验证日，LSTM、XGBoost、`timesfm_lora`、`chronos_lora` 先直接预测完整
@@ -131,7 +144,7 @@ run:
 不会补入恒定区域，也不会静默减少实验区域数。
 
 随机抽样同时要求负荷和 `energy_price` 非恒定。判定范围为该区域从数据开始至
-**最早预测起点减去 `validation_days`** 的全部历史，右端不包含，不使用验证或预测期数据。
+**最早预测起点** 的全部历史（右端不含）。开启预测偏差校正时，截止时间提前 `validation_days` 天。
 负荷或电价任意一项恒定都会被排除；常数比较使用 `rtol=1e-9`、`atol=1e-12`，
 容忍浮点计算误差。每个预测起点的 `history_days` 天上下文窗口还必须有完整、有效的小时数据。
 这是对早期历史中区域是否恒定的判断，不要求每个上下文窗口都发生变化；
@@ -149,7 +162,7 @@ run:
   forecast_start_count: 2
 ```
 
-程序按天筛选有效起点：起点之前必须包含 `history_days + validation_days` 天的
+程序按天筛选有效起点。起点之前必须包含 `history_days` 天（开启校正时额外 `validation_days` 天）的
 连续小时记录，之后必须包含完整的 `horizon_days` 天预测序列，再取候选日期中约 1/3 和 2/3
 位置的两个起点（均为 00:00）。这里的天数均按每天 24 小时计算。
 随机选区时，先按适配器转换后全部可用区域的共同覆盖范围筛选日期，再读取对应日期的
@@ -188,7 +201,7 @@ python main.py --stage train --forecast-models timesfm_lora chronos_lora
 删除输出标签触及验证起点的训练样本，记录实际训练/验证数量和删除数量。
 预处理只拟合训练前缀。模型仅训练一次，LSTM 按验证误差早停并恢复最佳权重；
 XGBoost 为 P 个输出小时分别训练和保存最佳树数。不会重新拟合验证数据。
-该内部验证与预测前默认 7 天的 Bias 校准相互独立。
+该内部验证独立于各数据集的预测偏差开关。
 
 固定默认值为 LSTM 隐藏大小 32、1 层、batch 64、学习率 0.001、最多 100 epochs；
 XGBoost 最大深度 3、每小时模型最多 800 棵树、学习率 0.03。没有自动参数档位。
@@ -229,7 +242,7 @@ run:
 
 每个文件夹用独立 Python 子进程，最多同时运行 `max_parallel_datasets` 个任务。
 各进程使用对应数据集及区域的训练覆盖配置；一个数据集内部依次执行模型/种子/模式矩阵。
-`pipeline_stage: train` 只准备离线权重；`forecaster` 生成预测及校准产物；`full` 执行完整闭环；
+`pipeline_stage: train` 只准备离线权重。`forecaster` 生成预测，开启校正的数据集还会保存校准记录。`full` 执行完整闭环。
 `dry_run: true` 使用确定性离线 Agent，不调用 API。
 单任务出错时其他任务继续执行，最终进程返回失败并在清单中记录各自退出码。
 
@@ -326,13 +339,17 @@ Agent-only 重放仍严格绑定原版本，原版本损坏时直接失败。
 重用模型时，将 `pipeline_stage` 从 `forecaster` 改为 `agent`，保持
 `output_folder`、`experiment_name` 和其他实验设置一致即可；单数据集和多数据集
 均按相同规则查找，无需再将 `output_folder` 指向某个时间批次目录。
-预测起点下的 `forecaster` 目录保存预测、Bias 和离线权重引用；多模式 `full` 阶段的这些产物
+七日校正的结果保存在 `blend_<alpha>/` 前的 `validation_bias/` 目录。
+其他天数单独建目录，例如三日校正使用 `validation_bias_3d/`。
+预测起点下的 `forecaster` 目录保存预测、所用校正参数和离线权重引用。多模式 `full` 阶段的这些产物
 位于各自模式目录，权重仍共用数据集缓存。Agent 阶段优先读取对应模式目录中的 `forecaster_manifest.json`，
 没有时再读取共享模型目录，支持这两种来源。
 使用单个 `data_dir` 时，可以通过 `forecaster_output_dir` 精确指定当前协议模型的
-`forecaster` 目录或 `forecaster_manifest.json` 文件。当前 Native 预测器产物为 schema 6，
-Forecaster manifest 为 schema 7；旧版本需通过 `forecaster` 或 `full` 阶段重新生成，
-再用于 Agent-only。LSTM/XGBoost 离线权重仍为 schema 2，缓存位置、训练内容及参数
+`forecaster` 目录或 `forecaster_manifest.json` 文件。当前 Native 预测器产物为 schema 8，
+Forecaster manifest 为 schema 10。Agent-only 也可读取 manifest 9 的七日校正或未校正产物，
+以及 native 7、manifest 8 的未校正产物。指定目录时，数据集的开关及启用时的天数须与产物一致。
+更早的版本需通过 `forecaster` 或 `full` 重新生成。
+LSTM/XGBoost 离线权重仍为 schema 2，缓存位置、训练内容及参数
 匹配时可直接复用，无需因此设置 `--force-train`。旧 LoRA 权重不自动迁移到新后端身份。
 历史结果字段兼容仅在离线评估读取边界处理。
 Agent 阶段校验适配器、数据目录和数据指纹，拒绝混用其他数据集的模型。

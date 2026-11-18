@@ -15,6 +15,7 @@ from typing import Any, Iterable
 import numpy as np
 import pandas as pd
 
+from config import VALIDATION_BIAS_DAYS, validation_bias_days
 from time_utils import normalize_datetime_series_24h
 
 
@@ -588,11 +589,12 @@ def default_forecast_start(spec: DatasetSpec, horizon_days: int) -> str:
 
 def evenly_spaced_forecast_starts(
     timeseries: pd.DataFrame, *, count: int, history_days: int,
-    validation_days: int, horizon_days: int, zone_ids: Iterable[str] | None = None,
+    horizon_days: int, zone_ids: Iterable[str] | None = None, validation_bias: bool = False,
+    validation_days: int = VALIDATION_BIAS_DAYS,
 ) -> list[str]:
     """Choose interior daily origins with complete hourly windows for every site."""
-    if count < 1 or history_days < 1 or validation_days < 0 or horizon_days < 1:
-        raise ValueError("Origin count, history and horizon must be positive; validation cannot be negative")
+    if count < 1 or history_days < 1 or horizon_days < 1:
+        raise ValueError("Origin count, history and horizon must be positive")
     frame = timeseries[[CANONICAL_TIME_COLUMN, CANONICAL_ZONE_COLUMN]].copy()
     frame[CANONICAL_ZONE_COLUMN] = frame[CANONICAL_ZONE_COLUMN].astype(str)
     if zone_ids is not None:
@@ -604,7 +606,7 @@ def evenly_spaced_forecast_starts(
     if frame.empty:
         raise ValueError("Cannot select forecast origins from an empty dataset/zone selection")
     bounds = frame.groupby(CANONICAL_ZONE_COLUMN)[CANONICAL_TIME_COLUMN].agg(["min", "max"])
-    past_hours = (history_days + validation_days) * 24
+    past_hours = (history_days + validation_bias_days(validation_bias, validation_days)) * 24
     future_hours = horizon_days * 24
     earliest = (bounds["min"].max() + pd.Timedelta(hours=past_hours)).ceil("D")
     latest = (bounds["max"].min() - pd.Timedelta(hours=future_hours - 1)).floor("D")

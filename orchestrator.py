@@ -35,6 +35,8 @@ from config import (
     BACKEND_PARAMETER_NAMES,
     BACKEND_BLEND_PARAMETER_NAMES,
     CALIBRATION_METHOD,
+    VALIDATION_BIAS_DAYS,
+    validation_bias_days,
     FORECAST_BACKENDS,
     normalize_float_list,
     resolve_backend_blend_alphas,
@@ -200,11 +202,12 @@ ERROR_CODE_BY_STAGE = {
 }
 MAX_CONTROL_ATTEMPTS = 3
 CONTROL_AGENT_USAGE_KEY = "_control_agent_usage"
-FORECASTER_MANIFEST_SCHEMA_VERSION = 7
+FORECASTER_MANIFEST_SCHEMA_VERSION = 10
 FORECAST_PARAMETER_NAMES = (
     'forecast_origin',
     'horizon_days',
     'history_days',
+    'validation_bias',
     'validation_days',
     'backend',
     'diurnal_blend_alpha',
@@ -349,7 +352,8 @@ def run_pipeline(
     forecast_origin: str | None = None,
     horizon_days: int = 1,
     history_days: int = 35,
-    validation_days: int = 7,
+    validation_bias: bool = False,
+    validation_days: int = VALIDATION_BIAS_DAYS,
     zone_ids: str | Iterable[str] | None = None,
     experiment_zone_count: int = 12,
     agent_mode: str = "multi_agent_economist_retry",
@@ -405,7 +409,8 @@ def run_pipeline(
         cache_dir=cache_dir,
     )
     shared_cache_dir = cache_dir or dataset_spec.resolved_cache_dir
-    run_output_dir = forecast_output_dir(output_dir, backend, diurnal_blend_alpha)
+    run_output_dir = forecast_output_dir(output_dir, backend, diurnal_blend_alpha,
+                                         validation_bias=validation_bias, validation_days=validation_days)
     forecaster_dir = resolve_forecaster_output_dir(
         run_output_dir,
         forecaster_output_dir if pipeline_stage == "agent" else None,
@@ -421,6 +426,7 @@ def run_pipeline(
         forecast_origin=forecast_origin,
         horizon_days=horizon_days,
         history_days=history_days,
+        validation_bias=validation_bias,
         validation_days=validation_days,
         backend=backend,
         diurnal_blend_alpha=diurnal_blend_alpha,
@@ -435,6 +441,16 @@ def run_pipeline(
     if pipeline_stage == "agent":
         try:
             bundle = load_forecaster_bundle(forecaster_dir)
+            if bundle.forecast_parameters["validation_bias"] != validation_bias:
+                raise ValueError(
+                    f"Saved forecaster validation_bias={bundle.forecast_parameters['validation_bias']} "
+                    f"differs from the requested validation_bias={validation_bias} for {data_dir}."
+                )
+            if bundle.forecast_parameters.get("validation_days") != forecast_parameters.get("validation_days"):
+                raise ValueError(
+                    f"Saved forecaster validation_days={bundle.forecast_parameters.get('validation_days')} "
+                    f"differs from the requested validation_days={validation_days} for {data_dir}."
+                )
         except Exception as exc:
             raise PipelineStageError(stage="load_forecaster_output", original=exc) from exc
         selected_zones = bundle.selected_zones
@@ -733,6 +749,8 @@ def run_pipeline(
         agent_manifest = build_agent_manifest(
             agent_mode=agent_mode,
             backend=backend,
+            validation_bias=forecast_parameters["validation_bias"],
+            validation_days=validation_days,
             forecaster_dir=forecaster_dir,
             selected_zone_ids=selected_zone_ids,
             forecast_origin=forecast_parameters.get("forecast_origin"),
@@ -768,7 +786,7 @@ def make_forecast_parameters(**values: Any) -> dict[str, Any]:
         raise ValueError("Offline training parameters belong to training configuration and per-zone model references: "
                          + ", ".join(moved))
     defaults = RunConfig()
-    common = ("forecast_origin", "backend", "history_days", "validation_days", "horizon_days", "diurnal_blend_alpha")
+    common = ("forecast_origin", "backend", "history_days", "horizon_days", "diurnal_blend_alpha")
     missing = [name for name in common if name not in values]
     if missing:
         raise ValueError("Missing forecast parameter(s): " + ", ".join(missing))
@@ -778,16 +796,23 @@ def make_forecast_parameters(**values: Any) -> dict[str, Any]:
     alpha = values["diurnal_blend_alpha"]
     if isinstance(alpha, (list, tuple, dict)) or alpha is None:
         raise ValueError("A resolved forecast requires one scalar diurnal_blend_alpha")
-    if values.get("calibration_method", CALIBRATION_METHOD) != CALIBRATION_METHOD:
+    validation_bias = values.get("validation_bias", False)
+    days = validation_bias_days(validation_bias, values.get("validation_days", VALIDATION_BIAS_DAYS))
+    if "calibration_method" in values and (
+        not validation_bias or values["calibration_method"] != CALIBRATION_METHOD
+    ):
         raise ValueError("Unsupported forecast calibration method; rerun the forecaster stage")
     parameters = {name: values[name] for name in common}
     parameters["backend"] = backend
+    parameters["validation_bias"] = validation_bias
     parameters["diurnal_blend_alpha"] = normalize_float_list(alpha)[0]
     parameters.update({name: values.get(name, getattr(defaults, name))
                        for name in BACKEND_PARAMETER_NAMES if name.startswith(base_backend(backend).lower() + "_")})
     if backend in LORA_BACKENDS:
         parameters[f"{base_backend(backend)}_context_hours"] = int(parameters["history_days"]) * 24
-    parameters["calibration_method"] = CALIBRATION_METHOD
+    if validation_bias:
+        parameters["validation_days"] = days
+        parameters["calibration_method"] = CALIBRATION_METHOD
     if values.get("model_ids"):
         if backend not in TRAINABLE_BACKENDS:
             raise ValueError("Pretrained forecasters cannot identify offline models; select the LoRA backend")
@@ -862,6 +887,8 @@ def build_agent_manifest(
     *,
     agent_mode: str,
     backend: str,
+    validation_bias: bool = False,
+    validation_days: int = VALIDATION_BIAS_DAYS,
     forecaster_dir: Path,
     selected_zone_ids: list[str],
     forecast_origin: Any = None,
@@ -874,6 +901,8 @@ def build_agent_manifest(
     return {
         "schema_version": 2,
         "stage": "agent",
+        "validation_bias": validation_bias,
+        "validation_days": validation_bias_days(validation_bias, validation_days),
         "completed_at": pd.Timestamp.now().isoformat(),
         "agent_mode": agent_mode,
         "backend": backend,
@@ -898,12 +927,12 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if not isinstance(manifest, dict):
         raise ValueError(f"Forecaster manifest must contain a JSON object: {manifest_path}")
-    if manifest.get("schema_version") != FORECASTER_MANIFEST_SCHEMA_VERSION:
+    manifest_version = manifest.get("schema_version")
+    if manifest_version not in (8, 9, FORECASTER_MANIFEST_SCHEMA_VERSION):
         raise ValueError(
             "Unsupported forecaster manifest schema_version: "
             f"{manifest.get('schema_version')}; expected {FORECASTER_MANIFEST_SCHEMA_VERSION}. "
-            "Run the forecaster stage again so closed-loop validation can reuse "
-            "the original backend instead of a legacy approximation artifact."
+            "Run the forecaster stage again to regenerate its inference state."
         )
     if manifest.get("stage") != "forecaster":
         raise ValueError(f"Invalid forecaster manifest stage: {manifest.get('stage')}")
@@ -911,8 +940,19 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
     raw_parameters = manifest.get("forecast_parameters")
     if not isinstance(raw_parameters, dict):
         raise ValueError("Forecaster manifest is missing forecast_parameters")
-    if raw_parameters.get("calibration_method") != CALIBRATION_METHOD:
-        raise ValueError("Forecaster manifest is missing the current daily calibration method; rerun the forecaster stage")
+    if "validation_days" in raw_parameters and (manifest_version < 10 or not raw_parameters.get("validation_bias")):
+        raise ValueError("Unexpected validation_days in forecaster manifest")
+    if manifest_version == 8:
+        if "validation_bias" in raw_parameters or "calibration_method" in raw_parameters:
+            raise ValueError("Unexpected bias configuration in a schema 8 forecaster manifest")
+    elif not isinstance(raw_parameters.get("validation_bias"), bool):
+        raise ValueError("Forecaster manifest must record its resolved validation_bias switch")
+    elif raw_parameters["validation_bias"] and raw_parameters.get("calibration_method") != CALIBRATION_METHOD:
+        raise ValueError("Forecaster manifest is missing the validation bias method")
+    elif manifest_version >= 10 and raw_parameters["validation_bias"] and "validation_days" not in raw_parameters:
+        raise ValueError("Calibrated forecaster manifest is missing validation_days")
+    if manifest_version == 9 and raw_parameters["validation_bias"]:
+        raw_parameters = {**raw_parameters, "validation_days": 7}
     forecast_parameters = make_forecast_parameters(**raw_parameters)
 
     artifacts = manifest.get("artifacts")
@@ -943,12 +983,12 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
     model_payload = json.loads(model_artifact_path.read_text(encoding="utf-8"))
     if (
         not isinstance(model_payload, dict)
-        or model_payload.get("schema_version") != NATIVE_ARTIFACT_SCHEMA_VERSION
+        or model_payload.get("schema_version") != (7 if manifest_version == 8 else NATIVE_ARTIFACT_SCHEMA_VERSION)
         or model_payload.get("artifact_type") != "native_backend_reforecast"
     ):
         raise ValueError(
-            "Forecaster output uses a legacy approximation artifact. Run the "
-            "forecaster stage again to create native backend reforecast state."
+            "Forecaster artifact type or schema does not match its manifest. "
+            "Run the forecaster stage again to regenerate its inference state."
         )
     raw_scenario_artifacts = model_payload.get("artifacts") if isinstance(model_payload, dict) else None
     if not isinstance(raw_scenario_artifacts, dict):
@@ -991,6 +1031,10 @@ def load_forecaster_bundle(path: Path | str) -> ForecasterBundle:
             raise ValueError(f"Forecaster model provenance backend differs for zone {zone_id}")
     for zone_id, artifact in scenario_artifacts.items():
         metadata = artifact.metadata()
+        if artifact.forecast_parameters.get("validation_bias", False) is not forecast_parameters["validation_bias"]:
+            raise ValueError(f"Forecaster artifact validation_bias differs from the manifest for zone {zone_id}")
+        if artifact.forecast_parameters.get("validation_days") != forecast_parameters.get("validation_days"):
+            raise ValueError(f"Forecaster artifact validation_days differs from the manifest for zone {zone_id}")
         if metadata.get("backend") != forecast_parameters["backend"]:
             raise ValueError(f"Forecaster artifact backend differs from the manifest for zone {zone_id}")
         if pd.Timestamp(metadata.get("forecast_origin")) != pd.Timestamp(forecast_parameters["forecast_origin"]):
@@ -1088,6 +1132,9 @@ def run_experiment_matrix(
             force_train=bool(pipeline_kwargs.get("force_train", False)),
             force_cache=bool(pipeline_kwargs.get("force_cache", False)),
         )
+    validation_bias = pipeline_kwargs.get("validation_bias", False)
+    validation_days = pipeline_kwargs.get("validation_days", VALIDATION_BIAS_DAYS)
+    effective_validation_days = validation_bias_days(validation_bias, validation_days)
     starts = normalize_forecast_starts(forecast_starts)
     seeds = normalize_experiment_seeds(experiment_seeds)
     requested_modes = normalize_agent_modes(
@@ -1137,7 +1184,8 @@ def run_experiment_matrix(
                 canonical_dataset,
                 forecast_starts=starts,
                 history_days=pipeline_kwargs.get("history_days", RunConfig.history_days),
-                validation_days=pipeline_kwargs.get("validation_days", RunConfig.validation_days),
+                validation_bias=validation_bias,
+                validation_days=validation_days,
                 force_cache=base_force_cache,
             )
             selection_artifacts = {
@@ -1151,7 +1199,7 @@ def run_experiment_matrix(
             if len(eligible_ids) < requested_count:
                 raise ValueError(
                     f"Only {len(eligible_ids)} eligible zones remain for {requested_count} requested random zones. "
-                    "Both load and electricity price must vary in history before the first validation period, "
+                    "Both load and electricity price must vary in the eligible pre-forecast history, "
                     "all historical windows must be complete and enough offline training samples must be available. "
                     "Choose another dataset/date or reduce its configured zone count "
                     "(run.experiment_zone_counts or run.experiment_zone_count). "
@@ -1252,7 +1300,8 @@ def run_experiment_matrix(
                             run_base_dir = run_base_dir / f"seed_{seed}"
                         if add_mode_folder:
                             run_base_dir = run_base_dir / f"agent_{safe_filename(agent_mode)}"
-                        run_output_dir = forecast_output_dir(run_base_dir, backend, blend_alpha)
+                        run_output_dir = forecast_output_dir(run_base_dir, backend, blend_alpha,
+                                                             validation_bias=validation_bias, validation_days=validation_days)
                         run_kwargs = dict(pipeline_kwargs)
                         run_kwargs["agent_mode"] = agent_mode
                         run_kwargs["diurnal_blend_alpha"] = blend_alpha
@@ -1262,7 +1311,10 @@ def run_experiment_matrix(
                                 shared_run_base_dir = shared_run_base_dir / f"seed_{seed}"
                             if not run_kwargs.get("forecaster_output_dir"):
                                 mode_forecaster = run_output_dir / "forecaster"
-                                shared_forecaster = forecast_output_dir(shared_run_base_dir, backend, blend_alpha) / "forecaster"
+                                shared_forecaster = forecast_output_dir(
+                                    shared_run_base_dir, backend, blend_alpha,
+                                    validation_bias=validation_bias, validation_days=validation_days
+                                ) / "forecaster"
                                 run_kwargs["forecaster_output_dir"] = (
                                     mode_forecaster
                                     if (mode_forecaster / "forecaster_manifest.json").is_file()
@@ -1276,6 +1328,8 @@ def run_experiment_matrix(
                             "backend": backend,
                             "experiment_seed": seed,
                             "agent_mode": agent_mode,
+                            "validation_bias": validation_bias,
+                            "validation_days": effective_validation_days,
                             "diurnal_blend_alpha": blend_alpha,
                             "zone_count": len(selected_zone_ids),
                             "zone_ids": ",".join(selected_zone_ids),
@@ -1311,6 +1365,8 @@ def run_experiment_matrix(
                                 "backend": backend,
                                 "experiment_seed": seed,
                                 "agent_mode": agent_mode,
+                                "validation_bias": validation_bias,
+                                "validation_days": effective_validation_days,
                                 "diurnal_blend_alpha": blend_alpha,
                                 "run_output_dir": str(run_output_dir),
                             }
@@ -1632,7 +1688,7 @@ def write_numeric_summary(
     metric_columns: list[str],
     group_columns: list[str] | None = None,
 ) -> pd.DataFrame:
-    group_columns = group_columns or ["backend", "agent_mode", "diurnal_blend_alpha"]
+    group_columns = group_columns or ["backend", "agent_mode", "diurnal_blend_alpha", "validation_bias", "validation_days"]
     output_columns = [
         *group_columns,
         "metric",
@@ -1711,6 +1767,8 @@ def write_decision_quality_summary(
         "backend",
         "agent_mode",
         "diurnal_blend_alpha",
+        "validation_bias",
+        "validation_days",
         "metric_family",
         "metric",
         "n",
@@ -1727,7 +1785,7 @@ def write_decision_quality_summary(
 
     groups = [
         column
-        for column in ["backend", "agent_mode", "diurnal_blend_alpha", "metric_family", "metric"]
+        for column in ["backend", "agent_mode", "diurnal_blend_alpha", "validation_bias", "validation_days", "metric_family", "metric"]
         if column in combined.columns
     ]
     rows = []
@@ -1757,7 +1815,7 @@ def write_decision_quality_summary(
 
 
 def long_metric_frame(frame: pd.DataFrame, *, metrics: list[str], metric_family: str) -> pd.DataFrame:
-    group_cols = [col for col in ["backend", "agent_mode", "diurnal_blend_alpha"] if col in frame.columns]
+    group_cols = [col for col in ["backend", "agent_mode", "diurnal_blend_alpha", "validation_bias", "validation_days"] if col in frame.columns]
     rows = []
     for metric in metrics:
         if metric not in frame.columns:
@@ -1832,11 +1890,19 @@ def select_representative_zone_ids(profiles: pd.DataFrame, *, count: int) -> lis
     return selected
 
 
-def forecast_output_dir(output_dir: Path, backend: str, diurnal_blend_alpha: float = 0.0) -> Path:
+def forecast_output_dir(
+    output_dir: Path, backend: str, diurnal_blend_alpha: float = 0.0, *,
+    validation_bias: bool = False, validation_days: int = VALIDATION_BIAS_DAYS,
+) -> Path:
     normalized = normalize_forecast_model_name(backend)
     alpha = normalize_float_list(diurnal_blend_alpha)[0]
     alpha_text = f"{alpha:.6f}".rstrip("0").rstrip(".")
-    return output_dir / f"blend_{alpha_text}" / safe_filename(normalized or "forecast")
+    days = validation_bias_days(validation_bias, validation_days)
+    root = output_dir
+    if days:
+        # Switch-only runs stored seven-day results in this directory.
+        root /= "validation_bias" if days == 7 else f"validation_bias_{days}d"
+    return root / f"blend_{alpha_text}" / safe_filename(normalized or "forecast")
 
 
 def normalize_experiment_name(value: Any, *, default: str) -> str:
@@ -2105,7 +2171,8 @@ def apply_price_conditioned_baseline_forecasts(
     forecast_origin: str | None,
     horizon_days: int,
     history_days: int,
-    validation_days: int,
+    validation_bias: bool = False,
+    validation_days: int = VALIDATION_BIAS_DAYS,
     backend: str,
     diurnal_blend_alpha: float,
     timesfm_repo: str,
@@ -3008,7 +3075,8 @@ def build_contexts(
     forecast_origin: str | None,
     horizon_days: int,
     history_days: int,
-    validation_days: int,
+    validation_bias: bool = False,
+    validation_days: int = VALIDATION_BIAS_DAYS,
     backend: str,
     diurnal_blend_alpha: float,
     zone_load_thresholds: pd.DataFrame,
@@ -3058,6 +3126,7 @@ def build_contexts(
                 forecast_origin=start,
                 horizon_days=horizon_days,
                 history_days=history_days,
+                validation_bias=validation_bias,
                 validation_days=validation_days,
                 backend=backend,
                 diurnal_blend_alpha=diurnal_blend_alpha,

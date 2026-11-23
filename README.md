@@ -31,6 +31,15 @@ Rejected calls still count. Agent execution, evaluation and independent price re
 require results produced with the current five-band policy. Regenerate forecaster
 handoffs and price caches before starting a new experiment.
 
+R1 sizes each window's quote from its forecast load gap, demand drivers and elasticity.
+On retries, a bolder quote is an option only when the last two forecasts for **that window**
+have the same non-Medium level: compare R0 with R1 before quoting R2, and R1 with R2
+before quoting R3. Rejected trials count as observations, not as the new base price.
+A change of level or a missing result calls for reassessment; accepted Medium windows
+keep their price. The LLM chooses its own percentage. For deterministic dry-runs, the
+rule agent tests 1.25 times the corrective magnitude on an eligible R2 and 1.5 times
+on an eligible R3, with a -100% floor. Quotes always refer to the original hourly prices.
+
 Offline price replay (no LLM calls or weight updates):
 
 ```shell

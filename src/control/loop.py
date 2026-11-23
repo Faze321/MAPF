@@ -198,8 +198,8 @@ async def run_control_loop(
             retry_context = build_retry_context(
                 contexts_by_zone[zone_id],
                 report,
-                attempt=attempt,
                 last_trial=traces[zone_id][-1],
+                previous_trial=traces[zone_id][-2] if attempt > 1 else None,
                 replace_forecast=True,
             )
             retry_jobs.append((retry_context, report, failed_keys))

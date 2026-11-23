@@ -6,21 +6,33 @@ from typing import Any
 import pandas as pd
 
 from src.agents.reports import ECONOMIST_AGENT_OUTPUT_KEY
+from src.control.numbers import optional_float
+from src.control.policy import MEDIUM_STRESS, STRESS_LEVELS
 from src.control.pricing import final_price_action_label, window_key
 from src.control.windows import max_stress_level, optional_number
 from src.forecast.engine import daily_totals, pct_change
 from src.pipeline.context import build_hourly_averages
 
 
+def _trial_level(window: dict[str, Any]) -> str | None:
+    level = window.get("reforecast_load_stress_level")
+    if window.get("price_valid") and optional_float(window.get("reforecast_load_kwh")) is not None and level in STRESS_LEVELS:
+        return level
+    return None
+
+
 def build_retry_context(
     original_context: dict[str, Any],
     report: dict[str, Any],
     *,
-    attempt: int,
+    last_trial: dict,
+    previous_trial: dict | None,
     replace_forecast: bool,
-    last_trial: dict | None = None,
 ) -> dict[str, Any]:
     context = copy.deepcopy(original_context)
+    attempt = last_trial["attempt"]
+    last_windows = {window_key(w): w for w in last_trial["windows"]}
+    prior_windows = {window_key(w): w for w in (previous_trial or {}).get("windows", [])}
     report_windows = {
         window_key(window): window
         for window in report.get("price_change_windows_3h") or []
@@ -44,9 +56,24 @@ def build_retry_context(
             item["stress_load_3h_kwh"] = latest.get("price_conditioned_baseline_load_kwh")
         updated_windows.append(item)
         if latest and not latest.get("control_success"):
+            key = window_key(original)
+            trial = last_windows.get(key, {})
+            prior = prior_windows.get(key, {})
+            # Compare consecutive tested schedules, even if the controller rolled back.
+            prior_level = original.get("load_stress_level") if attempt == 1 else _trial_level(prior)
+            if attempt == 1 and optional_float(original.get("sum_predicted_kwh")) is None:
+                prior_level = None
+            trial_level = _trial_level(trial)
             feedback.append(
                 {
                     "attempt": attempt,
+                    "next_attempt": attempt + 1,
+                    "prior_trial_level": prior_level,
+                    "last_trial_level": trial_level,
+                    "prior_trial_shift_pct": 0.0 if attempt == 1 else prior.get("suggested_price_shift_pct"),
+                    "last_trial_shift_pct": trial.get("suggested_price_shift_pct"),
+                    "allow_larger_step": trial_level is not None and trial_level != MEDIUM_STRESS
+                                         and trial_level == prior_level,
                     "window_start": latest.get("window_start"),
                     "window_end": latest.get("window_end"),
                     "previous_price_shift_pct": latest.get("suggested_price_shift_pct"),
@@ -59,8 +86,8 @@ def build_retry_context(
                     "failure_reason": latest.get("control_failure_reason"),
                 }
             )
-    if last_trial:
-        rejected = {window_key(w): w for w in last_trial["windows"]} if not last_trial["accepted"] else {}
+    if feedback:
+        rejected = last_windows if not last_trial["accepted"] else {}
         lost = sum(bool(w["control_success"]) and not rejected.get(k, {}).get("control_success", True)
                    for k, w in report_windows.items())
         gained = sum(not w["control_success"] and bool(rejected.get(k, {}).get("control_success"))

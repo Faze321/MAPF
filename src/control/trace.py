@@ -81,6 +81,7 @@ def control_attempt_snapshot(
                 "window_start": window.get("window_start"),
                 "window_end": window.get("window_end"),
                 "proposal_status": proposal_status,
+                "price_valid": window.get("price_valid"),
                 "mean_energy_price": window.get("mean_energy_price"),
                 "previous_proposed_energy_price": previous_price,
                 "proposed_energy_price": current_price,

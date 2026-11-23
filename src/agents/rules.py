@@ -4,6 +4,7 @@ from typing import Any
 
 from src.agents.validation import has_text, model_response_failed, validate_economist_report
 from src.control.numbers import as_float, optional_float
+from src.control.pricing import window_key
 from src.control.policy import (
     EXTREMELY_HIGH_STRESS,
     EXTREMELY_LOW_STRESS,
@@ -206,6 +207,7 @@ def build_heuristic_price_windows(
     stress = normalize_grid_stress_level(grid.get("grid_stress_level"), context.get("grid_stress_level"))
     category = str(context.get("category") or "")
     change = as_float(grid.get("predicted_change_pct"), context.get("predicted_change_pct", 0))
+    retries = {window_key(row): row for row in context.get("retry_feedback", [])}
     results = []
     for window in windows:
         window_stress = normalize_grid_stress_level(
@@ -215,7 +217,25 @@ def build_heuristic_price_windows(
         window_load = as_float(window.get("mean_predicted_kwh"), mean_load)
         window_energy_price = as_float(window.get("mean_energy_price"), mean_energy_price)
         elasticity = estimate_elasticity_factor(context, {}, window)
-        shift = round(price_shift_to_medium_band(context, window, elasticity), 2)
+        shift = price_shift_to_medium_band(context, window, elasticity)
+        retry = retries.get(window_key(window))
+        step_reason = ""
+        if retry and retry.get("allow_larger_step"):
+            # Scale the size of a quote off original prices, never the last execution price.
+            direction = -1 if window_stress in (EXTREMELY_LOW_STRESS, LOW_STRESS) else 1
+            tested = [optional_float(retry.get(key)) or 0.0 for key in
+                      ("prior_trial_shift_pct", "last_trial_shift_pct", "previous_price_shift_pct")]
+            size = max(1.0, direction * shift, *(direction * prior for prior in tested))
+            factor = 1.25 if retry["next_attempt"] == 2 else 1.5
+            requested = direction * size * factor
+            shift = max(-100.0, requested)
+            step_reason = (f" R{retry['next_attempt']}: the last two forecasts stayed "
+                           f"{retry['last_trial_level']}; "
+                           + ("the discount is capped at -100% (zero energy price)."
+                              if requested < -100 else "testing a larger corrective shift."))
+        shift = round(shift, 2)
+        if "retry_feedback" in context and not retry:
+            shift = optional_float(window.get("accepted_shift_pct")) or 0.0
         if shift > 0:
             label = "Raise energy price"
         elif shift < 0:
@@ -263,6 +283,7 @@ def build_heuristic_price_windows(
                     f"historical 3-hour load range; "
                     f"price shift targets the Medium band while keeping the resulting "
                     f"energy price non-negative from the {window_energy_price:.4f} baseline."
+                    + step_reason
                 ),
             }
         )

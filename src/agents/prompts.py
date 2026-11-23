@@ -99,6 +99,13 @@ QUOTE_POLICY = (
     "or Extremely High, considering a larger increase for Extremely High. When retry_feedback is present, "
     "revise only its windows: copy accepted_shift_pct unchanged for every other window. "
     "Rejected shifts and loads describe discarded trials, not the starting schedule. "
+    "For the first price proposal, choose the size from the window's load gap, demand drivers "
+    "and estimated elasticity; explain your choice. On a retry, allow_larger_step refers only "
+    "to the last two tested forecasts for that window (R0/R1 for R2, R1/R2 for R3). "
+    "When true, consider a bolder corrective shift than previously tested; on R3 you may go "
+    "further still. When false, reassess the remaining gap and response without escalating "
+    "just because it is a later round. Do not blindly extend a shift that moved load the wrong way. "
+    "These are price proposal rounds, not discussion turns or JSON repairs. "
     "Use only a finite percentage >= -100 relative to the ORIGINAL "
     "hourly energy prices of this window, never relative to a previous quote or the zone mean. "
     "Zero preserves all original hours. Do not quote absolute prices. Service price is fixed. "
@@ -169,7 +176,7 @@ REPAIR_INSTRUCTIONS = dedent(f"""\
 PRICE_RETRY_INSTRUCTIONS = dedent(f"""\
     {QUOTE_POLICY}
     Revise prices only for the failed windows listed in context.retry_feedback. Keep every
-    non-failed window's previous price unchanged. Use the previous proposed price,
+    non-failed window's previous price unchanged (its accepted price). Use the accepted price, tested shifts,
     price-conditioned forecast load, load-range position, stress, and failure reason.
     Do not use actual future load or evaluation information. Final energy prices must
     be non-negative.
@@ -393,6 +400,8 @@ def forecast_only_retry_feedback(value: Any) -> list[dict[str, Any]]:
         return []
     allowed = {
         "attempt",
+        "next_attempt", "prior_trial_level", "last_trial_level",
+        "prior_trial_shift_pct", "last_trial_shift_pct", "allow_larger_step",
         "window_start",
         "window_end",
         "accepted_attempt", "rejected_attempt", "rejected_mean_energy_price", "rejected_shift_pct", "rejected_load_kwh", "rejected_stress",

@@ -1,0 +1,275 @@
+"""Token accounting shared by Agent execution and output reporting."""
+
+from __future__ import annotations
+
+from numbers import Integral
+from typing import Any
+
+from src.agents.fields import response_field
+
+
+CACHE_USAGE_FIELDS = (
+    "cached_tokens", "known_cached_tokens", "cache_reported_call_count",
+    "cache_usage_complete", "cache_hit_ratio",
+)
+
+
+def _nonnegative_integer(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, Integral) or value < 0:
+        return None
+    return int(value)
+
+
+def cache_usage_fields(value: dict[str, Any]) -> dict[str, Any]:
+    """Normalize reported cache usage without treating unavailable counts as zero.
+
+    A call defaults to one invocation; aggregate rows supply agent_call_count.
+    A ratio is a pooled fraction of input tokens, not a request hit rate.
+    """
+    count = _nonnegative_integer(value.get("agent_call_count", 1))
+    prompt = _nonnegative_integer(value.get("prompt_tokens"))
+    cached = _nonnegative_integer(value.get("cached_tokens"))
+    known = _nonnegative_integer(value.get("known_cached_tokens"))
+    reported = _nonnegative_integer(value.get("cache_reported_call_count"))
+    if prompt is None or (cached is not None and cached > prompt):
+        cached = None
+    if prompt is None or (known is not None and known > prompt):
+        known = None
+    if "cache_reported_call_count" in value and (
+        reported is None or count is None or reported > count
+    ):
+        reported = 0
+    if count == 0:
+        return {"cached_tokens": 0, "known_cached_tokens": 0,
+                "cache_reported_call_count": 0, "cache_usage_complete": True,
+                "cache_hit_ratio": None}
+    permitted = value.get("cache_usage_complete") is None or value.get("cache_usage_complete") is True
+    if reported is None:
+        reported = count if cached is not None and permitted and count is not None else 0
+    complete = cached is not None and count is not None and permitted and reported == count
+    known = cached if complete or known is None else known
+    if known is None:
+        reported = 0
+    return {
+        "cached_tokens": cached if complete else None,
+        "known_cached_tokens": known if known is not None else 0,
+        "cache_reported_call_count": reported,
+        "cache_usage_complete": complete,
+        "cache_hit_ratio": cached / prompt if complete and prompt else None,
+    }
+
+
+def anthropic_response_token_usage(response: Any) -> dict[str, Any]:
+    """Read native Messages usage without guessing missing cache counts as zero.
+
+    Anthropic's input_tokens counts uncached input only. A complete input count
+    requires uncached input, cache-write input, and cache-read input, each added
+    exactly once; only cache reads count as hits. Partial records retain their
+    native components as diagnostics but cannot establish full prompt/total
+    tokens or a cache ratio. known_cached_tokens follows the shared normalizer's
+    validated-subtotal semantics; when the denominator is unavailable its native
+    evidence remains in cache_read_input_tokens instead.
+    """
+    usage = response_field(response, "usage")
+    inputs = {
+        name: _nonnegative_integer(response_field(usage, name))
+        for name in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+    }
+    prompt = sum(inputs.values()) if all(value is not None for value in inputs.values()) else None
+    completion = _nonnegative_integer(response_field(usage, "output_tokens"))
+    result = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion if prompt is not None and completion is not None else None,
+        **inputs,
+    }
+    result.update(cache_usage_fields({
+        **result,
+        "cached_tokens": inputs["cache_read_input_tokens"],
+    }))
+    return result
+
+
+def summarize_cache_usage(
+    records: list[dict[str, Any]], *, aggregated: bool = False,
+) -> dict[str, Any]:
+    """Pool cache counts across calls, or across already aggregated usage rows."""
+    normalized_records = [
+        {
+            **record,
+            "agent_call_count": record.get(
+                "agent_call_count", 0 if record.get("agent_invoked") is False else None,
+            ) if aggregated else 1,
+        }
+        for record in records
+    ]
+    rows = [cache_usage_fields(record) for record in normalized_records]
+    complete = all(row["cache_usage_complete"] for row in rows)
+    known = sum(row["known_cached_tokens"] for row in rows)
+    prompts = [
+        0 if _nonnegative_integer(record["agent_call_count"]) == 0
+        else _nonnegative_integer(record.get("prompt_tokens"))
+        for record in normalized_records
+    ]
+    prompt_total = sum(prompts) if all(value is not None for value in prompts) else None
+    return {
+        "cached_tokens": known if complete else None,
+        "known_cached_tokens": known,
+        "cache_reported_call_count": sum(row["cache_reported_call_count"] for row in rows),
+        "cache_usage_complete": complete,
+        "cache_hit_ratio": known / prompt_total if complete and prompt_total else None,
+    }
+
+
+def optional_int_usage(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def call_token_usage_complete(record: dict[str, Any]) -> bool:
+    explicit = record.get("token_usage_complete")
+    if explicit is not None:
+        return bool(explicit)
+    return all(
+        optional_int_usage(record.get(field)) is not None
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens")
+    )
+
+
+def sum_token_usage(records: list[dict[str, Any]], field: str) -> int:
+    return sum(usage_integer(record.get(field)) for record in records)
+
+
+def summarize_agent_call_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "agent_invoked": bool(records),
+        "agent_call_count": len(records),
+        "prompt_tokens": sum_token_usage(records, "prompt_tokens"),
+        "completion_tokens": sum_token_usage(records, "completion_tokens"),
+        "total_tokens": sum_token_usage(records, "total_tokens"),
+        "token_usage_complete": all(
+            call_token_usage_complete(record)
+            for record in records
+        ),
+        **summarize_cache_usage(records),
+    }
+
+
+def usage_integer(value: Any) -> int:
+    return optional_int_usage(value) or 0
+
+
+def cumulative_global_agent_usage(
+    rounds: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "agent_round_count": len(rounds),
+        "agent_invoked_round_count": sum(
+            bool(item.get("agent_invoked")) for item in rounds
+        ),
+        "agent_invoked": any(bool(item.get("agent_invoked")) for item in rounds),
+        "agent_invoked_zone_count": sum(
+            usage_integer(item.get("agent_invoked_zone_count")) for item in rounds
+        ),
+        **aggregate_usage(rounds),
+    }
+
+
+def token_total_summary(usage: dict[str, Any]) -> dict[str, Any]:
+    """Expose a compact final token-only total without timing fields."""
+    return {
+        "agent_call_count": usage_integer(usage.get("agent_call_count")),
+        "prompt_tokens": usage_integer(usage.get("prompt_tokens")),
+        "completion_tokens": usage_integer(usage.get("completion_tokens")),
+        "total_tokens": usage_integer(usage.get("total_tokens")),
+        "token_usage_complete": bool(usage.get("token_usage_complete")),
+        **cache_usage_fields(usage),
+    }
+
+
+def aggregate_usage(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """Sum recorded counts without claiming missing provider usage is complete."""
+    return {
+        **{
+            field: sum(usage_integer(row.get(field)) for row in rows)
+            for field in ("agent_call_count", "prompt_tokens", "completion_tokens", "total_tokens")
+        },
+        "token_usage_complete": all(bool(row.get("token_usage_complete")) for row in rows),
+        **summarize_cache_usage(rows, aggregated=True),
+    }
+
+
+CONTROL_AGENT_USAGE_KEY = "_control_agent_usage"
+
+
+def response_token_usage(response: Any) -> dict[str, Any]:
+    usage = response_field(response, "usage")
+    prompt_tokens = usage_value(usage, "prompt_tokens", "input_tokens")
+    completion_tokens = usage_value(usage, "completion_tokens", "output_tokens")
+    total_tokens = usage_value(usage, "total_tokens")
+    if total_tokens is None and prompt_tokens is not None and completion_tokens is not None:
+        total_tokens = prompt_tokens + completion_tokens
+    result = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+    details = response_field(usage, "prompt_tokens_details")
+    result.update(cache_usage_fields({
+        **result, "cached_tokens": response_field(details, "cached_tokens"),
+    }))
+    return result
+
+
+def usage_value(usage: Any, *keys: str) -> int | None:
+    if usage is None:
+        return None
+    for key in keys:
+        value = None
+        if isinstance(usage, dict):
+            value = usage.get(key)
+        else:
+            value = getattr(usage, key, None)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def agent_call_usage_record(
+    *,
+    stage: str,
+    agent: str,
+    zone_id: Any,
+    token_usage: dict[str, Any] | None,
+) -> dict[str, Any]:
+    usage = token_usage if isinstance(token_usage, dict) else {}
+    prompt_tokens = optional_int_usage(usage.get("prompt_tokens"))
+    completion_tokens = optional_int_usage(usage.get("completion_tokens"))
+    total_tokens = optional_int_usage(usage.get("total_tokens"))
+    provider_attempt_count = optional_int_usage(usage.get("provider_attempt_count")) or 1
+    explicit_complete = usage.get("token_usage_complete")
+    token_usage_complete = (
+        bool(explicit_complete)
+        if explicit_complete is not None
+        else all(
+            value is not None
+            for value in (prompt_tokens, completion_tokens, total_tokens)
+        )
+    )
+    return {
+        "stage": stage,
+        "agent": agent,
+        "zone_id": zone_id,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "token_usage_complete": token_usage_complete,
+        "provider_attempt_count": provider_attempt_count,
+        **cache_usage_fields(usage),
+    }

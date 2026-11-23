@@ -12,16 +12,16 @@ test.py
 test.ipynb
 config.yaml
 
-/.tmp_tests/
-/.cache/
-/cache/
+.tmp_tests/
+.cache/
+cache/
 tmp/
 .agents/
 .codex/
 tests/
 
 # Dataset
-data/
+/data/
 
 output/
 outputs/

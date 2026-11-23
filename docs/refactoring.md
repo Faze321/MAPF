@@ -9,8 +9,7 @@
 项目 `data/` 之外的数据源使用 `cache/_external/<safe-leaf>_<path-hash>/`，
 散列为规范化绝对数据路径的 SHA-256 前 12 位十六进制字符。
 显式 `data.cache_dir` 或 `--cache-dir` 精确指定该数据集的缓存目录。
-旧缓存和模型文件不自动移动，新默认运行在新位置构建缓存；
-已有预测产物仍引用旧权重，需保留原文件以便重放。
+目录重构不会改变权重身份。Agent 阶段使用预测产物引用的权重文件，不重新训练。
 
 `history_days` 决定输入 H 小时，`horizon_days` 决定直接输出 P 小时，默认 840→24。
 连续 N 个小时以步长 1 产生 N-H-P+1 个完整样本；输入和标签都不得跨缺口。
@@ -64,29 +63,28 @@ LoRA 的独立列表为 `timesfm_lora_diurnal_blend_alphas` 和
 模型权重可能使用历史预测区间内或之后的数据进行拟合/早停。结果记录训练范围、
 逐小时重叠和 model_id；只有预测起点不早于训练及早停使用数据的结束时间，才标为
 `evaluation_is_out_of_sample`。评估按 model_set_id 和实际校准设置分组。
-历史结果字段由离线评估在读取时识别。
+当前只支持五档压力策略，不迁移四档结果。Native 预测器 schema 为 8，Forecaster manifest 为 10，控制结果为 5；读入 manifest、控制结果和预计算窗口时检查当前策略标识。版本不符请重新运行 forecaster/full。训练权重有独立的版本和校验，不随 Python 导入路径变化。
 
-当前 Native 预测器产物为 schema 8，Forecaster manifest 为 schema 10。
-Agent-only 可读取 manifest 9 的七日校正或未校正产物，以及未校正的 native 7、manifest 8。
-更早的产物需先通过 `forecaster` 或 `full` 阶段重新生成。
-LSTM/XGBoost 离线权重仍为 schema 2，缓存位置、训练内容及参数匹配时可复用，
-无需因此强制重新训练；旧 LoRA 权重不自动迁移到新后端身份。
+## 代码与数据流
 
-| 文件 | 职责 |
+| 包 | 职责 |
 |---|---|
-| `training_config.py` | 原版/LoRA 后端身份、共享模型家族映射及离线训练配置 |
-| `config.py`、`main.py` | 运行配置验证、覆盖和训练/预测阶段入口 |
-| `foundation_models.py` | 基础模型 LoRA 训练、适配器加载和已训练权重预测 |
-| `zone_training.py` | 完整窗口计数、资格、选中区域训练、模型版本和校验 |
-| `offline_models.py` | 直接多步模型、单次早停、预处理及加载预测 |
-| `forecasting.py`、`global_forecaster.py` | 共用校准、原生产物和调价复用 |
-| `orchestrator.py` | 选区后训练、实验矩阵与阶段交接 |
-| `reporting.py`、`evaluation_artifacts.py` | 结果与权重身份、历史字段读取兼容 |
+| `src/data/` | 各数据集 adapter → 统一小时表 → 截至指定起点的画像 → 资格筛选、选区。 |
+| `src/training/` | 连续 H+P 样本、LSTM/XGBoost 和 LoRA 训练、并发、不可变权重校验与加载。 |
+| `src/forecast/` | 固定起点预测、后端分派、日内混合、bias 与冻结状态；首次预测和调价重预测使用同一内核。 |
+| `src/agents/` | 输入提示词、供应商请求、限流、Single/Multi/Discussion 调用、报价校验修复、离线规则。 |
+| `src/control/` | 五档规则、三小时窗口、逐小时执行价、整段评分、择优回退与反馈。独立回放复用调价和评分函数。 |
+| `src/results/` | 阶段产物、manifest、窗口缓存、控制轨迹和用量写出。 |
+| `src/evaluation/` | 离线读取、逐小时汇总、配对和比较；与运行时共享 `src/metrics.py` 的误差公式。 |
+| `src/pipeline/` | 四个阶段、区域上下文、数据集内矩阵与错误计数、跨数据集子进程。 |
+| `src/config/`、`src/paths.py` | PyYAML 配置、覆盖与环境变量；项目根目录、输出、缓存与锁路径。 |
+
+在项目根目录运行以下命令：`python src/main.py`（train/forecaster/agent/full）、`python src/evaluate.py`（离线评估）、`python src/replay_prices.py`（无 LLM 回放）、`python src/download_datasets.py`（下载）。每个命令均可加 `--help`。
 
 运行全量回归：
 
 ```powershell
-python -B -m unittest discover -s tests -p 'test_*.py' -v
+python -B -m unittest discover -s src/tests -t . -p 'test_*.py' -v
 ```
 
 关键覆盖包括完整 H+P 窗口和标签隔离、选中区域训练、窗口长度缓存失效、单次早停和

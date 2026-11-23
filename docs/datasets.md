@@ -1,16 +1,16 @@
 # 多数据集训练
 
-项目支持 UrbanEV、CHARGED 和 MP-EVData。数据读取统一在 `dataset_adapter.py`，
-并行调度统一在 `orchestrator.py`，训练入口统一为 `python main.py`。
+项目支持 UrbanEV、CHARGED 和 MP-EVData。数据读取统一在 `src/data/adapters/`，
+并行调度统一在 `src/pipeline/batch.py` 和 `src/pipeline/matrix.py`，训练入口统一为 `python src/main.py`。
 
 ## 下载和来源
 
 在项目根目录运行（使用项目 `.venv` 或 `uv run`）：
 
 ```powershell
-python download_datasets.py charged mp_evdata
+python src/download_datasets.py charged mp_evdata
 # 也可只下载某一个 CHARGED 城市
-python download_datasets.py charged --cities JHB
+python src/download_datasets.py charged --cities JHB
 ```
 
 下载器获取 [CHARGED 官方仓库](https://github.com/IntelligentSystemsLab/CHARGED)
@@ -27,7 +27,7 @@ MP-EVData 的发布许可为 CC BY 4.0。CHARGED 的数据和辅助来源使用�
 
 ## 修改配置切换数据集
 
-在 `config.yaml` 的现有 `data`、`run` 段中修改这些字段，然后运行 `python main.py`：
+在 `config.yaml` 的现有 `data`、`run` 段中修改这些字段，然后运行 `python src/main.py`：
 
 ```yaml
 data:
@@ -182,8 +182,8 @@ run:
 先筛选训练资格并完成实验选区，只为选中区域训练独立的 LSTM、XGBoost 或 LoRA 适配器：
 
 ```powershell
-python main.py --stage train --forecast-models lstm xgboost
-python main.py --stage train --forecast-models timesfm_lora chronos_lora
+python src/main.py --stage train --forecast-models lstm xgboost
+python src/main.py --stage train --forecast-models timesfm_lora chronos_lora
 ```
 
 `train`、`forecaster`、`full` 使用相同的显式站点或自动抽样规则；未选中区域不会训练。
@@ -222,7 +222,7 @@ XGBoost 使用 `xgboost_n_estimators` 和学习率，不提供 epoch 或 batch �
 
 ## 并行运行
 
-将同一个 `run.data_dir` 改为列表，仍然运行 `python main.py`：
+将同一个 `run.data_dir` 改为列表，仍然运行 `python src/main.py`：
 
 ```yaml
 data:
@@ -389,8 +389,8 @@ Agent 阶段校验适配器、数据目录和数据指纹，拒绝混用其他�
 ## 验证
 
 ```powershell
-python -B -m unittest discover -s tests -p test_datasets.py -v
-python -B -m unittest discover -s tests -p test_evaluate.py -v
+python -B -m unittest discover -s src/tests -t . -p test_datasets.py -v
+python -B -m unittest discover -s src/tests -t . -p test_evaluate.py -v
 ```
 
 新增测试覆盖价表尖峰优先级、跨午夜、冲突拒绝、换电/免费站点剔除、负荷单位、

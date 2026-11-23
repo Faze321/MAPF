@@ -2,23 +2,49 @@
 
 MAPF separates forecasting from price control and keeps forecast-period ground truth out of every Agent prompt.
 
+Run commands from the project root, for example `uv run src/main.py`. The four
+command-line scripts and domain packages (such as `src/agents/` and `src/forecast/`) live directly in `src/`,
+and local tests in `src/tests/`. Configuration, datasets, caches and outputs
+remain at the project root.
+
 ## Architecture
 
 1. **Dataset adapter and cache** converts UrbanEV, CHARGED, MP-EVData, or a mapped long-format dataset to a canonical schema. Reusable dataset features are stored in a separate directory for each dataset under `<project>/cache/`.
 2. **Offline models** train a separate LSTM and XGBoost for each selected Zone. Forecasting reads the cached weights and saves the inference state for price proposals. Datasets with validation bias enabled also save an hourly correction for each origin.
-3. **Control engine** runs either Grid → Behaviour → Economist or a single Agent, proposes one energy price per continuous 3-hour window, reforecasts, and accepts a run only when every Zone/window is `Medium`.
+3. **Control engine** runs either Grid → Behaviour → Economist or a single Agent, proposes one percentage shift relative to the original hourly prices per continuous 3-hour window, reforecasts, and accepts a run only when every Zone/window is `Medium`.
 4. **Evaluation** is kept separate from the no-leakage handoff and authoritative control result.
 
 The load-policy bands use the position within each Zone's pre-origin historical 3-hour load min/max range:
 
-- `Low`: below 35%
-- `Medium`: 35% to below 80%
+- `Extremely Low`: below 25%
+- `Low`: 25% to below 50%
+- `Medium`: 50% to below 80%
 - `High`: 80% to below 90%
 - `Extremely High`: 90% or above
 
+The service fee stays fixed; a 0% proposal preserves the original hourly curve.
+R0 (original prices) and up to three complete proposals compete per zone/origin:
+maximize Medium count, minimize total out-of-band distance in kWh, then minimize
+the sum of absolute hourly percentage shifts. Exact ties keep the incumbent.
+Trace parents refer to the accepted schedule, not necessarily the preceding trial.
+Rejected calls still count. Agent execution, evaluation and independent price replay
+require results produced with the current five-band policy. Regenerate forecaster
+handoffs and price caches before starting a new experiment.
+
+Offline price replay (no LLM calls or weight updates):
+
+```shell
+python src/replay_prices.py PATH_TO_FORECASTER --data-dir data/CHARGED/JHB --zone 19 --output-dir replay
+```
+
+Replay probes one window at a time using the referenced model weights, then
+verifies the combined schedule. `price_candidates.csv` records individual probes;
+`combined_windows.csv` records the combined result. An in-range energy price can
+still form an unobserved pair with the service fee.
+
 ## Dataset adapters and cache
 
-Set `run.data_dir` in `config.yaml`, then run `python main.py`. The default
+Set `run.data_dir` in `config.yaml`, then run `python src/main.py`. The default
 `data.adapter: auto` recognizes UrbanEV, CHARGED, and MP-EVData from their files.
 Use a single folder to switch datasets, or a list to train in separate processes:
 
@@ -127,7 +153,7 @@ do not need to be set. The legacy flat `agent.api_key`/`agent.base_url` format a
 profile for that run without changing the other profile.
 
 ```powershell
-python main.py --dry-run --forecast-models AR --agent-mode multi_agent_economist_retry
+python src/main.py --dry-run --forecast-models AR --agent-mode multi_agent_economist_retry
 ```
 
 The output root and run name are configured separately:
@@ -141,7 +167,7 @@ run:
 The same values can be overridden independently from the CLI:
 
 ```powershell
-python main.py --output-folder output --experiment-name my_experiment
+python src/main.py --output-folder output --experiment-name my_experiment
 ```
 
 `experiment_name` identifies the run or experiment matrix under the output root.
@@ -152,8 +178,8 @@ alpha and backend, including when there is only one configuration.
 Stages can be separated without changing the fitted state:
 
 ```powershell
-python main.py --pipeline-stage forecaster --forecast-models AR
-python main.py --pipeline-stage agent --forecast-models AR --agent-mode multi_agent_economist_retry
+python src/main.py --pipeline-stage forecaster --forecast-models AR
+python src/main.py --pipeline-stage agent --forecast-models AR --agent-mode multi_agent_economist_retry
 ```
 
 Supported control modes are:
@@ -390,7 +416,7 @@ utilization. Existing per-call token and cache accounting remain separate.
 ## OpenAI endpoint parameter compatibility
 
 Use an explicit `backend: openai` to apply the
-OpenAI request adapter in `agent_backend.py`. For example:
+OpenAI request adapter in `src/agents/providers.py`. For example:
 
 ```yaml
 agent:
@@ -418,7 +444,7 @@ Other backends keep their own request conventions and token/cache accounting.
 ## Native Anthropic / Claude endpoint
 
 Provider protocol helpers, including the native Anthropic adapter, live in
-`agent_backend.py`. Token and cache accounting share `usage.py`.
+`src/agents/providers.py`. Token and cache accounting share `src/agents/usage.py`.
 
 Set `backend: anthropic` to use the Anthropic SDK and Messages API independently
 of the OpenAI-compatible client. This works in either Agent profile, including
@@ -529,7 +555,7 @@ Training uses each Zone's available historical series independently of forecast
 origins, alpha values, Agent modes, and experiment seeds. Explicit training runs use:
 
 ```powershell
-python main.py --stage train --forecast-models lstm xgboost
+python src/main.py --stage train --forecast-models lstm xgboost
 ```
 
 Forecaster and Full stages prepare missing or stale models before generating
@@ -684,7 +710,7 @@ The old `timesfm_lora_enabled` and `chronos_lora_enabled` keys and CLI switches
 are rejected; choose the forecaster IDs instead. Existing LoRA forecast artifacts
 are not migrated or replayed under the new identities.
 
-Use `python main.py --stage train --forecast-models timesfm_lora chronos_lora`
+Use `python src/main.py --stage train --forecast-models timesfm_lora chronos_lora`
 to prepare adapters without Agent calls. The train stage filters out original
 pretrained forecasters. Forecaster/Full prepare missing adapters;
 prediction and Agent reforecasting reuse frozen adapters. Training requires the
@@ -783,7 +809,7 @@ CLI options use the same plural names with hyphens. CLI overrides its matching
 YAML setting before per-model precedence is applied:
 
 ```powershell
-python main.py --forecast-models lstm xgboost --diurnal-blend-alphas 0 0.5 --lstm-diurnal-blend-alphas 0.25
+python src/main.py --forecast-models lstm xgboost --diurnal-blend-alphas 0 0.5 --lstm-diurnal-blend-alphas 0.25
 ```
 
 The matrix runs each backend only for its own effective alpha list. Independent
@@ -798,12 +824,9 @@ Use separate experiment names to retain both experiment-level summaries.
 The singular date/model configuration and CLI options are removed, as are the
 singular alpha configuration options. Deprecated inputs fail with a migration
 message instead of silently falling back. Python single-run APIs and new output
-fields use `forecast_origin` and `backend`. Offline evaluation accepts legacy
-field names at its reading boundary and writes the new names.
+fields use `forecast_origin` and `backend`. Offline evaluation uses these same names.
 
-Native artifacts use schema 8 and Forecaster manifests use schema 10. Agent-only
-also reads manifest schema 9 (seven-day calibration or bias disabled) and the
-uncalibrated native schema 7 with manifest schema 8.
+Native artifacts use schema 8, forecaster manifests schema 10, and control results schema 5.
 Agent-only requires the effective calibration length to match the saved forecast, including
 when an explicit forecaster directory is supplied. For earlier artifacts, rerun
 Forecaster or Full. LSTM/XGBoost offline weights remain at schema 2 and can be
@@ -818,7 +841,7 @@ Select `run.forecast_models: [xgboost]`, or include `xgboost` alongside other
 backends for a model comparison. This CLI override selects only XGBoost:
 
 ```powershell
-python main.py --config config.yaml --forecast-models xgboost --pipeline-stage forecaster
+python src/main.py --config config.yaml --forecast-models xgboost --pipeline-stage forecaster
 ```
 
 `xgboost` (alias `xgb`) trains one `XGBRegressor` for each output hour per selected
@@ -860,7 +883,7 @@ For every Zone, the adapter computes mean energy price in consecutive non-overla
 
 ## Outputs
 
-The authoritative control artifact is `control_results.json` (schema version 4). It records the dataset fingerprint, split cache key, feature manifest, forecast origin/model, experiment mode, global and Zone status, attempts, structured Agent summaries, reforecast trace, final window prices/load positions/stress, rationale, and historical price diagnostics. Agent time is not measured or emitted. Every concrete Grid, Behaviour, Economist, schema-repair, and retry call records prompt, completion, and total tokens. Attempt-level summaries and the final `agent_token_totals` provide Zone and global totals. Missing provider usage remains explicitly incomplete instead of being estimated.
+The authoritative control artifact is `control_results.json` (schema version 5). It records the dataset fingerprint, split cache key, feature manifest, forecast origin/model, experiment mode, global and Zone status, attempts, structured Agent summaries, reforecast trace, final window prices/load positions/stress, rationale, and historical price diagnostics. Agent time is not measured or emitted. Every concrete Grid, Behaviour, Economist, schema-repair, and retry call records prompt, completion, and total tokens. Attempt-level summaries and the final `agent_token_totals` provide Zone and global totals. Missing provider usage remains explicitly incomplete instead of being estimated.
 
 Companion outputs are:
 
@@ -890,17 +913,17 @@ or zone-selection errors before the matrix starts still stop that dataset immedi
 An ordinary control outcome of `fail` is not an exception and does not increment
 this counter.
 
-The run is `success` only when every selected Zone and every 3-hour window is `Medium`; otherwise the third proposal produces `fail` with the final summaries and reforecast state.
+The run is `success` only when every selected Zone and every 3-hour window is `Medium`. If the attempt limit is reached, the run is `fail` and each Zone retains its selected schedule, which may be R0.
 
 ## Offline result analysis
 
-`evaluate.py` reads existing outputs independently of forecasting and control.
-It supports a single run or recursively scans an experiment matrix:
+`src/evaluate.py` reads existing outputs independently of forecasting and control.
+Point it at a new experiment directory. It supports a single run or recursively scans an experiment matrix; incompatible artifacts are rejected, not silently skipped or rescored:
 
 ```powershell
-python evaluate.py --input output/my_experiment
-python evaluate.py --input output/my_experiment --section forecaster
-python evaluate.py --input output/my_experiment --section agent --output output/my_analysis
+python src/evaluate.py --input output/my_experiment
+python src/evaluate.py --input output/my_experiment --section forecaster
+python src/evaluate.py --input output/my_experiment --section agent --output output/my_analysis
 ```
 
 The default destination is `<input>/analysis/`. `evaluation.json` includes metric
@@ -915,7 +938,7 @@ existing optional LLM analyzer remains opt-in.
 To compare multiple experiment batches, use unique labels and a separate output:
 
 ```powershell
-python evaluate.py --batch 27B=output/random5_start2_qwen3_5 --batch 9B=output/random5_start2_qwen3_5_9b_single --output output/evaluate_qwen_comparison
+python src/evaluate.py --batch 27B=output/random5_start2_qwen3_5 --batch 9B=output/random5_start2_qwen3_5_9b_single --output output/evaluate_qwen_comparison
 ```
 
 The equivalent Python entry point is
@@ -976,7 +999,7 @@ in the evaluation report and must not enter control Agent context.
 ## Tests
 
 ```powershell
-python -B -m unittest discover -s tests -v
+python -B -m unittest discover -s src/tests -t . -v
 ```
 
 The tests cover dataset formats and filtering, cache consistency and process locks,

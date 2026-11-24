@@ -28,6 +28,7 @@ from src.data.selection import filter_training_profiles, normalize_zone_ids, sel
 from src.paths import forecast_output_dir, forecast_start_slug, normalize_experiment_name, safe_filename
 from src.pipeline.errors import experiment_error_record
 from src.pipeline.stages import run_pipeline, run_training_stage
+from src.results.price_range import PRICE_RANGE_TABLES
 from src.results.experiment import (
     append_experiment_frame,
     write_decision_quality_summary,
@@ -211,6 +212,12 @@ def run_experiment_matrix(
         "agent_step_token_usage_csv": (agent_step_token_usage_frames, agent_step_token_usage_path),
         "control_attempt_trace_csv": (control_attempt_trace_frames, control_attempt_trace_path),
     }
+    price_range_outputs = {
+        f"{name}_csv": experiment_dir / f"experiment_{name}.csv"
+        for name in PRICE_RANGE_TABLES if matrix_stage in {"agent", "full"}
+    }
+    for key, path in price_range_outputs.items():
+        experiment_tables[key] = ([], path)
     cache_attempted = False
     add_seed_folder = len(seeds) > 1
     add_mode_folder = len(modes) > 1
@@ -369,6 +376,7 @@ def run_experiment_matrix(
         "experiment_agent_attempt_usage_csv": agent_attempt_usage_path,
         "experiment_agent_step_token_usage_csv": agent_step_token_usage_path,
         "experiment_control_attempt_trace_csv": control_attempt_trace_path,
+        **{f"experiment_{key}": path for key, path in price_range_outputs.items()},
         "experiment_forecast_summary_csv": forecast_summary_path,
         "experiment_price_summary_csv": price_summary_path,
         "experiment_rationale_summary_csv": rationale_summary_path,

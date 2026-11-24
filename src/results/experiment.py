@@ -13,7 +13,7 @@ def append_experiment_frame(
 ) -> None:
     if path is None or not path.exists():
         return
-    frame = pd.read_csv(path)
+    frame = pd.read_csv(path, dtype={"zone_id": str})
     insert_at = 0
     for column, value in metadata.items():
         if column in frame.columns:

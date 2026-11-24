@@ -32,6 +32,7 @@ from src.paths import forecast_output_dir
 from src.pipeline.context import build_contexts
 from src.pipeline.errors import PipelineStageError
 from src.results.control import write_agent_outputs
+from src.results.price_range import annotate_final_price_ranges
 from src.results.forecast import write_forecaster_outputs
 from src.results.manifest import (
     ForecasterBundle,
@@ -484,6 +485,7 @@ def run_pipeline(
 
     reports = asyncio.run(execute_agent_control_stage())
     try:
+        annotate_final_price_ranges(reports, pipeline_data.energy_price, effective_forecast_start)
         agent_manifest = build_agent_manifest(
             agent_mode=agent_mode,
             backend=backend,

@@ -15,6 +15,7 @@ from src.agents.usage import (
 )
 from src.control.policy import LOAD_POLICY_ID
 from src.results.formatting import markdown_table
+from src.results.price_range import PRICE_RANGE_FIELDS, PRICE_RANGE_TABLES, write_price_range_tables
 from src.results.prices import (
     TRACE_COLUMNS,
     TRACE_OUTPUT_RENAMES,
@@ -117,6 +118,7 @@ def write_agent_outputs(
         "explainability_review_packet_csv": explainability_review_packet_csv,
         "control_results_json": control_results_json,
         "control_final_windows_csv": control_final_windows_csv,
+        **{f"{name}_csv": output_dir / f"{name}.csv" for name in PRICE_RANGE_TABLES},
         "control_attempt_trace_csv": control_attempt_trace_csv,
         "agent_attempt_usage_csv": agent_attempt_usage_csv,
         "agent_step_token_usage_csv": agent_step_token_usage_csv,
@@ -188,6 +190,7 @@ def write_control_outputs(
         "historical_price_change_percentile",
         "historical_price_change_p95_pct",
         "exceeds_historical_p95",
+        *PRICE_RANGE_FIELDS,
         "control_success",
         "control_failure_reason",
         "direction_deviation", "hours",
@@ -387,6 +390,7 @@ def write_control_outputs(
     }
     results_json.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     pd.DataFrame(final_rows).to_csv(final_windows_csv, index=False)
+    write_price_range_tables(final_windows_csv.parent, final_rows, metadata.get("forecast_origin"))
     pd.DataFrame(attempt_rows).to_csv(attempt_trace_csv, index=False)
     pd.DataFrame(
         [*global_usage_rows, *zone_usage_rows],

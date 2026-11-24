@@ -16,9 +16,9 @@ remain at the project root.
 
 The load-policy bands use the position within each Zone's pre-origin historical 3-hour load min/max range:
 
-- `Extremely Low`: below 25%
-- `Low`: 25% to below 50%
-- `Medium`: 50% to below 80%
+- `Extremely Low`: below 10%
+- `Low`: 10% to below 35%
+- `Medium`: 35% to below 80%
 - `High`: 80% to below 90%
 - `Extremely High`: 90% or above
 
@@ -29,7 +29,8 @@ the sum of absolute hourly percentage shifts. Exact ties keep the incumbent.
 Trace parents refer to the accepted schedule, not necessarily the preceding trial.
 Rejected calls still count. Agent execution, evaluation and independent price replay
 require results produced with the current five-band policy. Regenerate forecaster
-handoffs and price caches before starting a new experiment.
+handoffs and price caches made with the former 25/50/80/90 cutoffs before running
+the agent with the 10/35/80/90 policy.
 
 R1 sizes each window's quote from its forecast load gap, demand drivers and elasticity.
 On retries, a bolder quote is an option only when the last two forecasts for **that window**
@@ -889,6 +890,17 @@ learned from history; tree predictions can remain unchanged for small price chan
 ## Historical price diagnostic
 
 For every Zone, the adapter computes mean energy price in consecutive non-overlapping 3-hour windows, then pools adjacent-window absolute percentage changes across the whole dataset. Every proposal reports its empirical percentile, dataset P95, and `exceeds_historical_p95`. This diagnostic is display-only: it does not clip prices, determine success, or enter Agent context.
+
+After control, `agent/final_price_out_of_range_windows.csv` lists only **selected,
+changed** windows with at least one hourly execution price below the Zone's historical
+minimum or above its maximum. The reference uses all available hourly energy prices
+strictly before the forecast origin, excludes the service fee, and includes both
+endpoints. This checks absolute prices, not the P95 of past percentage changes.
+`final_price_out_of_range_non_medium_windows.csv` is the subset whose final reforecast
+has a known non-Medium band. Holds, rejected proposals and missing reference data
+are not listed. See `control_final_windows.csv` for every window's range status.
+Both lists keep their headers when empty; matrix runs also write dataset-level
+copies prefixed with `experiment_`.
 
 ## Outputs
 

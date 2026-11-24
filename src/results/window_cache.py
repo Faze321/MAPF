@@ -181,7 +181,7 @@ def apply_precomputed_window_data(
             updated["predicted_energy_price"] = predicted_price
             updated["proposed_energy_price"] = predicted_price
             updated["price_valid"] = predicted_price is not None and predicted_price >= 0
-            updated["suggested_price_shift_pct"] = round(final_shift, 4) if final_shift is not None else None
+            updated["suggested_price_shift_pct"] = final_shift
             updated["price_conditioned_baseline_load_kwh"] = conditioned_load
             updated["price_conditioned_mean_predicted_kwh"] = optional_number(
                 row.get("price_conditioned_mean_load_kwh")

@@ -40,6 +40,10 @@ def window_key(window: dict[str, Any]) -> tuple[str, str]:
     return str(window.get("window_start")), str(window.get("window_end"))
 
 
+def shifted_energy_prices(prices: pd.Series, shift_pct: float) -> pd.Series:
+    return prices * (1 + shift_pct / 100)
+
+
 def energy_price_with_predicted_windows(
     energy_price: pd.DataFrame,
     zone_id: str,
@@ -59,7 +63,7 @@ def energy_price_with_predicted_windows(
         start = parse_datetime_24h(window.get("window_start"))
         end = parse_datetime_24h(window.get("window_end"))
         mask = (frame["time"] >= start) & (frame["time"] <= end)
-        frame.loc[mask, zone_id] = energy_price.loc[mask, zone_id] * (1 + shift / 100)
+        frame.loc[mask, zone_id] = shifted_energy_prices(energy_price.loc[mask, zone_id], shift)
     return frame
 
 

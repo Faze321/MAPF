@@ -261,6 +261,7 @@ def main(argv: list[str] | None = None):
             print(f"- {name}: {path}")
         return outputs
     resolved_data_dir = Path(data_dirs)
+    requested_zones = args.zones if args.zones is not None else run_config.zone_ids
     dataset_spec = resolve_dataset_spec(DatasetSpec(
         path=resolved_data_dir,
         adapter=args.dataset_adapter or data_config.adapter,
@@ -273,6 +274,7 @@ def main(argv: list[str] | None = None):
         static_file=data_config.static_file,
         static_mapping=data_config.static_mapping,
         unit_conversions=data_config.unit_conversions,
+        allow_zero_energy_price=not requested_zones and run_config.experiment_zone_selection == "random",
     ))
     if pipeline_stage == "train":
         selected_backends = normalize_forecast_model_list(args.forecast_models) or run_config.forecast_models or ["lstm", "xgboost"]
@@ -286,7 +288,7 @@ def main(argv: list[str] | None = None):
             backends=selected_backends,
             backend_parameters={name: getattr(run_config, name) for name in BACKEND_PARAMETER_NAMES},
             training_config=training_config, training_cli_overrides=training_cli_overrides,
-            zone_ids=args.zones if args.zones is not None else run_config.zone_ids,
+            zone_ids=requested_zones,
             experiment_zone_count=(args.experiment_zone_count if args.experiment_zone_count is not None
                                    else run_config.zone_count_for(resolved_data_dir)),
             experiment_zone_selection=run_config.experiment_zone_selection,
@@ -386,7 +388,7 @@ def main(argv: list[str] | None = None):
         "validation_days": validation_days,
         "validation_bias": (args.validation_bias if args.validation_bias is not None
                             else run_config.validation_bias_for(resolved_data_dir)),
-        "zone_ids": args.zones if args.zones is not None else run_config.zone_ids,
+        "zone_ids": requested_zones,
         "experiment_zone_count": (
             args.experiment_zone_count
             if args.experiment_zone_count is not None

@@ -7,7 +7,7 @@ import pandas as pd
 
 from src.data.adapters.base import DatasetAdapter
 from src.data.adapters.charged import tou_schedule
-from src.data.canonical import DatasetSpec, finalize, require_files
+from src.data.canonical import DatasetSpec, finalize, require_files, valid_energy_prices
 
 
 class MPEVDataDatasetAdapter(DatasetAdapter):
@@ -20,6 +20,7 @@ class MPEVDataDatasetAdapter(DatasetAdapter):
 
     def build(self, spec: DatasetSpec):
         frames, static_rows, excluded, trimmed = [], [], {}, {}
+        required = "non-negative" if spec.allow_zero_energy_price else "positive"
         with pd.ExcelFile(spec.path / self.load_filename, engine="openpyxl") as loads, pd.ExcelFile(spec.path / "price.xlsx", engine="openpyxl") as prices:
             metadata = pd.read_excel(loads, sheet_name=0).dropna(subset=["ID"]).set_index("ID")
             for site in [s for s in loads.sheet_names if re.fullmatch(r"A\d+", s)]:
@@ -42,10 +43,10 @@ class MPEVDataDatasetAdapter(DatasetAdapter):
                 tariff = tou_schedule(pd.read_excel(prices, sheet_name=site))
                 raw["month"], raw["hour"] = raw.datetime.dt.month, raw.datetime.dt.hour
                 raw = raw.merge(tariff, on=["month", "hour"], how="left", validate="many_to_one")
-                valid_price = np.isfinite(raw.energy_price) & raw.energy_price.gt(0)
+                valid_price = valid_energy_prices(raw.energy_price, spec.allow_zero_energy_price)
                 if not valid_price.all():
                     missing = raw.loc[~valid_price, ["month", "hour"]].drop_duplicates()
-                    excluded[site] = f"incomplete or non-positive electricity tariff ({len(missing)} month/hour combinations)"
+                    excluded[site] = f"electricity tariff must be finite and {required} ({len(missing)} invalid month/hour combinations)"
                     continue
                 if not (np.isfinite(raw.power) & raw.power.ge(0)).all():
                     raise ValueError(f"Invalid hourly power in {site}")
@@ -62,5 +63,5 @@ class MPEVDataDatasetAdapter(DatasetAdapter):
         return finalize(frame, pd.DataFrame(static_rows), excluded=excluded, trimmed_outside_2024=trimmed,
                         load_unit="kWh per hour (published hourly average kW times 1h)", price_unit="CNY/kWh",
                         source="https://doi.org/10.6084/m9.figshare.29882366", tariff_year=2024,
-                        selection_policy="charging energy only; complete positive published monthly TOU tariff; no imputation",
+                        selection_policy=f"charging energy only; complete {required} published monthly TOU tariff; no imputation",
                         excluded_static_features=["Total Orders", "ambiguous merged Capacity cells"])

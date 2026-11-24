@@ -5,6 +5,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from src.data.canonical import valid_energy_prices
 
 DEFAULT_EXOG_COLS = ["T", "U", "nRAIN", "e_price", "s_price", "is_weekend", "temp_price_idx"]
 KNOWN_EXOG_COLS = frozenset([*DEFAULT_EXOG_COLS, "hour", "occupancy"])
@@ -77,6 +78,7 @@ def inspect_training_window(
     frame: pd.DataFrame, *, history_days: int = 35, horizon_days: int = 1,
     train_ratio: float = 0.8, validation_ratio: float = 0.2,
     min_history_days: int = 45, min_samples: int = 512, sample_stride_hours: int = 1,
+    allow_zero_energy_price: bool = False,
 ) -> dict[str, Any]:
     """Chronologically split supervised windows, purging overlapping target labels."""
     for key, value in (("history_days", history_days), ("horizon_days", horizon_days),
@@ -102,7 +104,7 @@ def inspect_training_window(
         clean[column] = pd.to_numeric(clean[column], errors="coerce")
     valid = (clean["time"].notna() & (clean["time"] == clean["time"].dt.floor("h"))
              & np.isfinite(clean["actual_kwh"]) & (clean["actual_kwh"] >= 0)
-             & np.isfinite(clean["e_price"]) & (clean["e_price"] > 0))
+             & valid_energy_prices(clean["e_price"], allow_zero_energy_price))
     clean = clean[valid].sort_values("time").reset_index(drop=True)
     result.update(valid_hours=len(clean), invalid_hours=int((~valid).sum()))
     if len(clean) < min_history_days * 24:
@@ -146,6 +148,7 @@ def assess_dataset_training(dataset: Any, training_config: Any, *, zone_ids=None
             statuses[zone] = {"eligible": False, "reason": "adapter_excluded" if zone in excluded else "unknown_zone"}
             continue
         assessment = inspect_training_window(canonical_zone_frame(dataset, zone),
+            allow_zero_energy_price=dataset.feature_manifest.get("allow_zero_energy_price", False),
             history_days=history_days, horizon_days=horizon_days,
             train_ratio=training_config.train_ratio, validation_ratio=training_config.validation_ratio,
             min_history_days=training_config.min_history_days, min_samples=training_config.min_samples,

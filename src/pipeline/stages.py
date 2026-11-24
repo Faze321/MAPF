@@ -18,6 +18,7 @@ from src.control.loop import run_control_loop
 from src.control.windows import build_zone_3h_load_policy_thresholds
 from src.data.adapters.registry import load_canonical_dataset, validate_forecaster_dataset_source
 from src.data.canonical import DatasetSpec
+from src.data.eligibility import random_training_candidates
 from src.data.profiles import load_pipeline_data, profiles_at_origin
 from src.data.selection import (
     filter_training_profiles,
@@ -66,8 +67,10 @@ def run_training_stage(*, data_dir: Path, backends: Iterable[str] = ("lstm", "xg
     if not selected:
         raise ValueError("The train stage requires lstm, xgboost, timesfm_lora or chronos_lora")
     spec = dataset_spec or DatasetSpec(path=data_dir, cache_dir=cache_dir)
-    dataset = load_canonical_dataset(spec, force_cache=force_cache)
     selected_zone_ids = normalize_zone_ids(zone_ids)
+    if not selected_zone_ids and normalize_zone_selection(experiment_zone_selection) == "random":
+        spec = replace(spec, allow_zero_energy_price=True)
+    dataset = load_canonical_dataset(spec, force_cache=force_cache)
     eligible = eligible_training_zone_ids(
         dataset, training_config, zone_ids=selected_zone_ids,
         history_days=history_days, horizon_days=horizon_days,
@@ -75,6 +78,7 @@ def run_training_stage(*, data_dir: Path, backends: Iterable[str] = ("lstm", "xg
     if not selected_zone_ids:
         selection = normalize_zone_selection(experiment_zone_selection)
         if selection == "random":
+            eligible = random_training_candidates(dataset, eligible)
             if len(eligible) < experiment_zone_count:
                 raise ValueError(f"Only {len(eligible)} eligible zones remain for {experiment_zone_count} requested random zones")
             profiles = pd.DataFrame({"zone_id": eligible})
@@ -199,6 +203,9 @@ def run_pipeline(
     if pipeline_stage == "agent":
         try:
             bundle = load_forecaster_bundle(forecaster_dir)
+            requested = normalize_zone_ids(zone_ids)
+            if dataset_spec.allow_zero_energy_price and requested and set(requested) != set(bundle.manifest["zone_ids"]):
+                raise ValueError("Saved forecaster zones differ from the current random selection; rerun the forecaster stage.")
             if bundle.forecast_parameters["validation_bias"] != validation_bias:
                 raise ValueError(
                     f"Saved forecaster validation_bias={bundle.forecast_parameters['validation_bias']} "
@@ -225,6 +232,7 @@ def run_pipeline(
             dataset_spec,
             path=data_dir,
             weather_file=weather_file,
+            allow_zero_energy_price=(bundle.manifest.get("feature_manifest") or {}).get("allow_zero_energy_price", False),
         )
         if cache_dir is None and dataset_spec.cache_dir is None:
             shared_cache_dir = dataset_spec.resolved_cache_dir

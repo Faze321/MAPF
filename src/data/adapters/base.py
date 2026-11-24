@@ -59,6 +59,7 @@ class DatasetAdapter(ABC):
                 "static_mapping": spec.static_mapping,
                 "weather_file": spec.weather_file,
                 "unit_conversions": spec.unit_conversions,
+                **({"allow_zero_energy_price": True} if spec.allow_zero_energy_price else {}),
             },
         )
         fingerprint = hashlib.sha256(
@@ -106,7 +107,7 @@ class DatasetAdapter(ABC):
                 pd.to_numeric(timeseries["temperature"], errors="coerce")
                 * pd.to_numeric(timeseries[CANONICAL_ENERGY_PRICE_COLUMN], errors="coerce")
             )
-        timeseries = validate_canonical_timeseries(timeseries)
+        timeseries = validate_canonical_timeseries(timeseries, allow_zero_energy_price=spec.allow_zero_energy_price)
         static = validate_static_zone_features(static, timeseries)
         reference = build_price_change_reference(timeseries)
         feature_manifest = {
@@ -115,6 +116,7 @@ class DatasetAdapter(ABC):
             "adapter_version": self.version,
             "dataset_fingerprint": fingerprint,
             "unit_conversions": dict(spec.unit_conversions),
+            "allow_zero_energy_price": spec.allow_zero_energy_price,
             **feature_manifest,
         }
         dataset_cache.mkdir(parents=True, exist_ok=True)

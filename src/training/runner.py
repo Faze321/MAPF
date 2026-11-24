@@ -46,6 +46,7 @@ def _ensure_zone_model(
     with _zone_model_lock(folder / ".training.lock"):
         assessment = inspect_training_window(
             canonical_zone_frame(dataset, zone_id), history_days=history_days, horizon_days=horizon_days,
+            allow_zero_energy_price=dataset.feature_manifest.get("allow_zero_energy_price", False),
             train_ratio=training_config.train_ratio, validation_ratio=training_config.validation_ratio,
             min_history_days=training_config.min_history_days,
             min_samples=training_config.min_samples, sample_stride_hours=training_config.sample_stride_hours,
@@ -233,4 +234,5 @@ def _zone_training_payload(dataset: Any, zone_id: str) -> SimpleNamespace:
     return SimpleNamespace(
         timeseries=dataset.timeseries[dataset.timeseries["zone_id"].astype(str) == str(zone_id)].copy(),
         cache_dir=Path(dataset.cache_dir), dataset_fingerprint=dataset.dataset_fingerprint,
+        feature_manifest={"allow_zero_energy_price": getattr(dataset, "feature_manifest", {}).get("allow_zero_energy_price", False)},
     )

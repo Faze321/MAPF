@@ -85,7 +85,7 @@ def load_cached_dataset(
         )
         if CANONICAL_ZONE_COLUMN not in poi_counts:
             return None
-        timeseries = validate_canonical_timeseries(timeseries)
+        timeseries = validate_canonical_timeseries(timeseries, allow_zero_energy_price=feature_manifest.get("allow_zero_energy_price", False))
         static = validate_static_zone_features(static, timeseries)
         reference = PriceChangeReference.from_dict(reference_raw)
     except (OSError, ValueError, TypeError, json.JSONDecodeError, pd.errors.ParserError):

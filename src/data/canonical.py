@@ -33,6 +33,7 @@ class DatasetSpec:
     static_file: str | None = None
     static_mapping: dict[str, str] = field(default_factory=dict)
     unit_conversions: dict[str, float] = field(default_factory=dict)
+    allow_zero_energy_price: bool = False
 
     @property
     def resolved_cache_dir(self) -> Path:
@@ -169,7 +170,11 @@ def read_wide_matrix(path: Path, value_name: str) -> pd.DataFrame:
     return long
 
 
-def validate_canonical_timeseries(frame: pd.DataFrame) -> pd.DataFrame:
+def valid_energy_prices(prices: pd.Series, allow_zero: bool) -> pd.Series:
+    return prices.notna() & np.isfinite(prices) & (prices.ge(0) if allow_zero else prices.gt(0))
+
+
+def validate_canonical_timeseries(frame: pd.DataFrame, *, allow_zero_energy_price: bool = False) -> pd.DataFrame:
     required = {
         CANONICAL_TIME_COLUMN,
         CANONICAL_ZONE_COLUMN,
@@ -190,8 +195,9 @@ def validate_canonical_timeseries(frame: pd.DataFrame) -> pd.DataFrame:
     if result[CANONICAL_LOAD_COLUMN].isna().all():
         raise ValueError("Canonical dataset load is entirely missing")
     price = pd.to_numeric(result[CANONICAL_ENERGY_PRICE_COLUMN], errors="coerce")
-    if price.isna().any() or (price <= 0).any():
-        raise ValueError("Canonical baseline energy price must be present and greater than zero")
+    if not valid_energy_prices(price, allow_zero_energy_price).all():
+        required = "non-negative" if allow_zero_energy_price else "greater than zero"
+        raise ValueError(f"Canonical baseline energy price must be finite and {required}")
     return result
 
 

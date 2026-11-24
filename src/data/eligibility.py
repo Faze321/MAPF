@@ -21,7 +21,9 @@ from src.data.canonical import (
 from src.files import atomic_write_dataframe, atomic_write_json, process_file_lock
 
 
-POLICY_VERSION = 5
+POLICY_VERSION = 6
+MAX_ZERO_LOAD_PCT = 20
+MAX_ZERO_ENERGY_PRICE_PCT = 5
 CONSTANT_RTOL = 1e-9
 CONSTANT_ATOL = 1e-12
 
@@ -48,6 +50,8 @@ def load_zone_eligibility(
         "variation_cutoff": (starts[0] - pd.Timedelta(days=holdout_days)).isoformat(),
         "constant_rtol": CONSTANT_RTOL,
         "constant_atol": CONSTANT_ATOL,
+        "max_zero_load_pct": MAX_ZERO_LOAD_PCT,
+        "max_zero_energy_price_pct": MAX_ZERO_ENERGY_PRICE_PCT,
     }
     policy_key = hashlib.sha256(
         json.dumps(policy, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -74,15 +78,36 @@ def _series_statistics(values: pd.Series) -> dict[str, Any]:
     finite = numbers[np.isfinite(numbers)]
     minimum = float(finite.min()) if finite.size else None
     maximum = float(finite.max()) if finite.size else None
+    zeros = int(np.count_nonzero(finite == 0))
     return {
         "observations": int(len(numbers)),
         "finite_observations": int(finite.size),
         "minimum": minimum,
         "maximum": maximum,
-        "zero_observations": int(np.count_nonzero(finite == 0)),
+        "zero_observations": zeros,
+        "zero_pct": 100 * zeros / int(finite.size) if finite.size else None,
         "constant": bool(np.isclose(maximum, minimum, rtol=CONSTANT_RTOL, atol=CONSTANT_ATOL))
         if finite.size else None,
     }
+
+
+def zero_share_reasons(load: dict[str, Any], price: dict[str, Any]) -> list[str]:
+    return [reason for stats, limit, reason in (
+        (load, MAX_ZERO_LOAD_PCT, "excess_zero_load"),
+        (price, MAX_ZERO_ENERGY_PRICE_PCT, "excess_zero_energy_price"),
+    ) if 100 * stats["zero_observations"] > limit * stats["finite_observations"]]
+
+
+def random_training_candidates(dataset: CanonicalDataset, candidates: list[str]) -> list[str]:
+    """Train-only runs have no forecast origin: use their available offline history."""
+    groups = dataset.timeseries.groupby(CANONICAL_ZONE_COLUMN)
+    eligible = []
+    for zone in candidates:
+        group = groups.get_group(zone)
+        if not zero_share_reasons(_series_statistics(group[CANONICAL_LOAD_COLUMN]),
+                                  _series_statistics(group[CANONICAL_ENERGY_PRICE_COLUMN])):
+            eligible.append(zone)
+    return eligible
 
 
 def _build_report(dataset: CanonicalDataset, policy: dict[str, Any]) -> dict[str, Any]:
@@ -122,7 +147,7 @@ def _build_report(dataset: CanonicalDataset, policy: dict[str, Any]) -> dict[str
             "load_kwh": load_stats,
             "energy_price": price_stats,
         }
-        reasons = []
+        reasons = zero_share_reasons(load_stats, price_stats)
         if load_stats["constant"]:
             reasons.append("constant_load")
         if price_stats["constant"]:
@@ -145,7 +170,7 @@ def _build_report(dataset: CanonicalDataset, policy: dict[str, Any]) -> dict[str
             ):
                 window_reasons.append("invalid_training_load")
             if price["finite_observations"] != len(window) or (
-                price["minimum"] is not None and price["minimum"] <= 0
+                price["minimum"] is not None and price["minimum"] < 0
             ):
                 window_reasons.append("invalid_training_energy_price")
             if holdout_days:
@@ -218,12 +243,13 @@ def _write_csv(report: dict[str, Any], path: Path) -> None:
             "upstream_exclusion": upstream.get(zone_id, ""),
             "load_min": load.get("minimum"), "load_max": load.get("maximum"),
             "energy_price_min": price.get("minimum"), "energy_price_max": price.get("maximum"),
+            "load_zero_pct": load.get("zero_pct"), "energy_price_zero_pct": price.get("zero_pct"),
             "variation_history": json.dumps(values["variation_history"], ensure_ascii=False),
             "training_windows": json.dumps(values["training_windows"], ensure_ascii=False),
         })
     atomic_write_dataframe(pd.DataFrame(rows, columns=[
         "zone_id", "eligible", "reasons", "upstream_exclusion", "load_min", "load_max",
-        "energy_price_min", "energy_price_max", "variation_history", "training_windows",
+        "energy_price_min", "energy_price_max", "load_zero_pct", "energy_price_zero_pct", "variation_history", "training_windows",
     ]), path)
 
 

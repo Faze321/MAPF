@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -107,6 +108,9 @@ def run_experiment_matrix(
             cache_dir=shared_cache_dir,
             weather_file=str(pipeline_kwargs.get("weather_file") or "weather_airport.csv"),
         )
+        if not selected_zone_ids and normalize_zone_selection(experiment_zone_selection) == "random":
+            matrix_dataset_spec = replace(matrix_dataset_spec, allow_zero_energy_price=True)
+            pipeline_kwargs["dataset_spec"] = matrix_dataset_spec
         canonical_dataset = load_canonical_dataset(
             matrix_dataset_spec,
             force_cache=base_force_cache,
@@ -140,6 +144,7 @@ def run_experiment_matrix(
                 raise ValueError(
                     f"Only {len(eligible_ids)} eligible zones remain for {requested_count} requested random zones. "
                     "Both load and electricity price must vary in the eligible pre-forecast history, "
+                    "zero loads and energy prices must be within their respective eligibility limits, "
                     "all historical windows must be complete and enough offline training samples must be available. "
                     "Choose another dataset/date or reduce its configured zone count "
                     "(run.experiment_zone_counts or run.experiment_zone_count). "

@@ -128,7 +128,8 @@ def main():
             parser.error("Unknown zone in this forecaster artifact")
     source = bundle.manifest["data_source"]
     dataset = load_canonical_dataset(DatasetSpec(args.data_dir or Path(source["data_dir"]),
-        adapter=source["adapter"], weather_file=source["weather_file"]))
+        adapter=source["adapter"], weather_file=source["weather_file"],
+        allow_zero_energy_price=(bundle.manifest.get("feature_manifest") or {}).get("allow_zero_energy_price", False)))
     candidates, summaries = [], []
     for context in contexts:
         zone = str(context["zone_id"])

@@ -7,7 +7,7 @@ import pandas as pd
 
 from src.data.adapters.base import DatasetAdapter
 from src.data.adapters.urbanev import urban_ev_poi_zone_counts
-from src.data.canonical import DatasetSpec, finalize, hourly_matrix, require_files
+from src.data.canonical import DatasetSpec, finalize, hourly_matrix, require_files, valid_energy_prices
 
 
 class ChargedDatasetAdapter(DatasetAdapter):
@@ -24,14 +24,15 @@ class ChargedDatasetAdapter(DatasetAdapter):
         if not load.index.equals(price.index) or set(load.columns) != set(price.columns):
             raise ValueError("CHARGED load and price must have identical hours and site IDs")
         excluded = {}
+        required = "non-negative" if spec.allow_zero_energy_price else "positive"
         for site in load.columns:
-            if not (np.isfinite(price[site]) & price[site].gt(0)).all():
-                excluded[site] = "missing, non-finite or non-positive baseline electricity price"
+            if not valid_energy_prices(price[site], spec.allow_zero_energy_price).all():
+                excluded[site] = f"baseline electricity price must be finite and {required}"
             elif not (np.isfinite(load[site]) & load[site].ge(0)).all():
                 excluded[site] = "missing, non-finite or negative hourly energy"
         sites = [site for site in load if site not in excluded]
         if not sites:
-            raise ValueError("CHARGED has no sites with complete positive electricity prices")
+            raise ValueError(f"CHARGED has no sites with complete {required} electricity prices")
         frame = load[sites].reset_index().melt(id_vars="timestamp", var_name="zone_id", value_name="load_kwh")
         energy = price[sites].reset_index().melt(id_vars="timestamp", var_name="zone_id", value_name="energy_price")
         frame = frame.merge(energy, on=["timestamp", "zone_id"], validate="one_to_one")
@@ -67,7 +68,7 @@ class ChargedDatasetAdapter(DatasetAdapter):
                 static[cols] = static[cols].fillna(0)
         return finalize(frame, static, excluded=excluded, load_unit="kWh per hour", price_unit="source local currency/kWh",
                         city=spec.path.name, source="https://github.com/IntelligentSystemsLab/CHARGED",
-                        selection_policy="complete finite hourly energy and strictly positive electricity price; no invented tariffs",
+                        selection_policy=f"complete finite hourly energy and {required} electricity price; no invented tariffs",
                         excluded_static_features=["total_volume", "total_duration", "avg_power"])
 
 

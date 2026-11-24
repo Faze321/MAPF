@@ -72,8 +72,6 @@ class LongFormatDatasetAdapter(DatasetAdapter):
             frame[CANONICAL_TIME_COLUMN]
         )
         frame[CANONICAL_ZONE_COLUMN] = frame[CANONICAL_ZONE_COLUMN].astype(str)
-        if (pd.to_numeric(frame[CANONICAL_ENERGY_PRICE_COLUMN], errors="coerce") <= 0).any():
-            raise ValueError("Baseline energy price must be greater than zero")
         frame["hour"] = frame[CANONICAL_TIME_COLUMN].dt.hour.astype(int)
         frame["day_of_week"] = frame[CANONICAL_TIME_COLUMN].dt.dayofweek.astype(int)
         frame["is_weekend"] = frame["day_of_week"].isin([5, 6]).astype(int)

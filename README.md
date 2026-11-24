@@ -93,7 +93,7 @@ data:
     energy_price: tariff
 ```
 
-Required canonical fields are timestamp, Zone, load, and a strictly positive baseline energy-price schedule. Optional dynamic fields include weather, occupancy, service price, and calendar values; optional static fields include coordinates, Zone type, POIs, geography, and charging capacity. Explicit mappings win over alias discovery, and ambiguous aliases fail fast.
+Required canonical fields are timestamp, Zone, load, and baseline energy price. Automatic random selection preserves observed zero prices and excludes zones where more than 5% of historical energy prices or more than 20% of historical loads are zero. Each percentage uses that field's finite hourly observations before the earliest forecast (before the calibration holdout when enabled). The exact limits are allowed. Representative and explicit selections retain the strictly positive baseline-price requirement. Optional dynamic fields include weather, occupancy, service price, and calendar values; optional static fields include coordinates, Zone type, POIs, geography, and charging capacity. Explicit mappings win over alias discovery, and ambiguous aliases fail fast.
 
 The default cache root mirrors the dataset's path relative to `<project>/data/`:
 

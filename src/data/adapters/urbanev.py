@@ -49,8 +49,6 @@ class UrbanEVDatasetAdapter(DatasetAdapter):
         )
         if timeseries.empty:
             raise ValueError("UrbanEV load and energy-price files have no aligned observations")
-        if (pd.to_numeric(timeseries[CANONICAL_ENERGY_PRICE_COLUMN], errors="coerce") <= 0).any():
-            raise ValueError("UrbanEV baseline energy price must be greater than zero")
 
         dynamic_columns: list[str] = []
         optional_wide = {
